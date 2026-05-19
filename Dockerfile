@@ -15,11 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common ca-certificates curl gnupg \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv git git-lfs \
+        python3.12 python3.12-dev python3.12-venv git git-lfs bash \
     && rm -rf /var/lib/apt/lists/* \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && git lfs install
 
 WORKDIR /workspace
@@ -31,21 +29,22 @@ RUN git clone https://github.com/tensorforger/FluxRT.git \
 
 WORKDIR /workspace/FluxRT
 
-# PyTorch (CUDA 12.8) + FluxRT deps + server deps + huggingface_hub for runtime model fetch
-RUN pip install --upgrade pip \
-    && pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
-    && pip install -r requirements.txt \
-    && pip install -e . \
-    && pip install fastapi "uvicorn[standard]" websockets pillow numpy \
+# PyTorch (CUDA 12.8) + FluxRT deps + server deps + huggingface_hub for runtime model fetch.
+# Use absolute /usr/bin/python3.12 -m pip (avoid relying on a 'python' or 'pip' symlink).
+RUN /usr/bin/python3.12 -m pip install --upgrade pip \
+    && /usr/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+    && /usr/bin/python3.12 -m pip install -r requirements.txt \
+    && /usr/bin/python3.12 -m pip install -e . \
+    && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy \
         "huggingface_hub[hf_transfer]"
 
-# NOTE: model weights (FLUX.2-klein-4B ~14 GB + RIFE ~2 GB) are NOT baked into the image.
-# They are downloaded lazily at first worker boot by server.py warmup() using
-# huggingface_hub.snapshot_download into /workspace/models (persists on the worker for
-# the lifetime of the container). This keeps the build under the 30-minute RunPod limit.
-
-COPY server.py /workspace/FluxRT/server.py
+# Our app code lives at /workspace/app/server.py (separate from upstream FluxRT to avoid file conflicts).
+RUN mkdir -p /workspace/app
+COPY server.py /workspace/app/server.py
+COPY start.sh /workspace/start.sh
+RUN chmod +x /workspace/start.sh
 
 EXPOSE 8765
 
-CMD ["python", "-u", "server.py"]
+# Diagnostic entrypoint: prints PATH, ls, command -v checks, then execs python3.12 -u server.py.
+CMD ["bash", "/workspace/start.sh"]
