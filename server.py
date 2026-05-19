@@ -44,6 +44,48 @@ CONFIG_PATH = os.environ.get("FLUXRT_CONFIG", "/workspace/FluxRT/configs/stream_
 SESSION_SIGNING_SECRET = os.environ.get("SESSION_SIGNING_SECRET", "")
 PORT = int(os.environ.get("PORT", "8765"))
 
+# Model weights downloaded at runtime (not baked into Docker image to keep build < 30 min)
+FLUXRT_DIR = os.environ.get("FLUXRT_DIR", "/workspace/FluxRT")
+MODELS_DIR = os.environ.get("FLUXRT_MODELS_DIR", "/workspace/models")
+FLUX_REPO_ID = os.environ.get("FLUX_REPO_ID", "black-forest-labs/FLUX.2-klein-4B")
+RIFE_REPO_ID = os.environ.get("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
+
+
+def _ensure_models():
+    """Download FLUX.2-klein-4B and RIFE weights into the local FluxRT working dir
+    on first boot. Skips if a sentinel file already exists. Uses hf_transfer for
+    multi-stream parallel downloads (HF_HUB_ENABLE_HF_TRANSFER=1)."""
+    import os as _os
+    from huggingface_hub import snapshot_download
+
+    flux_local = _os.path.join(FLUXRT_DIR, "FLUX.2-klein-4B")
+    rife_local = _os.path.join(FLUXRT_DIR, "RIFE-safetensors")
+
+    flux_sentinel = _os.path.join(flux_local, ".downloaded")
+    rife_sentinel = _os.path.join(rife_local, ".downloaded")
+
+    if not _os.path.exists(flux_sentinel):
+        log.info("Downloading FLUX weights to %s ...", flux_local)
+        _os.makedirs(flux_local, exist_ok=True)
+        snapshot_download(repo_id=FLUX_REPO_ID, local_dir=flux_local,
+                          local_dir_use_symlinks=False, max_workers=8)
+        with open(flux_sentinel, "w") as f:
+            f.write("ok")
+        log.info("FLUX weights ready")
+    else:
+        log.info("FLUX weights already present, skipping download")
+
+    if not _os.path.exists(rife_sentinel):
+        log.info("Downloading RIFE weights to %s ...", rife_local)
+        _os.makedirs(rife_local, exist_ok=True)
+        snapshot_download(repo_id=RIFE_REPO_ID, local_dir=rife_local,
+                          local_dir_use_symlinks=False, max_workers=8)
+        with open(rife_sentinel, "w") as f:
+            f.write("ok")
+        log.info("RIFE weights ready")
+    else:
+        log.info("RIFE weights already present, skipping download")
+
 # Global processor - loaded once per worker
 processor = None
 ready_event = asyncio.Event()
@@ -101,6 +143,7 @@ async def lifespan(app):
         global processor
         loop = asyncio.get_event_loop()
         try:
+            await loop.run_in_executor(None, _ensure_models)
             log.info("Loading FluxRT StreamProcessor from %s", CONFIG_PATH)
             processor = await loop.run_in_executor(None, StreamProcessor, CONFIG_PATH)
             await loop.run_in_executor(None, processor.start)
