@@ -1,5 +1,5 @@
-# Base: CUDA 12.8 runtime + cuDNN, Ubuntu 22.04 (matches FluxRT README requirements)
-FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+# Base: CUDA 12.4 runtime + cuDNN, Ubuntu 22.04 (downgraded from 12.8 to match RunPod host driver)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -29,10 +29,10 @@ RUN git clone https://github.com/tensorforger/FluxRT.git \
 
 WORKDIR /workspace/FluxRT
 
-# PyTorch (CUDA 12.8) + FluxRT deps + server deps + huggingface_hub for runtime model fetch.
+# PyTorch (CUDA 12.4) + FluxRT deps + server deps + huggingface_hub for runtime model fetch.
 # Use absolute /usr/bin/python3.12 -m pip (avoid relying on a 'python' or 'pip' symlink).
 RUN /usr/bin/python3.12 -m pip install --upgrade pip \
-    && /usr/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+    && /usr/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
     && /usr/bin/python3.12 -m pip install -r requirements.txt \
     && /usr/bin/python3.12 -m pip install -e . \
     && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy \
