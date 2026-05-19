@@ -8,33 +8,37 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT_HEALTH=8765 \
     HF_HUB_ENABLE_HF_TRANSFER=1
 
-# System deps
+# Bootstrap: add deadsnakes PPA (FluxRT requires Python >=3.12, Ubuntu 22.04 ships 3.10)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git git-lfs python3.12 python3.12-dev python3-pip ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
+        software-properties-common ca-certificates curl gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs python3.12 python3.12-dev python3.12-venv \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && git lfs install \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python3
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-# Clone FluxRT (replace FLUXRT_REF with a pinned SHA when ready)
+# Clone FluxRT
 ARG FLUXRT_REF=main
 RUN git clone https://github.com/tensorforger/FluxRT.git \
- && cd FluxRT && git checkout ${FLUXRT_REF}
+    && cd FluxRT && git checkout ${FLUXRT_REF}
 
 WORKDIR /workspace/FluxRT
 
 # PyTorch (CUDA 12.8) + FluxRT deps + server deps
 RUN pip install --upgrade pip \
- && pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
- && pip install -r requirements.txt \
- && pip install -e . \
- && pip install fastapi "uvicorn[standard]" websockets pillow numpy hf_transfer
+    && pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+    && pip install -r requirements.txt \
+    && pip install -e . \
+    && pip install fastapi "uvicorn[standard]" websockets pillow numpy hf_transfer
 
 # Bake model weights so cold-start is short (~16 GB total)
 RUN git clone https://huggingface.co/TensorForger/RIFE-safetensors \
- && git clone https://huggingface.co/black-forest-labs/FLUX.2-klein-4B
+    && git clone https://huggingface.co/black-forest-labs/FLUX.2-klein-4B
 
 COPY server.py /workspace/FluxRT/server.py
 
