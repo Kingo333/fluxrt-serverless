@@ -91,26 +91,42 @@ def bgr_to_b64_jpeg(arr, quality=80):
 
 @asynccontextmanager
 async def lifespan(app):
+    """Non-blocking lifespan: start FastAPI immediately, warm up FluxRT in background.
+    /ping returns 204 while loading, 200 once ready. This lets RunPod's load balancer
+    keep the worker alive during the (potentially long) model load.
+    """
     global processor
-    log.info("Loading FluxRT StreamProcessor from %s", CONFIG_PATH)
-    processor = StreamProcessor(CONFIG_PATH)
-    processor.start()
-    for _ in range(120):
+
+    async def warmup():
+        global processor
+        loop = asyncio.get_event_loop()
         try:
-            if processor.is_ready():
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-    ready_event.set()
-    log.info("StreamProcessor ready")
+            log.info("Loading FluxRT StreamProcessor from %s", CONFIG_PATH)
+            processor = await loop.run_in_executor(None, StreamProcessor, CONFIG_PATH)
+            await loop.run_in_executor(None, processor.start)
+            for i in range(600):
+                try:
+                    if processor.is_ready():
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            ready_event.set()
+            log.info("StreamProcessor ready after warmup")
+        except Exception as e:
+            log.exception("Warmup failed: %s", e)
+
+    task = asyncio.create_task(warmup())
     try:
         yield
     finally:
+        task.cancel()
         try:
-            processor.stop()
+            if processor is not None:
+                processor.stop()
         except Exception:
             pass
+
 
 
 app = FastAPI(lifespan=lifespan)
