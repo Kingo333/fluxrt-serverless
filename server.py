@@ -53,84 +53,63 @@ RIFE_REPO_ID = os.environ.get("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
 
 def _ensure_models():
     """Download FLUX.2-klein-4B and RIFE weights into the local FluxRT working dir
-    on first boot. Skips if a sentinel file already exists. Uses hf_transfer for
-    multi-stream parallel downloads (HF_HUB_ENABLE_HF_TRANSFER=1)."""
+    on first boot. Skips if a sentinel file already exists AND the directory contains
+    a sane number of files (so a previously-interrupted download is re-attempted).
+    Uses hf_transfer for multi-stream parallel downloads (HF_HUB_ENABLE_HF_TRANSFER=1).
+    Revisions can be pinned via FLUX_REV / RIFE_REV env vars (default \"main\").
+    """
     import os as _os
     from huggingface_hub import snapshot_download
 
     flux_local = _os.path.join(FLUXRT_DIR, "FLUX.2-klein-4B")
     rife_local = _os.path.join(FLUXRT_DIR, "RIFE-safetensors")
-
     flux_sentinel = _os.path.join(flux_local, ".downloaded")
     rife_sentinel = _os.path.join(rife_local, ".downloaded")
+    flux_rev = _os.environ.get("FLUX_REV", "main")
+    rife_rev = _os.environ.get("RIFE_REV", "main")
 
-    if not _os.path.exists(flux_sentinel):
-        log.info("Downloading FLUX weights to %s ...", flux_local)
+    def _has_enough_files(d, minimum):
+        if not _os.path.isdir(d):
+            return False
+        n = 0
+        for _root, _dirs, _files in _os.walk(d):
+            n += len(_files)
+            if n >= minimum:
+                return True
+        return False
+
+    # FLUX.2-klein-4B has many shard files; require at least 5 to consider it complete.
+    if _os.path.exists(flux_sentinel) and _has_enough_files(flux_local, 5):
+        log.info("FLUX weights already present (rev=%s), skipping download", flux_rev)
+    else:
+        log.info("Downloading FLUX weights (rev=%s) to %s ...", flux_rev, flux_local)
         _os.makedirs(flux_local, exist_ok=True)
-        snapshot_download(repo_id=FLUX_REPO_ID, local_dir=flux_local,
-                          local_dir_use_symlinks=False, max_workers=8)
+        snapshot_download(
+            repo_id=FLUX_REPO_ID,
+            revision=flux_rev,
+            local_dir=flux_local,
+            local_dir_use_symlinks=False,
+            max_workers=8,
+        )
         with open(flux_sentinel, "w") as f:
-            f.write("ok")
+            f.write(flux_rev)
         log.info("FLUX weights ready")
-    else:
-        log.info("FLUX weights already present, skipping download")
 
-    if not _os.path.exists(rife_sentinel):
-        log.info("Downloading RIFE weights to %s ...", rife_local)
+    if _os.path.exists(rife_sentinel) and _has_enough_files(rife_local, 1):
+        log.info("RIFE weights already present (rev=%s), skipping download", rife_rev)
+    else:
+        log.info("Downloading RIFE weights (rev=%s) to %s ...", rife_rev, rife_local)
         _os.makedirs(rife_local, exist_ok=True)
-        snapshot_download(repo_id=RIFE_REPO_ID, local_dir=rife_local,
-                          local_dir_use_symlinks=False, max_workers=8)
+        snapshot_download(
+            repo_id=RIFE_REPO_ID,
+            revision=rife_rev,
+            local_dir=rife_local,
+            local_dir_use_symlinks=False,
+            max_workers=8,
+        )
         with open(rife_sentinel, "w") as f:
-            f.write("ok")
+            f.write(rife_rev)
         log.info("RIFE weights ready")
-    else:
-        log.info("RIFE weights already present, skipping download")
-
-# Global processor - loaded once per worker
-processor = None
-ready_event = asyncio.Event()
-
-
-def verify_token(token):
-    """Verify HMAC-SHA256 signed token minted by the Cloudflare Worker.
-    Token format: userId.garmentId.expEpoch.hexSig
-    """
-    if not token or not SESSION_SIGNING_SECRET:
-        return False
-    try:
-        last_dot = token.rfind(".")
-        payload, sig = token[:last_dot], token[last_dot + 1:]
-        parts = payload.split(".")
-        if len(parts) != 3:
-            return False
-        exp = int(parts[2])
-        if exp < int(time.time()):
-            return False
-        expected = hmac.new(
-            SESSION_SIGNING_SECRET.encode("utf-8"),
-            payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected, sig)
-    except Exception:
-        return False
-
-
-def b64_to_bgr(b64):
-    raw = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    arr = np.array(img)
-    return arr[:, :, ::-1].copy()
-
-
-def bgr_to_b64_jpeg(arr, quality=80):
-    rgb = arr[:, :, ::-1]
-    img = Image.fromarray(rgb)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
 @asynccontextmanager
 async def lifespan(app):
     """Non-blocking lifespan: start FastAPI immediately, warm up FluxRT in background.
@@ -177,9 +156,12 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/ping")
 async def ping():
+    """Health endpoint. Returns 200 always so RunPod load balancer keeps the worker alive
+    during the (potentially slow) first-boot model download. The JSON body tells callers
+    whether the FluxRT processor is actually ready to serve frames yet."""
     if ready_event.is_set():
-        return Response(status_code=200)
-    return Response(status_code=204)
+        return {"status": "ready"}
+    return {"status": "warming"}
 
 
 @app.websocket("/ws")
