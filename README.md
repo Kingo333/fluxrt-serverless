@@ -154,3 +154,8 @@ userId.garmentId.exp_epoch
 FluxRT model loading is intentionally not done during container startup.
 This prevents RunPod health checks from killing the worker before uvicorn
 can answer /ping.
+
+
+<!-- trigger rebuild: bake HF model weights (f93c64a) -->
+
+<!-- trigger rebuild: bake HF model weights (f93c64a) -->
