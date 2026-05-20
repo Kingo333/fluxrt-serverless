@@ -50,13 +50,60 @@ MODELS_DIR = os.environ.get("FLUXRT_MODELS_DIR", "/workspace/models")
 FLUX_REPO_ID = os.environ.get("FLUX_REPO_ID", "black-forest-labs/FLUX.2-klein-4B")
 RIFE_REPO_ID = os.environ.get("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
 
+# --- Module-level state (must exist BEFORE lifespan / warmup / handlers run) ---
+processor = None
+ready_event = asyncio.Event()
+
+if not SESSION_SIGNING_SECRET:
+    log.warning(
+        "SESSION_SIGNING_SECRET is empty - running in DEV MODE: verify_token() will accept "
+        "ALL /ws connections. Set SESSION_SIGNING_SECRET in the RunPod endpoint env vars before production."
+    )
+
+
+def verify_token(token: str) -> bool:
+    """Verify a session token of the form '<session_id>.<sig>' where
+    sig = HMAC-SHA256(SESSION_SIGNING_SECRET, session_id) hex-encoded.
+    If SESSION_SIGNING_SECRET is empty, accept all tokens (dev mode)."""
+    if not SESSION_SIGNING_SECRET:
+        return True
+    if not token or "." not in token:
+        return False
+    try:
+        session_id, sig = token.split(".", 1)
+        expected = hmac.new(
+            SESSION_SIGNING_SECRET.encode("utf-8"),
+            session_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, sig)
+    except Exception:
+        return False
+
+
+def b64_to_bgr(b64_str: str) -> "np.ndarray":
+    """Decode a base64 PNG/JPEG image into a BGR HxWx3 uint8 numpy array (OpenCV order)."""
+    raw = base64.b64decode(b64_str)
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    arr = np.asarray(img)  # RGB
+    return arr[:, :, ::-1].copy()  # BGR
+
+
+def bgr_to_b64_jpeg(bgr: "np.ndarray", quality: int = 85) -> str:
+    """Encode a BGR HxWx3 uint8 numpy array as base64-encoded JPEG."""
+    rgb = bgr[:, :, ::-1]
+    img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
 
 def _ensure_models():
     """Download FLUX.2-klein-4B and RIFE weights into the local FluxRT working dir
     on first boot. Skips if a sentinel file already exists AND the directory contains
     a sane number of files (so a previously-interrupted download is re-attempted).
     Uses hf_transfer for multi-stream parallel downloads (HF_HUB_ENABLE_HF_TRANSFER=1).
-    Revisions can be pinned via FLUX_REV / RIFE_REV env vars (default \"main\").
+    Revisions can be pinned via FLUX_REV / RIFE_REV env vars (default "main").
     """
     import os as _os
     from huggingface_hub import snapshot_download
@@ -110,11 +157,15 @@ def _ensure_models():
         with open(rife_sentinel, "w") as f:
             f.write(rife_rev)
         log.info("RIFE weights ready")
+
+
 @asynccontextmanager
 async def lifespan(app):
     """Non-blocking lifespan: start FastAPI immediately, warm up FluxRT in background.
-    /ping returns 204 while loading, 200 once ready. This lets RunPod's load balancer
-    keep the worker alive during the (potentially long) model load.
+    /ping returns status:warming while loading, status:ready once ready. This lets RunPod's
+    load balancer keep the worker alive during the (potentially long) model load.
+    On unrecoverable warmup failure we os._exit(1) so RunPod restarts the worker cleanly
+    rather than leaving it stuck in 'warming' forever.
     """
     global processor
 
@@ -136,7 +187,10 @@ async def lifespan(app):
             ready_event.set()
             log.info("StreamProcessor ready after warmup")
         except Exception as e:
-            log.exception("Warmup failed: %s", e)
+            log.exception("Warmup failed, exiting so RunPod restarts the worker: %s", e)
+            # Give logs a moment to flush, then exit so the platform restarts us cleanly.
+            await asyncio.sleep(1)
+            os._exit(1)
 
     task = asyncio.create_task(warmup())
     try:
@@ -148,7 +202,6 @@ async def lifespan(app):
                 processor.stop()
         except Exception:
             pass
-
 
 
 app = FastAPI(lifespan=lifespan)
