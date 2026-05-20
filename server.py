@@ -56,6 +56,7 @@ STATE: Dict[str, Any] = {
     "warmup_thread": None,
 }
 
+
 def verify_token(token: str) -> bool:
     if not SESSION_SIGNING_SECRET:
         return True
@@ -113,10 +114,31 @@ def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     sentinel = local_dir / ".downloaded"
 
-    if sentinel.exists():
+    # Fast path: sentinel present with enough files.
+    if sentinel.exists() and local_dir.exists():
         count = sum(1 for p in local_dir.rglob("*") if p.is_file())
         if count >= min_files:
-            log.info("model already present: %s", local_dir)
+            log.info("model already present (sentinel): %s", local_dir)
+            return
+
+    # Second fast path: image-baked models. Folder exists with enough files
+    # even though the sentinel was not written. Trust the baked content and
+    # write the sentinel so future starts hit the fast path above.
+    if local_dir.exists() and local_dir.is_dir():
+        try:
+            count = sum(1 for p in local_dir.rglob("*") if p.is_file())
+        except Exception:
+            count = 0
+        if count >= min_files:
+            log.info(
+                "model already present (baked, %d files): %s",
+                count,
+                local_dir,
+            )
+            try:
+                sentinel.write_text(str(time.time()))
+            except Exception as e:
+                log.warning("could not write sentinel for %s: %s", local_dir, e)
             return
 
     log.info("downloading %s to %s", repo_id, local_dir)
@@ -138,6 +160,7 @@ def ensure_models() -> None:
 
     if ENABLE_INT8:
         _download_model(INT8_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B-int8", min_files=3)
+
 
 def write_runtime_config() -> Path:
     config = {
@@ -228,6 +251,7 @@ def warmup_blocking() -> None:
             STATE["status"] = "error"
             STATE["error"] = f"{type(e).__name__}: {e}"
         raise
+
 
 def start_warmup_background() -> None:
     with STATE_LOCK:
@@ -333,6 +357,7 @@ async def warmup(wait: bool = Query(False)):
 
     return JSONResponse(public_state())
 
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
     if not verify_token(token):
@@ -346,15 +371,15 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         await websocket.send_json({"type": "warming", "state": state})
         start_warmup_background()
 
-    while True:
-        state = public_state()
-        if state["status"] == "ready":
-            break
-        if state["status"] == "error":
-            await websocket.send_json({"type": "error", "message": state["error"]})
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-            return
-        await asyncio.sleep(1)
+        while True:
+            state = public_state()
+            if state["status"] == "ready":
+                break
+            if state["status"] == "error":
+                await websocket.send_json({"type": "error", "message": state["error"]})
+                await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+                return
+            await asyncio.sleep(1)
 
     await websocket.send_json({"type": "ready"})
 
