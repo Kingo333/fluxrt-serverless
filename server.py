@@ -54,6 +54,12 @@ CONFIG_PATH = os.environ.get("FLUXRT_CONFIG", "/workspace/FluxRT/configs/stream_
 SESSION_SIGNING_SECRET = os.environ.get("SESSION_SIGNING_SECRET", "")
 PORT = int(os.environ.get("PORT", "8765"))
 
+# Diagnostic mode: when FLUXRT_SKIP_WARMUP is truthy, the worker starts FastAPI/uvicorn
+# and serves /ping + /debug/startup, but does NOT import torch/cv2/fluxrt and does NOT
+# download model weights. Used to isolate container/load-balancer health from FluxRT.
+FLUXRT_SKIP_WARMUP = os.environ.get("FLUXRT_SKIP_WARMUP", "").strip().lower() in ("1", "true", "yes", "on")
+STARTUP_LOG_PATH = os.environ.get("FLUXRT_STARTUP_LOG", "/tmp/fluxrt-startup.log")
+
 # Model weights downloaded at runtime (not baked into Docker image to keep build < 30 min)
 FLUXRT_DIR = os.environ.get("FLUXRT_DIR", "/workspace/FluxRT")
 MODELS_DIR = os.environ.get("FLUXRT_MODELS_DIR", "/workspace/models")
@@ -209,11 +215,17 @@ async def lifespan(app):
             await asyncio.sleep(1)
             os._exit(1)
 
-    task = asyncio.create_task(warmup())
+    if FLUXRT_SKIP_WARMUP:
+        log.warning("FLUXRT_SKIP_WARMUP=1 -> NOT starting FluxRT warmup. /ping will return ready, /ws will reject with warmup_skipped.")
+        ready_event.set()
+        task = None
+    else:
+        task = asyncio.create_task(warmup())
     try:
         yield
     finally:
-        task.cancel()
+        if task is not None:
+            task.cancel()
         try:
             if processor is not None:
                 processor.stop()
@@ -231,7 +243,12 @@ async def ping():
 
 @app.get("/debug/startup")
 async def debug_startup():
-    """Non-secret diagnostic snapshot of worker startup state."""
+    """Non-secret diagnostic snapshot of worker startup state.
+
+    When FLUXRT_SKIP_WARMUP=1 this stays lightweight: it does NOT import torch/cv2
+    so the route can answer even if those native libs are broken. It also returns
+    the last ~8KB of the start.sh diagnostic log at /tmp/fluxrt-startup.log.
+    """
     info = {
         "port": PORT,
         "config_path": CONFIG_PATH,
@@ -245,25 +262,55 @@ async def debug_startup():
         "fluxrt_dir_exists": os.path.isdir(FLUXRT_DIR),
         "flux_weights_dir_exists": os.path.isdir(os.path.join(FLUXRT_DIR, "FLUX.2-klein-4B")),
         "rife_weights_dir_exists": os.path.isdir(os.path.join(FLUXRT_DIR, "RIFE-safetensors")),
+        "fluxrt_skip_warmup": FLUXRT_SKIP_WARMUP,
+        "startup_log_path": STARTUP_LOG_PATH,
     }
+    # Always include start.sh diagnostic log (lightweight: just file IO)
     try:
-        import torch  # type: ignore
-        info["torch_version"] = torch.__version__
-        info["torch_cuda_version"] = torch.version.cuda
-        info["torch_cuda_available"] = bool(torch.cuda.is_available())
+        if os.path.isfile(STARTUP_LOG_PATH):
+            size = os.path.getsize(STARTUP_LOG_PATH)
+            info["startup_log_size_bytes"] = size
+            with open(STARTUP_LOG_PATH, "rb") as f:
+                # Tail last 8 KB to keep response small
+                if size > 8192:
+                    f.seek(-8192, 2)
+                info["startup_log_tail"] = f.read().decode("utf-8", errors="replace")
+        else:
+            info["startup_log_tail"] = None
+            info["startup_log_present"] = False
     except Exception as e:
-        info["torch_import_error"] = f"{type(e).__name__}: {e}"
-    try:
-        import cv2  # type: ignore
-        info["cv2_version"] = cv2.__version__
-    except Exception as e:
-        info["cv2_import_error"] = f"{type(e).__name__}: {e}"
+        info["startup_log_error"] = f"{type(e).__name__}: {e}"
+    # Only probe torch/cv2 when NOT in skip-warmup mode. Keeping the route lightweight
+    # in skip mode lets us verify container/uvicorn health even if native libs are broken.
+    if not FLUXRT_SKIP_WARMUP:
+        try:
+            import torch  # type: ignore
+            info["torch_version"] = torch.__version__
+            info["torch_cuda_version"] = torch.version.cuda
+            info["torch_cuda_available"] = bool(torch.cuda.is_available())
+        except Exception as e:
+            info["torch_import_error"] = f"{type(e).__name__}: {e}"
+        try:
+            import cv2  # type: ignore
+            info["cv2_version"] = cv2.__version__
+        except Exception as e:
+            info["cv2_import_error"] = f"{type(e).__name__}: {e}"
+    else:
+        info["torch_probed"] = False
+        info["cv2_probed"] = False
     return info
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
     if not verify_token(token):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    if FLUXRT_SKIP_WARMUP:
+        await websocket.accept()
+        try:
+            await websocket.send_json({"type": "error", "message": "warmup_skipped"})
+        finally:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="warmup_skipped")
         return
     await websocket.accept()
     if not ready_event.is_set():
