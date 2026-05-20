@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-dev python3.12-venv \
     && rm -rf /var/lib/apt/lists/* \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
-    && git lfs install
+    && git lfs install \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && /usr/bin/python3.12 --version \
+    && /usr/local/bin/python --version
 
 WORKDIR /workspace
 
@@ -108,4 +112,4 @@ EXPOSE 8765
 
 WORKDIR /workspace/FluxRT
 
-CMD ["/usr/bin/python3.12", "-u", "/app/server.py"]
+CMD ["python", "-u", "/app/server.py"]
