@@ -1,9 +1,11 @@
 .git
-.gitignore
-*.md
+.github
 __pycache__
 *.pyc
-.venv
-.idea
-.vscode
+*.pyo
+*.pyd
+.env
+.env.*
 node_modules
+.DS_Store
+README.old.md

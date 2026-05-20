@@ -1,88 +1,156 @@
 # fluxrt-serverless
 
-FluxRT FastAPI/WebSocket worker for RunPod Serverless Load Balancing endpoints.
-Powers Azyah Shopping's Live Cam virtual try-on.
+Clean RunPod Serverless Load Balancer wrapper for TensorForger FluxRT.
 
-## What's inside
+Reference:
+- https://github.com/tensorforger/FluxRT
 
-- `Dockerfile` — CUDA 12.8 base, installs FluxRT and bakes in FLUX.2-klein-4B + RIFE model weights (~16 GB) so cold starts are short.
-- `server.py` — FastAPI app exposing `GET /ping` (health) and `WS /ws` (FluxRT pipeline). Verifies an HMAC-SHA256 signed token minted by the Cloudflare orchestrator Worker.
-- `.dockerignore` — skip irrelevant files in the build context.
+This repo runs FluxRT as a FastAPI + WebSocket service on RunPod Load Balancer mode.
 
-## Build & push
+## Important
 
-Requires a build machine with Docker, ~30 GB free disk, decent bandwidth.
+This is NOT queue-based RunPod serverless.
 
-```bash
-docker login                                          # to Docker Hub (or your registry)
-docker build -t YOUR_DH_USER/fluxrt-serverless:latest .
-docker push YOUR_DH_USER/fluxrt-serverless:latest
+Do not use:
+
+```python
+runpod.serverless.start(...)
 ```
 
-To pin a specific upstream FluxRT commit instead of `main`:
+This service uses:
 
-```bash
-docker build --build-arg FLUXRT_REF=<commit_sha> -t YOUR_DH_USER/fluxrt-serverless:<tag> .
+uvicorn server.py on port 8765
+
+## Endpoints
+
+### GET /ping
+
+Always returns HTTP 200 as soon as uvicorn is running.
+
+### GET /health
+
+Same as /ping.
+
+### GET /debug/startup
+
+Non-secret diagnostics.
+
+Use:
+
+```
+/debug/startup?deep=true
 ```
 
-First build takes 30–60 min (model weight downloads). Subsequent builds are layer-cached.
+to probe torch/cv2.
 
-## Deploy on RunPod Serverless (Load Balancing)
+### POST /warmup
 
-1. RunPod console → Serverless → New Endpoint → choose **Load Balancing** type.
-2. Image: `YOUR_DH_USER/fluxrt-serverless:latest`.
-3. GPU: 4090 PRO (24 GB). Add A6000 / L40 as fallback if multi-GPU select is available.
-4. Workers: min 0, max 2 to start. Idle timeout 30s. **FlashBoot: ON**.
-5. Expose HTTP Ports: `8765`.
-6. Env vars:
-   - `PORT=8765`
-   - `PORT_HEALTH=8765`
-   - `SESSION_SIGNING_SECRET=<random hex, same value as the Cloudflare Worker secret>`
-7. Save. Copy the endpoint ID — paste into the Cloudflare Worker secret `RUNPOD_LB_ENDPOINT_ID`.
+Starts FluxRT model download/loading in the background.
 
-## Health checks
+Use:
 
-The load balancer polls `/ping` on the same port. Returns:
+```
+/warmup?wait=true
+```
 
-- 200 once `StreamProcessor.is_ready()` is true.
-- 204 while warming up.
+to wait until ready or error.
 
-Cold-start time is measured between first 204 and first 200.
+### WS /ws?token=...
 
-## Client protocol (JSON over WebSocket)
+Live WebSocket frame processing.
 
-Client connects to `wss://{ENDPOINT_ID}.api.runpod.ai/ws?token={signed_token}`.
-
-Client → Server:
+Client messages:
 
 ```json
-{"type":"set_prompt", "prompt":"…"}
-{"type":"set_reference_image", "image_b64":"…"}
-{"type":"frame", "frame_b64":"…"}
-{"type":"set_param", "name":"…", "value": "…"}
+{"type":"set_prompt","prompt":"..."}
+{"type":"set_reference_image","image_b64":"..."}
+{"type":"frame","frame_b64":"..."}
+{"type":"set_param","name":"steps","value":2}
 ```
 
-Server → Client:
+Server messages:
 
 ```json
-{"type":"warming"}
+{"type":"warming","state":{...}}
 {"type":"ready"}
-{"type":"frame", "frame_b64":"…"}
-{"type":"error", "message":"…"}
+{"type":"frame","frame_b64":"..."}
+{"type":"error","message":"..."}
 ```
 
-## Token verification
+## Required RunPod settings
 
-The Cloudflare orchestrator Worker mints a token shaped:
+Endpoint type:
+- Serverless Load Balancer / HTTP WebSocket
+
+Docker:
+- Branch: main
+- Dockerfile path: Dockerfile
+- Build context: .
+- Container start command override: empty
+
+Ports:
+- Expose only: 8765
+- PORT=8765
+- PORT_HEALTH=8765
+
+Recommended workers:
+- Min workers: 1
+- Max workers: 1 first, then scale later
+- Idle timeout: 300 seconds or more while testing
+
+Recommended GPU:
+- ADA_24 / RTX 4090 minimum
+- 48GB GPU preferred
+
+Recommended disk:
+- 80GB minimum
+- 100GB preferred
+
+## Required env vars
 
 ```
-{userId}.{garmentId}.{exp_epoch}.{hex_hmac_sha256_signature}
+PORT=8765
+PORT_HEALTH=8765
+HF_TOKEN=<huggingface token if required>
+SESSION_SIGNING_SECRET=<random secret>
+AUTO_WARMUP=false
+ENABLE_INT8=true
+ENABLE_REFERENCE_IMAGE=true
+FLUXRT_WIDTH=576
+FLUXRT_HEIGHT=320
+FLUXRT_STEPS=2
+WARMUP_TIMEOUT_S=900
 ```
 
-The server HMACs the `userId.garmentId.exp` payload with `SESSION_SIGNING_SECRET` and constant-time compares. Tokens expire 5 minutes after issuance. Connections without a valid token are closed with code 1008.
+## Token format
 
-## Security notes
+```
+<payload>.<signature>
+```
 
-- No persistent volume is mounted. Container disk is wiped when the Serverless worker scales down.
-- No frames are written to disk by `server.py`. They live in shared-memory tensors inside FluxRT only.
-- Bearer tokens for RunPod and Docker are never used at runtime by the worker — only at build/deploy time on your machine.
+Signature:
+
+```
+HMAC-SHA256(SESSION_SIGNING_SECRET, payload)
+```
+
+Payload may be:
+
+```
+userId.garmentId.exp_epoch
+```
+
+## Testing order
+
+1. Deploy with AUTO_WARMUP=false.
+2. Confirm /ping returns 200.
+3. Confirm /debug/startup works.
+4. Call /debug/startup?deep=true.
+5. Call /warmup?wait=true.
+6. Only after warmup succeeds, test /ws.
+
+## Notes
+
+FluxRT model loading is intentionally not done during container startup.
+This prevents RunPod health checks from killing the worker before uvicorn
+can answer /ping.

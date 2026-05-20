@@ -1,93 +1,68 @@
-"""
-FluxRT WebSocket server for RunPod Serverless Load Balancing.
-
-Endpoints:
-  GET  /ping            -> health (always HTTP 200; body says warming|ready)
-  GET  /debug/startup   -> non-secret diagnostic snapshot
-  WS   /ws              -> live cam pipeline (token query param required)
-
-Client protocol (JSON over WS):
-  Client -> Server:
-    {"type":"set_prompt", "prompt":"..."}
-    {"type":"set_reference_image", "image_b64":"..."}  # PNG/JPEG bytes, base64
-    {"type":"frame", "frame_b64":"..."}                # JPEG bytes, base64
-    {"type":"set_param", "name":"...", "value": ...}
-  Server -> Client:
-    {"type":"warming"}                                  # workers initializing
-    {"type":"ready"}                                    # warmup complete
-    {"type":"frame", "frame_b64":"..."}                 # JPEG output
-    {"type":"error", "message":"..."}
-
-Session token format (verified by verify_token):
-    "<payload>.<sig>" where payload may itself contain dots, e.g.
-    "<userId>.<garmentId>.<exp_epoch>" or just "<session_id>".
-    sig = HMAC-SHA256(SESSION_SIGNING_SECRET, payload) hex-encoded.
-    If SESSION_SIGNING_SECRET is empty, all tokens are accepted (dev mode).
-"""
-
 import asyncio
 import base64
-import hmac
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import shutil
+import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import JSONResponse
 from PIL import Image
 
-# Heavy fluxrt + torch + cv2 imports are deferred to a synchronous warmup_sync()
-# that runs entirely in a worker thread (run_in_executor). This keeps uvicorn able
-# to bind port 8765 and answer LB /ping probes during the (potentially long) cold
-# import / model-download / CUDA-init phase.
-StreamProcessor = None  # lazy-loaded in warmup_sync()
-crop_maximal_rectangle = None  # lazy-loaded in warmup_sync()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("fluxrt-lb")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("fluxrt-ws")
+PORT = int(os.getenv("PORT", "8765"))
 
-CONFIG_PATH = os.environ.get("FLUXRT_CONFIG", "/workspace/FluxRT/configs/stream_processor_config.json")
-SESSION_SIGNING_SECRET = os.environ.get("SESSION_SIGNING_SECRET", "")
-PORT = int(os.environ.get("PORT", "8765"))
+FLUXRT_ROOT = Path(os.getenv("FLUXRT_ROOT", "/workspace/FluxRT"))
+MODEL_ROOT = Path(os.getenv("MODEL_ROOT", str(FLUXRT_ROOT)))
 
-# Diagnostic mode: when FLUXRT_SKIP_WARMUP is truthy, the worker starts FastAPI/uvicorn
-# and serves /ping + /debug/startup, but does NOT import torch/cv2/fluxrt and does NOT
-# download model weights. Used to isolate container/load-balancer health from FluxRT.
-FLUXRT_SKIP_WARMUP = os.environ.get("FLUXRT_SKIP_WARMUP", "").strip().lower() in ("1", "true", "yes", "on")
-STARTUP_LOG_PATH = os.environ.get("FLUXRT_STARTUP_LOG", "/tmp/fluxrt-startup.log")
+FLUX_REPO_ID = os.getenv("FLUX_REPO_ID", "black-forest-labs/FLUX.2-klein-4B")
+RIFE_REPO_ID = os.getenv("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
+INT8_REPO_ID = os.getenv("INT8_REPO_ID", "aydin99/FLUX.2-klein-4B-int8")
 
-# Model weights downloaded at runtime (not baked into Docker image to keep build < 30 min)
-FLUXRT_DIR = os.environ.get("FLUXRT_DIR", "/workspace/FluxRT")
-MODELS_DIR = os.environ.get("FLUXRT_MODELS_DIR", "/workspace/models")
-FLUX_REPO_ID = os.environ.get("FLUX_REPO_ID", "black-forest-labs/FLUX.2-klein-4B")
-RIFE_REPO_ID = os.environ.get("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
+ENABLE_INT8 = os.getenv("ENABLE_INT8", "true").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_REFERENCE_IMAGE = os.getenv("ENABLE_REFERENCE_IMAGE", "true").strip().lower() in ("1", "true", "yes", "on")
 
-# --- Module-level state (must exist BEFORE lifespan / warmup / handlers run) ---
-processor = None
-ready_event = asyncio.Event()
-startup_error = None  # last warmup failure message (for /debug/startup)
+WIDTH = int(os.getenv("FLUXRT_WIDTH", "576"))
+HEIGHT = int(os.getenv("FLUXRT_HEIGHT", "320"))
+DEFAULT_STEPS = int(os.getenv("FLUXRT_STEPS", "2"))
+DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
+DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
+WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
-if not SESSION_SIGNING_SECRET:
-    log.warning(
-        "SESSION_SIGNING_SECRET is empty - running in DEV MODE: verify_token() will accept "
-        "ALL /ws connections. Set SESSION_SIGNING_SECRET in the RunPod endpoint env vars before production."
-    )
+SESSION_SIGNING_SECRET = os.getenv("SESSION_SIGNING_SECRET", "")
+
+STATE_LOCK = threading.RLock()
+STATE: Dict[str, Any] = {
+    "status": "cold",
+    "error": None,
+    "processor": None,
+    "crop_fn": None,
+    "warmup_started_at": None,
+    "ready_at": None,
+    "warmup_thread": None,
+}
 
 def verify_token(token: str) -> bool:
-    """Verify a session token of the form '<payload>.<sig>' where payload may itself
-    contain dots (e.g. '<userId>.<garmentId>.<exp_epoch>') and
-    sig = HMAC-SHA256(SESSION_SIGNING_SECRET, payload) hex-encoded.
-    Uses rsplit so any number of dots in the payload is fine. Validates exp_epoch if
-    the payload has a numeric last segment that looks like a unix timestamp.
-    If SESSION_SIGNING_SECRET is empty, accept all tokens (dev mode)."""
     if not SESSION_SIGNING_SECRET:
         return True
+
     if not token or "." not in token:
         return False
+
     try:
         payload, sig = token.rsplit(".", 1)
         expected = hmac.new(
@@ -95,281 +70,362 @@ def verify_token(token: str) -> bool:
             payload.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+
         if not hmac.compare_digest(expected, sig):
             return False
+
         parts = payload.split(".")
         if parts:
-            last = parts[-1]
-            if last.isdigit() and len(last) >= 9:
-                try:
-                    if int(last) < int(time.time()):
-                        return False
-                except Exception:
-                    pass
+            maybe_exp = parts[-1]
+            if maybe_exp.isdigit() and len(maybe_exp) >= 9:
+                if int(maybe_exp) < int(time.time()):
+                    return False
+
         return True
     except Exception:
         return False
 
-def b64_to_bgr(b64_str: str) -> "np.ndarray":
-    """Decode a base64 PNG/JPEG image into a BGR HxWx3 uint8 numpy array (OpenCV order)."""
-    raw = base64.b64decode(b64_str)
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    arr = np.asarray(img)  # RGB
-    return arr[:, :, ::-1].copy()  # BGR
 
-def bgr_to_b64_jpeg(bgr: "np.ndarray", quality: int = 85) -> str:
-    """Encode a BGR HxWx3 uint8 numpy array as base64-encoded JPEG."""
+def _strip_data_url(value: str) -> str:
+    if "," in value and value.strip().lower().startswith("data:"):
+        return value.split(",", 1)[1]
+    return value
+
+
+def b64_to_bgr(b64_str: str) -> np.ndarray:
+    raw = base64.b64decode(_strip_data_url(b64_str))
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    arr = np.asarray(img)
+    return arr[:, :, ::-1].copy()
+
+
+def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = 85) -> str:
     rgb = bgr[:, :, ::-1]
     img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
-def _ensure_models():
-    """Download FLUX.2-klein-4B and RIFE weights into the local FluxRT working dir."""
-    import os as _os
+
+def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
     from huggingface_hub import snapshot_download
 
-    flux_local = _os.path.join(FLUXRT_DIR, "FLUX.2-klein-4B")
-    rife_local = _os.path.join(FLUXRT_DIR, "RIFE-safetensors")
-    flux_sentinel = _os.path.join(flux_local, ".downloaded")
-    rife_sentinel = _os.path.join(rife_local, ".downloaded")
-    flux_rev = _os.environ.get("FLUX_REV", "main")
-    rife_rev = _os.environ.get("RIFE_REV", "main")
-    hf_token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    sentinel = local_dir / ".downloaded"
 
-    def _has_enough_files(d, minimum):
-        if not _os.path.isdir(d):
-            return False
-        n = 0
-        for _root, _dirs, _files in _os.walk(d):
-            n += len(_files)
-            if n >= minimum:
-                return True
-        return False
+    if sentinel.exists():
+        count = sum(1 for p in local_dir.rglob("*") if p.is_file())
+        if count >= min_files:
+            log.info("model already present: %s", local_dir)
+            return
 
-    if _os.path.exists(flux_sentinel) and _has_enough_files(flux_local, 5):
-        log.info("FLUX weights already present (rev=%s), skipping download", flux_rev)
-    else:
-        log.info("Downloading FLUX weights (rev=%s) to %s ...", flux_rev, flux_local)
-        _os.makedirs(flux_local, exist_ok=True)
-        snapshot_download(repo_id=FLUX_REPO_ID, revision=flux_rev, local_dir=flux_local,
-            local_dir_use_symlinks=False, max_workers=8, token=hf_token)
-        with open(flux_sentinel, "w") as f:
-            f.write(flux_rev)
-        log.info("FLUX weights ready")
+    log.info("downloading %s to %s", repo_id, local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=False,
+        token=token,
+        max_workers=8,
+    )
+    sentinel.write_text(str(time.time()))
+    log.info("download complete: %s", local_dir)
 
-    if _os.path.exists(rife_sentinel) and _has_enough_files(rife_local, 1):
-        log.info("RIFE weights already present (rev=%s), skipping download", rife_rev)
-    else:
-        log.info("Downloading RIFE weights (rev=%s) to %s ...", rife_rev, rife_local)
-        _os.makedirs(rife_local, exist_ok=True)
-        snapshot_download(repo_id=RIFE_REPO_ID, revision=rife_rev, local_dir=rife_local,
-            local_dir_use_symlinks=False, max_workers=8, token=hf_token)
-        with open(rife_sentinel, "w") as f:
-            f.write(rife_rev)
-        log.info("RIFE weights ready")
 
-def warmup_sync():
-    """Synchronous warmup: import heavy deps (fluxrt -> cv2/torch), download weights,
-    construct the StreamProcessor, and start it. Runs entirely in a worker thread via
-    run_in_executor so the asyncio event loop (and /ping) stays responsive.
-    Returns (processor, StreamProcessor_class, crop_maximal_rectangle) or raises.
-    """
-    log.info("warmup_sync: importing fluxrt (this pulls cv2 + torch)")
-    from fluxrt import StreamProcessor as _SP
-    from fluxrt.utils import crop_maximal_rectangle as _crm
-    log.info("warmup_sync: fluxrt imports OK")
-    _ensure_models()
-    log.info("warmup_sync: building StreamProcessor from %s", CONFIG_PATH)
-    proc = _SP(CONFIG_PATH)
-    proc.start()
-    for _ in range(600):
-        try:
-            if proc.is_ready():
-                break
-        except Exception:
-            pass
-        time.sleep(1)
-    log.info("warmup_sync: StreamProcessor ready")
-    return proc, _SP, _crm
+def ensure_models() -> None:
+    _download_model(FLUX_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B", min_files=5)
+    _download_model(RIFE_REPO_ID, FLUXRT_ROOT / "RIFE-safetensors", min_files=1)
+
+    if ENABLE_INT8:
+        _download_model(INT8_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B-int8", min_files=3)
+
+def write_runtime_config() -> Path:
+    config = {
+        "default_prompt": DEFAULT_PROMPT,
+        "default_steps": DEFAULT_STEPS,
+        "default_seed": DEFAULT_SEED,
+        "models_path": "FLUX.2-klein-4B",
+        "int8_models_path": "FLUX.2-klein-4B-int8",
+        "resolution": {
+            "height": HEIGHT,
+            "width": WIDTH,
+        },
+        "compile_models": False,
+        "enable_spatial_cache": True,
+        "enable_int8_quantization": ENABLE_INT8,
+        "target_fps": None,
+        "interpolation_exp": 2,
+        "use_reference_image": ENABLE_REFERENCE_IMAGE,
+        "reference_image_resolution": {
+            "height": HEIGHT,
+            "width": WIDTH,
+        },
+        "logging": True,
+    }
+
+    path = FLUXRT_ROOT / "config.server.runtime.json"
+    path.write_text(json.dumps(config, indent=2))
+    return path
+
+
+def warmup_blocking() -> None:
+    with STATE_LOCK:
+        if STATE["status"] == "ready":
+            return
+        if STATE["status"] == "loading":
+            return
+        STATE["status"] = "loading"
+        STATE["error"] = None
+        STATE["warmup_started_at"] = time.time()
+
+    try:
+        os.chdir(str(FLUXRT_ROOT))
+        log.info("warmup: cwd=%s", os.getcwd())
+
+        from fluxrt import StreamProcessor
+        from fluxrt.utils import crop_maximal_rectangle
+
+        log.info("warmup: fluxrt imports ok")
+
+        ensure_models()
+
+        config_path = write_runtime_config()
+        log.info("warmup: config written to %s", config_path)
+
+        proc = StreamProcessor(str(config_path))
+        proc.start()
+        log.info("warmup: processor started")
+
+        start = time.time()
+        while time.time() - start < WARMUP_TIMEOUT_S:
+            model_proc = getattr(proc.model_inference_subprocess, "process", None)
+            if model_proc is not None and not model_proc.is_alive():
+                raise RuntimeError("FluxRT model_inference_subprocess exited during warmup")
+
+            sched_proc = getattr(proc.output_scheduler_subprocess, "process", None)
+            if sched_proc is not None and not sched_proc.is_alive():
+                raise RuntimeError("FluxRT output_scheduler_subprocess exited during warmup")
+
+            try:
+                if proc.is_ready():
+                    with STATE_LOCK:
+                        STATE["processor"] = proc
+                        STATE["crop_fn"] = crop_maximal_rectangle
+                        STATE["status"] = "ready"
+                        STATE["ready_at"] = time.time()
+                    log.info("warmup: ready")
+                    return
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        raise TimeoutError(f"FluxRT warmup timed out after {WARMUP_TIMEOUT_S}s")
+
+    except Exception as e:
+        log.exception("warmup failed: %s", e)
+        with STATE_LOCK:
+            STATE["status"] = "error"
+            STATE["error"] = f"{type(e).__name__}: {e}"
+        raise
+
+def start_warmup_background() -> None:
+    with STATE_LOCK:
+        if STATE["status"] in ("loading", "ready"):
+            return
+        t = threading.Thread(target=warmup_blocking, name="fluxrt-warmup", daemon=True)
+        STATE["warmup_thread"] = t
+        t.start()
+
+
+def public_state() -> Dict[str, Any]:
+    with STATE_LOCK:
+        processor = STATE.get("processor")
+        return {
+            "status": STATE["status"],
+            "error": STATE["error"],
+            "warmup_started_at": STATE["warmup_started_at"],
+            "ready_at": STATE["ready_at"],
+            "processor_loaded": processor is not None,
+            "enable_int8": ENABLE_INT8,
+            "enable_reference_image": ENABLE_REFERENCE_IMAGE,
+            "resolution": {"width": WIDTH, "height": HEIGHT},
+        }
+
 
 @asynccontextmanager
-async def lifespan(app):
-    """Non-blocking lifespan: start FastAPI immediately, warm up FluxRT in background."""
-    global processor, StreamProcessor, crop_maximal_rectangle, startup_error
+async def lifespan(app: FastAPI):
+    if os.getenv("AUTO_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on"):
+        log.warning("AUTO_WARMUP enabled: starting FluxRT warmup in background")
+        start_warmup_background()
 
-    async def warmup():
-        global processor, StreamProcessor, crop_maximal_rectangle, startup_error
-        loop = asyncio.get_event_loop()
-        try:
-            proc, _SP, _crm = await loop.run_in_executor(None, warmup_sync)
-            StreamProcessor = _SP
-            crop_maximal_rectangle = _crm
-            processor = proc
-            ready_event.set()
-            log.info("warmup: ready_event set, worker can serve frames")
-        except Exception as e:
-            startup_error = f"{type(e).__name__}: {e}"
-            log.exception("warmup failed, exiting so RunPod restarts the worker: %s", e)
-            await asyncio.sleep(1)
-            os._exit(1)
+    yield
 
-    if FLUXRT_SKIP_WARMUP:
-        log.warning("FLUXRT_SKIP_WARMUP=1 -> NOT starting FluxRT warmup. /ping will return ready, /ws will reject with warmup_skipped.")
-        ready_event.set()
-        task = None
-    else:
-        task = asyncio.create_task(warmup())
-    try:
-        yield
-    finally:
-        if task is not None:
-            task.cancel()
+    with STATE_LOCK:
+        proc = STATE.get("processor")
+    if proc is not None:
         try:
-            if processor is not None:
-                processor.stop()
+            proc.stop()
         except Exception:
             pass
+
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.get("/ping")
 async def ping():
-    """Health endpoint. Always returns HTTP 200."""
-    if ready_event.is_set():
-        return {"status": "ready"}
-    return {"status": "warming"}
+    return JSONResponse({"ok": True, **public_state()})
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"ok": True, **public_state()})
+
 
 @app.get("/debug/startup")
-async def debug_startup():
-    """Non-secret diagnostic snapshot of worker startup state.
-
-    When FLUXRT_SKIP_WARMUP=1 this stays lightweight: it does NOT import torch/cv2
-    so the route can answer even if those native libs are broken. It also returns
-    the last ~8KB of the start.sh diagnostic log at /tmp/fluxrt-startup.log.
-    """
+async def debug_startup(deep: bool = Query(False)):
+    total, used, free = shutil.disk_usage("/")
     info = {
+        "ok": True,
         "port": PORT,
-        "config_path": CONFIG_PATH,
-        "config_path_exists": os.path.exists(CONFIG_PATH),
+        "cwd": os.getcwd(),
+        "fluxrt_root": str(FLUXRT_ROOT),
+        "fluxrt_root_exists": FLUXRT_ROOT.exists(),
+        "hf_token_configured": bool(os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")),
         "session_secret_configured": bool(SESSION_SIGNING_SECRET),
-        "hf_token_configured": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
-        "ready_event": ready_event.is_set(),
-        "processor_loaded": processor is not None,
-        "startup_error": startup_error,
-        "fluxrt_dir": FLUXRT_DIR,
-        "fluxrt_dir_exists": os.path.isdir(FLUXRT_DIR),
-        "flux_weights_dir_exists": os.path.isdir(os.path.join(FLUXRT_DIR, "FLUX.2-klein-4B")),
-        "rife_weights_dir_exists": os.path.isdir(os.path.join(FLUXRT_DIR, "RIFE-safetensors")),
-        "fluxrt_skip_warmup": FLUXRT_SKIP_WARMUP,
-        "startup_log_path": STARTUP_LOG_PATH,
+        "env_names": sorted(os.environ.keys()),
+        "disk": {"total": total, "used": used, "free": free},
+        **public_state(),
     }
-    # Always include start.sh diagnostic log (lightweight: just file IO)
-    try:
-        if os.path.isfile(STARTUP_LOG_PATH):
-            size = os.path.getsize(STARTUP_LOG_PATH)
-            info["startup_log_size_bytes"] = size
-            with open(STARTUP_LOG_PATH, "rb") as f:
-                # Tail last 8 KB to keep response small
-                if size > 8192:
-                    f.seek(-8192, 2)
-                info["startup_log_tail"] = f.read().decode("utf-8", errors="replace")
-        else:
-            info["startup_log_tail"] = None
-            info["startup_log_present"] = False
-    except Exception as e:
-        info["startup_log_error"] = f"{type(e).__name__}: {e}"
-    # Only probe torch/cv2 when NOT in skip-warmup mode. Keeping the route lightweight
-    # in skip mode lets us verify container/uvicorn health even if native libs are broken.
-    if not FLUXRT_SKIP_WARMUP:
+
+    if deep:
         try:
-            import torch  # type: ignore
-            info["torch_version"] = torch.__version__
-            info["torch_cuda_version"] = torch.version.cuda
-            info["torch_cuda_available"] = bool(torch.cuda.is_available())
+            import torch
+            info["torch"] = {
+                "version": torch.__version__,
+                "cuda": torch.version.cuda,
+                "cuda_available": bool(torch.cuda.is_available()),
+                "device_count": torch.cuda.device_count(),
+            }
         except Exception as e:
-            info["torch_import_error"] = f"{type(e).__name__}: {e}"
+            info["torch_error"] = f"{type(e).__name__}: {e}"
+
         try:
-            import cv2  # type: ignore
+            import cv2
             info["cv2_version"] = cv2.__version__
         except Exception as e:
-            info["cv2_import_error"] = f"{type(e).__name__}: {e}"
-    else:
-        info["torch_probed"] = False
-        info["cv2_probed"] = False
-    return info
+            info["cv2_error"] = f"{type(e).__name__}: {e}"
+
+    return JSONResponse(info)
+
+
+@app.post("/warmup")
+async def warmup(wait: bool = Query(False)):
+    start_warmup_background()
+
+    if wait:
+        for _ in range(WARMUP_TIMEOUT_S):
+            state = public_state()
+            if state["status"] in ("ready", "error"):
+                return JSONResponse(state)
+            await asyncio.sleep(1)
+
+    return JSONResponse(public_state())
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
     if not verify_token(token):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    if FLUXRT_SKIP_WARMUP:
-        await websocket.accept()
-        try:
-            await websocket.send_json({"type": "error", "message": "warmup_skipped"})
-        finally:
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="warmup_skipped")
-        return
+
     await websocket.accept()
-    if not ready_event.is_set():
-        await websocket.send_json({"type": "warming"})
-    await ready_event.wait()
+
+    state = public_state()
+    if state["status"] != "ready":
+        await websocket.send_json({"type": "warming", "state": state})
+        start_warmup_background()
+
+    while True:
+        state = public_state()
+        if state["status"] == "ready":
+            break
+        if state["status"] == "error":
+            await websocket.send_json({"type": "error", "message": state["error"]})
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+        await asyncio.sleep(1)
+
     await websocket.send_json({"type": "ready"})
 
-    assert processor is not None
-    input_t = processor.get_input_tensor()
-    output_t = processor.get_output_tensor()
-    res = processor.get_resolution()
-    H, W = int(res["height"]), int(res["width"])
+    with STATE_LOCK:
+        proc = STATE["processor"]
+        crop_fn = STATE["crop_fn"]
+
+    input_t = proc.get_input_tensor()
+    output_t = proc.get_output_tensor()
+    res = proc.get_resolution()
+    h, w = int(res["height"]), int(res["width"])
 
     try:
         while True:
-            msg = await websocket.receive_text()
+            raw = await websocket.receive_text()
             try:
-                data = json.loads(msg)
+                data = json.loads(raw)
             except Exception:
                 await websocket.send_json({"type": "error", "message": "invalid_json"})
                 continue
 
-            t = data.get("type")
-            if t == "set_prompt":
-                processor.set_prompt(str(data.get("prompt", "")))
-            elif t == "set_reference_image":
+            msg_type = data.get("type")
+
+            if msg_type == "set_prompt":
+                proc.set_prompt(str(data.get("prompt", "")))
+                await websocket.send_json({"type": "ack", "name": "set_prompt"})
+
+            elif msg_type == "set_param":
                 try:
-                    ref = b64_to_bgr(data["image_b64"])
-                    processor.set_reference_image(ref)
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"set_ref_failed:{e}"})
-            elif t == "set_param":
-                try:
-                    processor.set_param(data["name"], data["value"])
+                    proc.set_param(str(data["name"]), data["value"])
+                    await websocket.send_json({"type": "ack", "name": "set_param"})
                 except Exception as e:
                     await websocket.send_json({"type": "error", "message": f"set_param_failed:{e}"})
-            elif t == "frame":
+
+            elif msg_type == "set_reference_image":
+                try:
+                    ref = b64_to_bgr(data["image_b64"])
+                    proc.set_reference_image(ref)
+                    await websocket.send_json({"type": "ack", "name": "set_reference_image"})
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
+
+            elif msg_type == "frame":
                 try:
                     frame = b64_to_bgr(data["frame_b64"])
-                    resized = crop_maximal_rectangle(frame, H, W)
+                    resized = crop_fn(frame, h, w)
                     input_t.copy_from(resized)
-                    out = output_t.to_numpy()
-                    await websocket.send_json({"type": "frame", "frame_b64": bgr_to_b64_jpeg(out)})
+                    output = output_t.to_numpy()
+                    await websocket.send_json({
+                        "type": "frame",
+                        "frame_b64": bgr_to_b64_jpeg(output),
+                    })
                 except Exception as e:
                     await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong", "state": public_state()})
+
             else:
-                await websocket.send_json({"type": "error", "message": f"unknown_type:{t}"})
+                await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
+
     except WebSocketDisconnect:
-        log.info("client disconnected")
+        log.info("websocket disconnected")
     except Exception as e:
-        log.exception("ws error: %s", e)
+        log.exception("websocket failure: %s", e)
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
-        finally:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level=os.getenv("UVICORN_LOG_LEVEL", "info"))
