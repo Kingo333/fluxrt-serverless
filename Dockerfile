@@ -12,12 +12,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_ROOT=/workspace/FluxRT
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common ca-certificates curl gnupg \
-    git git-lfs bash ffmpeg \
-    libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 \
+        software-properties-common ca-certificates curl gnupg \
+        git git-lfs bash ffmpeg \
+        libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 python3.12-dev python3.12-venv \
+        python3.12 python3.12-dev python3.12-venv \
     && rm -rf /var/lib/apt/lists/* \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
     && git lfs install \
@@ -172,9 +172,16 @@ else:
 PY
 
 COPY server.py /app/server.py
+COPY bootstrap.py /app/bootstrap.py
+
+# Build-time smoke check: fail the build early if either app file has a syntax error.
+RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py
 
 EXPOSE 8765
 
 WORKDIR /workspace/FluxRT
 
-CMD ["python", "-u", "/app/server.py"]
+# Use bootstrap.py: it tries to import & run server.app under uvicorn, and if
+# that fails it starts a minimal FastAPI fallback on the same port so the
+# worker stays reachable and /debug/startup can surface the real traceback.
+CMD ["/usr/bin/python3.12", "-u", "/app/bootstrap.py"]
