@@ -82,6 +82,9 @@ RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 
+# Diagnostic cache-bust: force RunPod to create a fresh build artifact.
+LABEL diag.cache_bust="shell-health-2026-05-21-01"
+
 EXPOSE 8765
 
 WORKDIR /workspace/FluxRT
