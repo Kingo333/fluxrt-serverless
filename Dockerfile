@@ -82,7 +82,7 @@ EXPOSE 8765
 
 WORKDIR /workspace/FluxRT
 
-# Use bootstrap.py: it tries to import & run server.app under uvicorn, and if
-# that fails it starts a minimal FastAPI fallback on the same port so the
-# worker stays reachable and /debug/startup can surface the real traceback.
-CMD ["/usr/bin/python3.12", "-u", "/app/bootstrap.py"]
+# Diagnostic CMD wrapper: exit code 127 on serverless workers means "command
+# not found". Wrap in bash so we can log PATH, verify the python binary and
+# app files exist, then exec the real entrypoint /usr/bin/python3.12 -u /app/bootstrap.py.
+CMD ["/bin/bash", "-lc", "set -euxo pipefail; echo '[cmd-wrapper] started'; echo '[cmd-wrapper] PATH='$PATH; ls -l /usr/bin/python3.12 /usr/local/bin/python /app/bootstrap.py /app/server.py || true; /usr/bin/python3.12 --version; exec /usr/bin/python3.12 -u /app/bootstrap.py"]
