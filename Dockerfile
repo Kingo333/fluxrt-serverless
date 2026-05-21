@@ -78,11 +78,16 @@ COPY bootstrap.py /app/bootstrap.py
 # Build-time smoke check: fail the build early if either app file has a syntax error.
 RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py
 
+# Diagnostic: install netcat-openbsd for shell-health-server CMD below.
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+
 EXPOSE 8765
 
 WORKDIR /workspace/FluxRT
 
-# Diagnostic CMD wrapper: exit code 127 on serverless workers means "command
-# not found". Wrap in bash so we can log PATH, verify the python binary and
-# app files exist, then exec the real entrypoint /usr/bin/python3.12 -u /app/bootstrap.py.
-CMD ["/bin/bash", "-lc", "set -euxo pipefail; echo '[cmd-wrapper] started'; echo '[cmd-wrapper] PATH='$PATH; ls -l /usr/bin/python3.12 /usr/local/bin/python /app/bootstrap.py /app/server.py || true; /usr/bin/python3.12 --version; exec /usr/bin/python3.12 -u /app/bootstrap.py"]
+# Diagnostic shell-health-server: prove RunPod can execute a basic shell CMD
+# and answer /ping on PORT 8765 without Python, Uvicorn, FluxRT, Torch, or model
+# code. Workers were exiting with code 127 even with a bash wrapper, so this
+# pulls the entrypoint below the Python layer entirely.
+CMD ["/bin/sh", "-c", "echo '[shell-health] started'; while true; do printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}' | nc -l -p ${PORT:-8765} -q 1; done"]
