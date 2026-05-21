@@ -363,6 +363,81 @@ async def warmup(wait: bool = Query(False)):
     return JSONResponse(public_state())
 
 
+@app.post("/api/load")
+async def api_load(wait: bool = Query(False)):
+    """Alias for /warmup. Triggers background model loading. Owen-style HTTP-first."""
+    start_warmup_background()
+    if wait:
+        for _ in range(WARMUP_TIMEOUT_S):
+            state = public_state()
+            if state["status"] in ("ready", "error"):
+                return JSONResponse(state)
+            await asyncio.sleep(1)
+    return JSONResponse(public_state())
+
+
+@app.post("/api/predict")
+async def api_predict(payload: Dict[str, Any]):
+    """Single-frame HTTP predict endpoint (Owen-style).
+
+    Body:
+        {"base64_image": "...", "prompt": "...", "reference_image_b64": "optional"}
+
+    Returns:
+        {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
+        warmup has not completed yet.
+    """
+    state = public_state()
+    if state["status"] != "ready":
+        return JSONResponse({"error": "model_not_ready", "state": state}, status_code=503)
+
+    try:
+        b64 = payload.get("base64_image")
+        if not isinstance(b64, str) or not b64:
+            return JSONResponse({"error": "missing_base64_image"}, status_code=400)
+
+        prompt = payload.get("prompt")
+        ref_b64 = payload.get("reference_image_b64")
+
+        with STATE_LOCK:
+            proc = STATE["processor"]
+            crop_fn = STATE["crop_fn"]
+
+        if proc is None or crop_fn is None:
+            return JSONResponse({"error": "model_not_ready"}, status_code=503)
+
+        if isinstance(prompt, str) and prompt:
+            try:
+                proc.set_prompt(prompt)
+            except Exception as e:
+                log.warning("set_prompt failed: %s", e)
+
+        if isinstance(ref_b64, str) and ref_b64:
+            try:
+                ref = b64_to_bgr(ref_b64)
+                proc.set_reference_image(ref)
+            except Exception as e:
+                log.warning("set_reference_image failed: %s", e)
+
+        frame = b64_to_bgr(b64)
+        res = proc.get_resolution()
+        h, w = int(res["height"]), int(res["width"])
+        resized = crop_fn(frame, h, w)
+
+        input_t = proc.get_input_tensor()
+        output_t = proc.get_output_tensor()
+        input_t.copy_from(resized)
+        output = output_t.to_numpy()
+
+        return JSONResponse({"base64_image": bgr_to_b64_jpeg(output)})
+    except Exception as e:
+        log.exception("api_predict failed")
+        return JSONResponse(
+            {"error": "predict_failed", "message": f"{type(e).__name__}: {e}"},
+            status_code=500,
+        )
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
     if not verify_token(token):

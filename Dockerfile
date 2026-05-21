@@ -28,6 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
+# Clone FluxRT source only. Model weights are NOT baked into this image --
+# they are downloaded at runtime via /warmup or /api/load (Owen-style HTTP-first
+# pattern). This keeps the image small enough to actually start on RunPod
+# serverless workers.
 ARG FLUXRT_REF=main
 RUN git clone https://github.com/tensorforger/FluxRT.git /workspace/FluxRT \
     && cd /workspace/FluxRT \
@@ -55,121 +59,18 @@ print("fluxrt import ok")
 PY
 
 # ------------------------------------------------------------------------------
-# Hugging Face model bake -- split into separate RUN layers so each upload to
-# the RunPod registry is smaller and a transient I/O error only fails one layer.
+# Slim image: NO model baking.
+# - No FLUX.2-klein-4B bake
+# - No RIFE-safetensors bake
+# - No INT8 bake
+# - No build-time ARG HF_TOKEN
+# - No snapshot_download at build time
 #
-# HF_TOKEN is passed as a build arg; it is consumed inside each RUN layer and
-# is NOT persisted as an env var in any subsequent layer.
-#
-# ENABLE_INT8 defaults to false at BUILD time on purpose: baking the INT8 weights
-# pushed us over RunPod's 30-minute build limit. server.py keeps its runtime
-# ENABLE_INT8 behavior unchanged, so /warmup can lazy-fetch INT8 at runtime if
-# the endpoint env var ENABLE_INT8=true is set.
+# server.py already supports lazy model download at warmup via ensure_models().
+# /warmup and the new /api/load endpoint trigger that lazy download at runtime.
+# A RunPod Network Volume mounted at /runpod-volume (or HF_HOME) can be used
+# later to persist weights across worker spin-ups.
 # ------------------------------------------------------------------------------
-ARG HF_TOKEN=""
-ARG ENABLE_INT8=false
-ARG FLUX_REPO_ID=black-forest-labs/FLUX.2-klein-4B
-ARG RIFE_REPO_ID=TensorForger/RIFE-safetensors
-ARG INT8_REPO_ID=aydin99/FLUX.2-klein-4B-int8
-
-# Bake 1: RIFE (small, ~hundreds of MB) -- its own layer.
-RUN HF_TOKEN="${HF_TOKEN}" \
-    HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
-    RIFE_REPO_ID="${RIFE_REPO_ID}" \
-    /usr/bin/python3.12 - <<'PY'
-import os, time
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-ROOT = Path("/workspace/FluxRT")
-ROOT.mkdir(parents=True, exist_ok=True)
-
-token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
-if token in ("", "None"):
-    token = None
-
-repo_id = os.environ["RIFE_REPO_ID"]
-target = ROOT / "RIFE-safetensors"
-target.mkdir(parents=True, exist_ok=True)
-print(f"[bake-rife] downloading {repo_id} -> {target}", flush=True)
-snapshot_download(
-    repo_id=repo_id,
-    local_dir=str(target),
-    local_dir_use_symlinks=False,
-    token=token,
-    max_workers=8,
-)
-(target / ".downloaded").write_text(str(time.time()))
-print(f"[bake-rife] done {repo_id}", flush=True)
-PY
-
-# Bake 2: FLUX.2-klein-4B (the big one, ~12-16 GB) -- its own layer.
-RUN HF_TOKEN="${HF_TOKEN}" \
-    HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
-    FLUX_REPO_ID="${FLUX_REPO_ID}" \
-    /usr/bin/python3.12 - <<'PY'
-import os, time
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-ROOT = Path("/workspace/FluxRT")
-ROOT.mkdir(parents=True, exist_ok=True)
-
-token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
-if token in ("", "None"):
-    token = None
-
-repo_id = os.environ["FLUX_REPO_ID"]
-target = ROOT / "FLUX.2-klein-4B"
-target.mkdir(parents=True, exist_ok=True)
-print(f"[bake-flux] downloading {repo_id} -> {target}", flush=True)
-snapshot_download(
-    repo_id=repo_id,
-    local_dir=str(target),
-    local_dir_use_symlinks=False,
-    token=token,
-    max_workers=8,
-)
-(target / ".downloaded").write_text(str(time.time()))
-print(f"[bake-flux] done {repo_id}", flush=True)
-PY
-
-# Bake 3: INT8 -- intentionally skipped at build time (ENABLE_INT8 build-arg
-# defaults to false). server.py /warmup can lazy-fetch this at runtime if
-# the endpoint env var ENABLE_INT8=true is set. To re-enable baking,
-# pass --build-arg ENABLE_INT8=true.
-RUN HF_TOKEN="${HF_TOKEN}" \
-    HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
-    ENABLE_INT8="${ENABLE_INT8}" \
-    INT8_REPO_ID="${INT8_REPO_ID}" \
-    /usr/bin/python3.12 - <<'PY'
-import os, time
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-ROOT = Path("/workspace/FluxRT")
-ROOT.mkdir(parents=True, exist_ok=True)
-
-if os.environ.get("ENABLE_INT8", "false").strip().lower() not in ("1", "true", "yes", "on"):
-    print("[bake-int8] ENABLE_INT8 build-arg is false -- skipping INT8 bake (server.py will lazy-fetch at warmup if needed)", flush=True)
-else:
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
-    if token in ("", "None"):
-        token = None
-    repo_id = os.environ["INT8_REPO_ID"]
-    target = ROOT / "FLUX.2-klein-4B-int8"
-    target.mkdir(parents=True, exist_ok=True)
-    print(f"[bake-int8] downloading {repo_id} -> {target}", flush=True)
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=str(target),
-        local_dir_use_symlinks=False,
-        token=token,
-        max_workers=8,
-    )
-    (target / ".downloaded").write_text(str(time.time()))
-    print(f"[bake-int8] done {repo_id}", flush=True)
-PY
 
 COPY server.py /app/server.py
 COPY bootstrap.py /app/bootstrap.py
