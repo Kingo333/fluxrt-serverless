@@ -297,6 +297,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/")
+async def root():
+    return JSONResponse({"ok": True, "service": "fluxrt-lb", **public_state()})
+
+
 @app.get("/ping")
 async def ping():
     return JSONResponse({"ok": True, **public_state()})
