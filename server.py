@@ -56,6 +56,7 @@ STATE: Dict[str, Any] = {
     "warmup_thread": None,
 }
 
+
 def verify_token(token: str) -> bool:
     if not SESSION_SIGNING_SECRET:
         return True
@@ -85,10 +86,12 @@ def verify_token(token: str) -> bool:
     except Exception:
         return False
 
+
 def _strip_data_url(value: str) -> str:
     if "," in value and value.strip().lower().startswith("data:"):
         return value.split(",", 1)[1]
     return value
+
 
 def b64_to_bgr(b64_str: str) -> np.ndarray:
     raw = base64.b64decode(_strip_data_url(b64_str))
@@ -96,12 +99,14 @@ def b64_to_bgr(b64_str: str) -> np.ndarray:
     arr = np.asarray(img)
     return arr[:, :, ::-1].copy()
 
+
 def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = 85) -> str:
     rgb = bgr[:, :, ::-1]
     img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
 
 def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
     from huggingface_hub import snapshot_download
@@ -148,12 +153,14 @@ def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
     sentinel.write_text(str(time.time()))
     log.info("download complete: %s", local_dir)
 
+
 def ensure_models() -> None:
     _download_model(FLUX_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B", min_files=5)
     _download_model(RIFE_REPO_ID, FLUXRT_ROOT / "RIFE-safetensors", min_files=1)
 
     if ENABLE_INT8:
         _download_model(INT8_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B-int8", min_files=3)
+
 
 def write_runtime_config() -> Path:
     config = {
@@ -182,6 +189,7 @@ def write_runtime_config() -> Path:
     path = FLUXRT_ROOT / "config.server.runtime.json"
     path.write_text(json.dumps(config, indent=2))
     return path
+
 
 def warmup_blocking() -> None:
     with STATE_LOCK:
@@ -244,13 +252,15 @@ def warmup_blocking() -> None:
             STATE["error"] = f"{type(e).__name__}: {e}"
         raise
 
+
 def start_warmup_background() -> None:
     with STATE_LOCK:
         if STATE["status"] in ("loading", "ready"):
             return
-    t = threading.Thread(target=warmup_blocking, name="fluxrt-warmup", daemon=True)
-    STATE["warmup_thread"] = t
-    t.start()
+        t = threading.Thread(target=warmup_blocking, name="fluxrt-warmup", daemon=True)
+        STATE["warmup_thread"] = t
+        t.start()
+
 
 def public_state() -> Dict[str, Any]:
     with STATE_LOCK:
@@ -266,6 +276,7 @@ def public_state() -> Dict[str, Any]:
             "resolution": {"width": WIDTH, "height": HEIGHT},
         }
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if os.getenv("AUTO_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on"):
@@ -276,25 +287,30 @@ async def lifespan(app: FastAPI):
 
     with STATE_LOCK:
         proc = STATE.get("processor")
-        if proc is not None:
-            try:
-                proc.stop()
-            except Exception:
-                pass
+    if proc is not None:
+        try:
+            proc.stop()
+        except Exception:
+            pass
+
 
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 async def root():
     return JSONResponse({"ok": True, "service": "fluxrt-lb", **public_state()})
 
+
 @app.get("/ping")
 async def ping():
     return JSONResponse({"ok": True, **public_state()})
 
+
 @app.get("/health")
 async def health():
     return JSONResponse({"ok": True, **public_state()})
+
 
 @app.get("/debug/startup")
 async def debug_startup(deep: bool = Query(False)):
@@ -332,6 +348,7 @@ async def debug_startup(deep: bool = Query(False)):
 
     return JSONResponse(info)
 
+
 @app.post("/warmup")
 async def warmup(wait: bool = Query(False)):
     start_warmup_background()
@@ -344,6 +361,7 @@ async def warmup(wait: bool = Query(False)):
             await asyncio.sleep(1)
 
     return JSONResponse(public_state())
+
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
@@ -436,6 +454,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     import uvicorn
