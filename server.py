@@ -287,11 +287,11 @@ async def lifespan(app: FastAPI):
 
     with STATE_LOCK:
         proc = STATE.get("processor")
-    if proc is not None:
-        try:
-            proc.stop()
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                proc.stop()
+            except Exception:
+                pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -379,13 +379,11 @@ async def api_load(wait: bool = Query(False)):
 @app.post("/api/predict")
 async def api_predict(payload: Dict[str, Any]):
     """Single-frame HTTP predict endpoint (Owen-style).
-
     Body:
-        {"base64_image": "...", "prompt": "...", "reference_image_b64": "optional"}
-
+      {"base64_image": "...", "prompt": "...", "reference_image_b64": "optional"}
     Returns:
-        {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
-        warmup has not completed yet.
+      {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
+      warmup has not completed yet.
     """
     state = public_state()
     if state["status"] != "ready":
@@ -472,55 +470,148 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     res = proc.get_resolution()
     h, w = int(res["height"]), int(res["width"])
 
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "invalid_json"})
-                continue
+    # ------------------------------------------------------------------
+    # Latest-frame-wins live-cam pipeline.
+    #
+    # Receiver task: continuously reads WebSocket messages. set_prompt /
+    # set_reference_image / set_param / ping are handled inline. For
+    # "frame" messages we keep only the NEWEST pending frame; if a
+    # previous pending frame is still unprocessed we DROP it (and bump
+    # dropped_frame_count). Max backlog is 1.
+    #
+    # Processor task: loops, takes the latest pending frame (if any),
+    # runs it through FluxRT, sends the output, records timing. If no
+    # frame is pending it sleeps briefly to avoid busy-looping.
+    #
+    # An asyncio.Event coordinates clean shutdown when either side
+    # finishes (disconnect / error). No base64 is ever logged.
+    # ------------------------------------------------------------------
 
-            msg_type = data.get("type")
+    pending_lock = asyncio.Lock()
+    pending_frame_b64: Optional[str] = None
+    pending_recv_ts: float = 0.0
+    dropped_frame_count = 0
+    last_send_ts = 0.0
+    stop_event = asyncio.Event()
 
-            if msg_type == "set_prompt":
-                proc.set_prompt(str(data.get("prompt", "")))
-                await websocket.send_json({"type": "ack", "name": "set_prompt"})
-
-            elif msg_type == "set_param":
+    async def receiver():
+        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count
+        try:
+            while not stop_event.is_set():
+                raw = await websocket.receive_text()
                 try:
-                    proc.set_param(str(data["name"]), data["value"])
-                    await websocket.send_json({"type": "ack", "name": "set_param"})
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"set_param_failed:{e}"})
+                    data = json.loads(raw)
+                except Exception:
+                    await websocket.send_json({"type": "error", "message": "invalid_json"})
+                    continue
 
-            elif msg_type == "set_reference_image":
-                try:
-                    ref = b64_to_bgr(data["image_b64"])
-                    proc.set_reference_image(ref)
-                    await websocket.send_json({"type": "ack", "name": "set_reference_image"})
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
+                msg_type = data.get("type")
 
-            elif msg_type == "frame":
+                if msg_type == "set_prompt":
+                    try:
+                        proc.set_prompt(str(data.get("prompt", "")))
+                        await websocket.send_json({"type": "ack", "name": "set_prompt"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_prompt_failed:{e}"})
+
+                elif msg_type == "set_param":
+                    try:
+                        proc.set_param(str(data["name"]), data["value"])
+                        await websocket.send_json({"type": "ack", "name": "set_param"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_param_failed:{e}"})
+
+                elif msg_type == "set_reference_image":
+                    try:
+                        ref = b64_to_bgr(data["image_b64"])
+                        proc.set_reference_image(ref)
+                        await websocket.send_json({"type": "ack", "name": "set_reference_image"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
+
+                elif msg_type == "frame":
+                    # Latest-frame-wins: overwrite any pending frame.
+                    frame_b64 = data.get("frame_b64")
+                    if isinstance(frame_b64, str) and frame_b64:
+                        async with pending_lock:
+                            if pending_frame_b64 is not None:
+                                dropped_frame_count += 1
+                            pending_frame_b64 = frame_b64
+                            pending_recv_ts = time.time()
+
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong", "state": public_state()})
+
+                else:
+                    await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
+        except WebSocketDisconnect:
+            log.info("livecam receiver: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam receiver failure: %s", e)
+        finally:
+            stop_event.set()
+
+    async def processor_loop():
+        nonlocal pending_frame_b64, pending_recv_ts, last_send_ts
+        log_every = 30  # log timing every N sent frames
+        sent = 0
+        try:
+            while not stop_event.is_set():
+                async with pending_lock:
+                    frame_b64 = pending_frame_b64
+                    recv_ts = pending_recv_ts
+                    pending_frame_b64 = None
+
+                if frame_b64 is None:
+                    # No work; brief idle to avoid busy loop.
+                    await asyncio.sleep(0.01)
+                    continue
+
+                t_proc_start = time.time()
                 try:
-                    frame = b64_to_bgr(data["frame_b64"])
+                    frame = b64_to_bgr(frame_b64)
                     resized = crop_fn(frame, h, w)
                     input_t.copy_from(resized)
                     output = output_t.to_numpy()
-                    await websocket.send_json({
-                        "type": "frame",
-                        "frame_b64": bgr_to_b64_jpeg(output),
-                    })
+                    out_b64 = bgr_to_b64_jpeg(output)
                 except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
+                    try:
+                        await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
+                    except Exception:
+                        pass
+                    continue
+                t_proc_end = time.time()
 
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong", "state": public_state()})
+                try:
+                    await websocket.send_json({"type": "frame", "frame_b64": out_b64})
+                except Exception as e:
+                    log.warning("livecam processor: send failed: %s", e)
+                    break
+                t_send = time.time()
 
-            else:
-                await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
+                interval_ms = (t_send - last_send_ts) * 1000.0 if last_send_ts else 0.0
+                last_send_ts = t_send
+                sent += 1
 
+                if sent % log_every == 0:
+                    log.info(
+                        "livecam timing: proc_ms=%.1f pending_age_ms=%.1f "
+                        "send_interval_ms=%.1f dropped=%d sent=%d",
+                        (t_proc_end - t_proc_start) * 1000.0,
+                        (t_proc_start - recv_ts) * 1000.0,
+                        interval_ms,
+                        dropped_frame_count,
+                        sent,
+                    )
+        except WebSocketDisconnect:
+            log.info("livecam processor: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam processor failure: %s", e)
+        finally:
+            stop_event.set()
+
+    try:
+        await asyncio.gather(receiver(), processor_loop())
     except WebSocketDisconnect:
         log.info("websocket disconnected")
     except Exception as e:
