@@ -43,6 +43,13 @@ DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
+ENABLE_PLAYBACK_SCHEDULER = os.getenv("ENABLE_PLAYBACK_SCHEDULER", "false").strip().lower() in ("1", "true", "yes", "on")
+PLAYBACK_TARGET_FPS = float(os.getenv("PLAYBACK_TARGET_FPS", "12"))
+PLAYBACK_MAX_JITTER_MS = float(os.getenv("PLAYBACK_MAX_JITTER_MS", "40"))
+REPEAT_LAST_FRAME_WHEN_IDLE = os.getenv("REPEAT_LAST_FRAME_WHEN_IDLE", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_LIVECAM_TIMING_LOG = os.getenv("ENABLE_LIVECAM_TIMING_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+LIVECAM_LOG_EVERY = max(1, int(os.getenv("LIVECAM_LOG_EVERY", "30")))
+
 SESSION_SIGNING_SECRET = os.getenv("SESSION_SIGNING_SECRET", "")
 
 STATE_LOCK = threading.RLock()
@@ -480,8 +487,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     # dropped_frame_count). Max backlog is 1.
     #
     # Processor task: loops, takes the latest pending frame (if any),
-    # runs it through FluxRT, sends the output, records timing. If no
-    # frame is pending it sleeps briefly to avoid busy-looping.
+    # runs it through FluxRT, publishes output to sender hand-off state.
+    #
+    # Sender task: waits on output_event and sends frames to client,
+    # either immediately (scheduler off) or on cadence (scheduler on).
     #
     # An asyncio.Event coordinates clean shutdown when either side
     # finishes (disconnect / error). No base64 is ever logged.
@@ -491,8 +500,14 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     pending_frame_b64: Optional[str] = None
     pending_recv_ts: float = 0.0
     dropped_frame_count = 0
-    last_send_ts = 0.0
     stop_event = asyncio.Event()
+
+    # Track B: sender hand-off state.
+    latest_output_b64: Optional[str] = None
+    latest_output_seq: int = 0
+    latest_output_ts: float = 0.0
+    last_sent_seq: int = 0
+    output_event = asyncio.Event()
 
     async def receiver():
         nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count
@@ -552,9 +567,8 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             stop_event.set()
 
     async def processor_loop():
-        nonlocal pending_frame_b64, pending_recv_ts, last_send_ts
-        log_every = 30  # log timing every N sent frames
-        sent = 0
+        nonlocal pending_frame_b64, pending_recv_ts, latest_output_b64, latest_output_seq, latest_output_ts
+        processed = 0
         try:
             while not stop_event.is_set():
                 async with pending_lock:
@@ -582,26 +596,25 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     continue
                 t_proc_end = time.time()
 
-                try:
-                    await websocket.send_json({"type": "frame", "frame_b64": out_b64})
-                except Exception as e:
-                    log.warning("livecam processor: send failed: %s", e)
-                    break
-                t_send = time.time()
+                # Publish to sender hand-off.
+                latest_output_b64 = out_b64
+                latest_output_seq += 1
+                latest_output_ts = t_proc_end
+                output_event.set()
 
-                interval_ms = (t_send - last_send_ts) * 1000.0 if last_send_ts else 0.0
-                last_send_ts = t_send
-                sent += 1
+                processed += 1
 
-                if sent % log_every == 0:
+                if ENABLE_LIVECAM_TIMING_LOG and processed % LIVECAM_LOG_EVERY == 0:
+                    proc_ms = (t_proc_end - t_proc_start) * 1000.0
+                    pending_age_ms = (t_proc_start - recv_ts) * 1000.0
                     log.info(
                         "livecam timing: proc_ms=%.1f pending_age_ms=%.1f "
-                        "send_interval_ms=%.1f dropped=%d sent=%d",
-                        (t_proc_end - t_proc_start) * 1000.0,
-                        (t_proc_start - recv_ts) * 1000.0,
-                        interval_ms,
+                        "dropped=%d processed=%d latest_seq=%d",
+                        proc_ms,
+                        pending_age_ms,
                         dropped_frame_count,
-                        sent,
+                        processed,
+                        latest_output_seq,
                     )
         except WebSocketDisconnect:
             log.info("livecam processor: websocket disconnected")
@@ -609,9 +622,121 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             log.exception("livecam processor failure: %s", e)
         finally:
             stop_event.set()
+            output_event.set()
+
+    async def sender_loop():
+        nonlocal latest_output_b64, latest_output_seq, last_sent_seq
+
+        try:
+            unique_frames_sent = 0
+            repeated_frames_sent = 0
+            last_send_ts = 0.0
+
+            if not ENABLE_PLAYBACK_SCHEDULER:
+                # Scheduler OFF: send immediately on new output_event.
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(output_event.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    output_event.clear()
+
+                    if latest_output_b64 is not None and latest_output_seq > last_sent_seq:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            last_sent_seq = latest_output_seq
+                            unique_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+
+                        if ENABLE_LIVECAM_TIMING_LOG and (unique_frames_sent + repeated_frames_sent) % LIVECAM_LOG_EVERY == 0:
+                            sender_interval_ms = (time.time() - last_send_ts) * 1000.0 if last_send_ts > 0 else 0.0
+                            log.info(
+                                "livecam sender: scheduler_enabled=False sender_interval_ms=%.1f "
+                                "unique_frames_sent=%d repeated_frames_sent=%d latest_seq=%d last_sent_seq=%d",
+                                sender_interval_ms,
+                                unique_frames_sent,
+                                repeated_frames_sent,
+                                latest_output_seq,
+                                last_sent_seq,
+                            )
+            else:
+                # Scheduler ON: cadence-based with jitter handling.
+                period_s = 1.0 / PLAYBACK_TARGET_FPS if PLAYBACK_TARGET_FPS > 0 else 0.0
+                max_jitter_s = PLAYBACK_MAX_JITTER_MS / 1000.0
+                next_tick_ts = time.time()
+
+                while not stop_event.is_set():
+                    cadence_deadline = next_tick_ts
+
+                    # Check if new frame available.
+                    have_new_frame = latest_output_b64 is not None and latest_output_seq > last_sent_seq
+
+                    if have_new_frame:
+                        freshness_deadline = latest_output_ts + max_jitter_s
+                        emit_deadline = min(cadence_deadline, freshness_deadline)
+                    else:
+                        emit_deadline = cadence_deadline
+
+                    # Wait until emit_deadline or output_event.
+                    wait_time = max(0, emit_deadline - time.time())
+                    try:
+                        await asyncio.wait_for(output_event.wait(), timeout=wait_time)
+                        # Early wake: clear event and recompute, do NOT send immediately.
+                        output_event.clear()
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+
+                    if stop_event.is_set():
+                        break
+
+                    # emit_deadline reached.
+                    if have_new_frame:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            last_sent_seq = latest_output_seq
+                            unique_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+                    elif REPEAT_LAST_FRAME_WHEN_IDLE and latest_output_b64 is not None:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            repeated_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+
+                    # Advance cadence.
+                    next_tick_ts += period_s
+
+                    # Log periodically.
+                    total_sent = unique_frames_sent + repeated_frames_sent
+                    if ENABLE_LIVECAM_TIMING_LOG and total_sent > 0 and total_sent % LIVECAM_LOG_EVERY == 0:
+                        sender_interval_ms = (time.time() - last_send_ts) * 1000.0 if last_send_ts > 0 else 0.0
+                        log.info(
+                            "livecam sender: scheduler_enabled=True sender_interval_ms=%.1f "
+                            "unique_frames_sent=%d repeated_frames_sent=%d latest_seq=%d last_sent_seq=%d",
+                            sender_interval_ms,
+                            unique_frames_sent,
+                            repeated_frames_sent,
+                            latest_output_seq,
+                            last_sent_seq,
+                        )
+        except WebSocketDisconnect:
+            log.info("livecam sender: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam sender failure: %s", e)
+        finally:
+            stop_event.set()
 
     try:
-        await asyncio.gather(receiver(), processor_loop())
+        await asyncio.gather(receiver(), processor_loop(), sender_loop())
     except WebSocketDisconnect:
         log.info("websocket disconnected")
     except Exception as e:
