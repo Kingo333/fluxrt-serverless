@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from PIL import Image
+
+from session_token import SessionClock, SessionToken, parse_and_verify
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -44,6 +46,17 @@ DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame i
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
 SESSION_SIGNING_SECRET = os.getenv("SESSION_SIGNING_SECRET", "")
+# Streaming cap per session (D4). The token can lower it, never raise it.
+MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "300"))
+# This worker only serves Standard-tier tokens (and legacy tokens, which are Standard).
+SERVED_TIER = "standard"
+
+# Fail closed: without a signing secret every token check would be meaningless.
+# bootstrap.py re-raises SystemExit, so the container exits instead of serving.
+if not SESSION_SIGNING_SECRET:
+    raise SystemExit("SESSION_SIGNING_SECRET is not set; refusing to start")
+
+SESSION_CLOCK = SessionClock()
 
 STATE_LOCK = threading.RLock()
 STATE: Dict[str, Any] = {
@@ -57,34 +70,25 @@ STATE: Dict[str, Any] = {
 }
 
 
-def verify_token(token: str) -> bool:
-    if not SESSION_SIGNING_SECRET:
-        return True
+def verify_token(token: str) -> Optional[SessionToken]:
+    """Valid, unexpired, Standard-tier token or None. Expiry segment is required."""
+    tok = parse_and_verify(token, SESSION_SIGNING_SECRET)
+    if tok is None or tok.tier != SERVED_TIER:
+        return None
+    return tok
 
-    if not token or "." not in token:
-        return False
 
-    try:
-        payload, sig = token.rsplit(".", 1)
-        expected = hmac.new(
-            SESSION_SIGNING_SECRET.encode("utf-8"),
-            payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+def unauthorized() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-        if not hmac.compare_digest(expected, sig):
-            return False
 
-        parts = payload.split(".")
-        if parts:
-            maybe_exp = parts[-1]
-            if maybe_exp.isdigit() and len(maybe_exp) >= 9:
-                if int(maybe_exp) < int(time.time()):
-                    return False
+def request_token(header_token: Optional[str], query_token: Optional[str]) -> Optional[SessionToken]:
+    """Admin HTTP routes accept the session token in X-Session-Token or ?token=.
 
-        return True
-    except Exception:
-        return False
+    The Authorization header is not used: RunPod's gateway consumes it for the
+    RunPod API key.
+    """
+    return verify_token(header_token or query_token or "")
 
 
 def _strip_data_url(value: str) -> str:
@@ -313,7 +317,13 @@ async def health():
 
 
 @app.get("/debug/startup")
-async def debug_startup(deep: bool = Query(False)):
+async def debug_startup(
+    deep: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     total, used, free = shutil.disk_usage("/")
     info = {
         "ok": True,
@@ -350,7 +360,13 @@ async def debug_startup(deep: bool = Query(False)):
 
 
 @app.post("/warmup")
-async def warmup(wait: bool = Query(False)):
+async def warmup(
+    wait: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     start_warmup_background()
 
     if wait:
@@ -364,8 +380,14 @@ async def warmup(wait: bool = Query(False)):
 
 
 @app.post("/api/load")
-async def api_load(wait: bool = Query(False)):
+async def api_load(
+    wait: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
     """Alias for /warmup. Triggers background model loading. Owen-style HTTP-first."""
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     start_warmup_background()
     if wait:
         for _ in range(WARMUP_TIMEOUT_S):
@@ -377,7 +399,11 @@ async def api_load(wait: bool = Query(False)):
 
 
 @app.post("/api/predict")
-async def api_predict(payload: Dict[str, Any]):
+async def api_predict(
+    payload: Dict[str, Any],
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
     """Single-frame HTTP predict endpoint (Owen-style).
 
     Body:
@@ -387,6 +413,9 @@ async def api_predict(payload: Dict[str, Any]):
         {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
         warmup has not completed yet.
     """
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
+
     state = public_state()
     if state["status"] != "ready":
         return JSONResponse({"error": "model_not_ready", "state": state}, status_code=503)
@@ -440,7 +469,8 @@ async def api_predict(payload: Dict[str, Any]):
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
-    if not verify_token(token):
+    session_tok = verify_token(token)
+    if session_tok is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
@@ -461,7 +491,13 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 return
             await asyncio.sleep(1)
 
-    await websocket.send_json({"type": "ready"})
+    deadline = SESSION_CLOCK.deadline(session_tok, MAX_SESSION_SECONDS)
+    if time.time() >= deadline:
+        await websocket.send_json({"type": "status", "status": "session_limit"})
+        await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        return
+
+    await websocket.send_json({"type": "ready", "session_deadline": int(deadline)})
 
     with STATE_LOCK:
         proc = STATE["processor"]
@@ -474,7 +510,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
             try:
                 data = json.loads(raw)
             except Exception:
@@ -521,6 +560,13 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             else:
                 await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
 
+    except asyncio.TimeoutError:
+        log.info("session time limit reached")
+        try:
+            await websocket.send_json({"type": "status", "status": "session_limit"})
+            await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        except Exception:
+            pass
     except WebSocketDisconnect:
         log.info("websocket disconnected")
     except Exception as e:

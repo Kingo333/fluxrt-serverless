@@ -31,9 +31,9 @@ Always returns HTTP 200 as soon as uvicorn is running.
 
 Same as /ping.
 
-### GET /debug/startup
+### GET /debug/startup  (auth required)
 
-Non-secret diagnostics.
+Non-secret diagnostics. Needs a valid session token (see "Auth" below).
 
 Use:
 
@@ -43,7 +43,7 @@ Use:
 
 to probe torch/cv2.
 
-### POST /warmup
+### POST /warmup, POST /api/load  (auth required)
 
 Starts FluxRT model download/loading in the background.
 
@@ -55,9 +55,25 @@ Use:
 
 to wait until ready or error.
 
+### POST /api/predict  (auth required)
+
+Single-frame HTTP predict.
+
 ### WS /ws?token=...
 
-Live WebSocket frame processing.
+Live WebSocket frame processing. Each session streams for at most
+`MAX_SESSION_SECONDS` (default 300) after `ready`; the server then sends
+`{"type":"status","status":"session_limit"}` and closes the socket.
+Reconnecting with the same token resumes the same clock.
+
+## Auth
+
+The server refuses to start if `SESSION_SIGNING_SECRET` is unset.
+
+Admin routes take the session token in an `X-Session-Token` header or a
+`?token=` query parameter. The `Authorization` header is not used, because
+RunPod's gateway consumes it for the RunPod API key. Only Standard-tier tokens
+(and legacy 3-part tokens) are accepted.
 
 Client messages:
 
@@ -75,6 +91,7 @@ Server messages:
 {"type":"ready"}
 {"type":"frame","frame_b64":"..."}
 {"type":"error","message":"..."}
+{"type":"status","status":"session_limit"}
 ```
 
 ## Required RunPod settings
@@ -112,7 +129,8 @@ Recommended disk:
 PORT=8765
 PORT_HEALTH=8765
 HF_TOKEN=<huggingface token if required>
-SESSION_SIGNING_SECRET=<random secret>
+SESSION_SIGNING_SECRET=<random secret, same value as the Cloudflare Worker>
+MAX_SESSION_SECONDS=300
 AUTO_WARMUP=false
 ENABLE_INT8=true
 ENABLE_REFERENCE_IMAGE=true
@@ -125,28 +143,30 @@ WARMUP_TIMEOUT_S=900
 ## Token format
 
 ```
-<payload>.<signature>
+<payload>.<hex HMAC-SHA256(SESSION_SIGNING_SECRET, payload)>
 ```
 
-Signature:
+Payload (current, issued by the Worker):
 
 ```
-HMAC-SHA256(SESSION_SIGNING_SECRET, payload)
+userId.garmentId.tier.maxSessionSeconds.expEpochSeconds
 ```
 
-Payload may be:
+Legacy payload (still accepted, treated as Standard):
 
 ```
-userId.garmentId.exp_epoch
+userId.garmentId.expEpochSeconds
 ```
+
+The expiry segment is required in both. See `session_token.py`.
 
 ## Testing order
 
 1. Deploy with AUTO_WARMUP=false.
 2. Confirm /ping returns 200.
-3. Confirm /debug/startup works.
-4. Call /debug/startup?deep=true.
-5. Call /warmup?wait=true.
+3. Confirm /debug/startup returns 401 without a token, 200 with one.
+4. Call /debug/startup?deep=true with a token.
+5. Call /warmup?wait=true with a token.
 6. Only after warmup succeeds, test /ws.
 
 ## Notes
