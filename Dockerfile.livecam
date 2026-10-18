@@ -1,0 +1,112 @@
+# Live Cam dual-engine image: FluxRT (Standard) + JoyAI-Video-Edit (Premium HD).
+#
+#   LIVECAM_ENGINE=fluxrt  (default) FluxRT, same code and Python env as Dockerfile.fluxrt
+#   LIVECAM_ENGINE=joyai             JoyAI adapter (:8765) + unmodified JoyAI on 127.0.0.1:8080
+#
+# Each engine has its own Python so their dependencies never clash:
+#   FluxRT: /usr/bin/python3.12 (torch cu124), as in the live image
+#   JoyAI:  /opt/joyai-venv (python3.10, torch 2.9.1 cu128, SageAttention, joyomni_ops for sm_120a)
+#
+# GPU per engine (set on the RunPod endpoint):
+#   fluxrt -> the current 48 GB card (or any card FluxRT runs on today)
+#   joyai  -> RTX 5090 32 GB ("32 GB PRO") + network volume with weights at /runpod-volume/joyai
+# No model weights are baked in.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ARG FLUXRT_REF=main
+ARG JOYAI_COMMIT=d875895dd44950caf06f1a2cc4f4601c9eadc5cd
+ARG SAGE_COMMIT=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
+ARG CUTLASS_COMMIT=dcf215af
+ARG MAX_JOBS=4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=8765 \
+    PORT_HEALTH=8765 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/workspace/.cache/huggingface \
+    FLUXRT_ROOT=/workspace/FluxRT \
+    MODEL_ROOT=/workspace/FluxRT \
+    CUDA_HOME=/usr/local/cuda
+
+# ---------------------------------------------------------------------------
+# System packages: FluxRT's list plus Python 3.10 headers/venv and a compiler
+# (JoyAI's torch.compile / Triton kernels build at runtime).
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates curl gnupg \
+        git git-lfs bash ffmpeg build-essential ninja-build \
+        libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 \
+        python3.10 python3.10-dev python3.10-venv \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && git lfs install \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+
+# ---------------------------------------------------------------------------
+# FluxRT engine (identical steps to Dockerfile.fluxrt)
+# ---------------------------------------------------------------------------
+WORKDIR /workspace
+RUN git clone https://github.com/tensorforger/FluxRT.git /workspace/FluxRT \
+    && cd /workspace/FluxRT && git checkout ${FLUXRT_REF}
+WORKDIR /workspace/FluxRT
+RUN /usr/bin/python3.12 -m pip install --upgrade pip setuptools wheel \
+    && /usr/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
+    && /usr/bin/python3.12 -m pip install -r requirements.txt \
+    && /usr/bin/python3.12 -m pip install -e . \
+    && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy "huggingface_hub[hf_transfer]"
+RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt; print('fluxrt env ok', torch.__version__, torch.version.cuda)"
+
+# ---------------------------------------------------------------------------
+# JoyAI engine, in its own venv. Built only for the RTX 5090 (sm_120a).
+# ---------------------------------------------------------------------------
+ENV TORCH_CUDA_ARCH_LIST=12.0 \
+    JOYOMNI_OPS_CUDA_ARCHS=120a
+RUN python3.10 -m venv /opt/joyai-venv \
+    && /opt/joyai-venv/bin/pip install --upgrade pip setuptools wheel
+RUN git clone https://github.com/jd-opensource/JoyAI-Video-Edit.git /opt/JoyAI-Video-Edit \
+    && git -C /opt/JoyAI-Video-Edit checkout ${JOYAI_COMMIT} \
+    && /opt/joyai-venv/bin/pip install -r /opt/JoyAI-Video-Edit/deploy/requirements.txt
+RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
+    && cd /tmp/SageAttention && git checkout ${SAGE_COMMIT} \
+    && git apply /opt/JoyAI-Video-Edit/deploy/sageattention-cudagraph-stream.patch \
+    && EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 4" MAX_JOBS=${MAX_JOBS} /opt/joyai-venv/bin/python setup.py install \
+    && cd / && rm -rf /tmp/SageAttention
+RUN git clone https://github.com/NVIDIA/cutlass.git /tmp/cutlass \
+    && git -C /tmp/cutlass checkout ${CUTLASS_COMMIT} \
+    && JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=${MAX_JOBS} \
+       /opt/joyai-venv/bin/pip install --no-build-isolation /opt/JoyAI-Video-Edit/deploy/joyomni_ops \
+    && rm -rf /tmp/cutlass
+COPY joyai/requirements-adapter.txt /tmp/joyai-adapter-requirements.txt
+RUN /opt/joyai-venv/bin/pip install -r /tmp/joyai-adapter-requirements.txt \
+    && /opt/joyai-venv/bin/python -c "import torch, sageattention, joyomni_ops, fastapi, websockets, httpx; print('joyai env ok', torch.__version__, torch.version.cuda, 'fp8', joyomni_ops.has_fp8())"
+
+# ---------------------------------------------------------------------------
+# App code (shared token module + both engines' entry points)
+# ---------------------------------------------------------------------------
+COPY server.py bootstrap.py session_token.py /app/
+COPY joyai /app/joyai
+RUN chmod +x /app/joyai/start_upstream.sh /app/joyai/scripts/populate_volume.sh \
+    && /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py \
+    && /opt/joyai-venv/bin/python -m py_compile /app/session_token.py /app/joyai/adapter/*.py
+
+ENV LIVECAM_ENGINE=fluxrt \
+    JOYAI_PYTHON=/opt/joyai-venv/bin/python \
+    JOYAI_DIR=/opt/JoyAI-Video-Edit/deploy \
+    JOYAI_VOLUME_ROOT=/runpod-volume/joyai \
+    JOYOMNI_CKPT_ROOT=/runpod-volume/joyai/checkpoints \
+    JOYOMNI_CACHE_ROOT=/runpod-volume/joyai/cache_rtx5090 \
+    JOYOMNI_SAGE_ATTN=1 \
+    JOYOMNI_FP8_FAST_ACCUM=1 \
+    JOYOMNI_LOW_VRAM=1
+
+EXPOSE 8765
+WORKDIR /workspace/FluxRT
+# bootstrap.py reads LIVECAM_ENGINE: fluxrt runs here; joyai execs the JoyAI venv.
+CMD ["/usr/bin/python3.12", "-u", "/app/bootstrap.py"]
