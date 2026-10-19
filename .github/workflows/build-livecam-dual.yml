@@ -26,7 +26,8 @@ concurrency:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moves to Ubuntu 26 from 2026-10-19; the passing build ran on 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 340
     steps:
       - name: Checkout repository
@@ -62,3 +63,9 @@ jobs:
           # No Actions cache: the image layers exceed GitHub's 10 GB per-repo
           # cache limit, so a restored cache is partial and the build fails.
           no-cache: true
+          # Fewer parallel CUDA compiles so the 16 GB runner isn't starved
+          # ("hosted runner lost communication" during the kernel builds).
+          build-args: |
+            MAX_JOBS=2
+            EXT_PARALLEL=1
+            NVCC_THREADS=1

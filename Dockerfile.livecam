@@ -18,6 +18,8 @@ ARG JOYAI_COMMIT=d875895dd44950caf06f1a2cc4f4601c9eadc5cd
 ARG SAGE_COMMIT=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 ARG CUTLASS_COMMIT=dcf215af
 ARG MAX_JOBS=4
+ARG EXT_PARALLEL=4
+ARG NVCC_THREADS=4
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -76,7 +78,7 @@ RUN git clone https://github.com/jd-opensource/JoyAI-Video-Edit.git /opt/JoyAI-V
 RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
     && cd /tmp/SageAttention && git checkout ${SAGE_COMMIT} \
     && git apply /opt/JoyAI-Video-Edit/deploy/sageattention-cudagraph-stream.patch \
-    && EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 4" MAX_JOBS=${MAX_JOBS} /opt/joyai-venv/bin/python setup.py install \
+    && EXT_PARALLEL=${EXT_PARALLEL} NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS}" MAX_JOBS=${MAX_JOBS} /opt/joyai-venv/bin/python setup.py install \
     && cd / && rm -rf /tmp/SageAttention
 RUN git clone https://github.com/NVIDIA/cutlass.git /tmp/cutlass \
     && git -C /tmp/cutlass checkout ${CUTLASS_COMMIT} \
