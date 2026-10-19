@@ -94,7 +94,9 @@ COPY server.py bootstrap.py session_token.py /app/
 COPY joyai /app/joyai
 RUN chmod +x /app/joyai/start_upstream.sh /app/joyai/scripts/populate_volume.sh \
     && /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py \
-    && /opt/joyai-venv/bin/python -m py_compile /app/session_token.py /app/joyai/adapter/*.py
+    && /opt/joyai-venv/bin/python -m py_compile /app/session_token.py /app/joyai/adapter/*.py \
+    && cd /app && SESSION_SIGNING_SECRET=build-check /usr/bin/python3.12 -c "import server; print('fluxrt server import ok')" \
+    && cd /app && SESSION_SIGNING_SECRET=build-check JOYAI_UPSTREAM_COMMAND= /opt/joyai-venv/bin/python -c "from joyai.adapter.app import create_app; create_app(); print('joyai adapter import ok')"
 
 ENV LIVECAM_ENGINE=fluxrt \
     JOYAI_PYTHON=/opt/joyai-venv/bin/python \

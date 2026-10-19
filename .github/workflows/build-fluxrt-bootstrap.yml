@@ -9,6 +9,7 @@ on:
       - Dockerfile.fluxrt
       - server.py
       - bootstrap.py
+      - session_token.py
       - .github/workflows/build-fluxrt-bootstrap.yml
   pull_request:
     branches:
@@ -17,6 +18,7 @@ on:
       - Dockerfile.fluxrt
       - server.py
       - bootstrap.py
+      - session_token.py
       - .github/workflows/build-fluxrt-bootstrap.yml
   workflow_dispatch:
 
