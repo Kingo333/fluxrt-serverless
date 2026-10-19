@@ -9,6 +9,7 @@ on:
       - Dockerfile.fluxrt
       - server.py
       - bootstrap.py
+      - session_token.py
       - .github/workflows/build-fluxrt-bootstrap.yml
   pull_request:
     branches:
@@ -17,6 +18,7 @@ on:
       - Dockerfile.fluxrt
       - server.py
       - bootstrap.py
+      - session_token.py
       - .github/workflows/build-fluxrt-bootstrap.yml
   workflow_dispatch:
 
@@ -48,7 +50,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # PR builds only check that the image builds. Publishing happens on push to
+      # main (or the listed branches), so a PR can never replace the tag RunPod pulls.
       - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -61,7 +66,7 @@ jobs:
           context: .
           file: ./Dockerfile.fluxrt
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ghcr.io/kingo333/fluxrt-serverless:fluxrt-bootstrap-v1
             ghcr.io/kingo333/fluxrt-serverless:fluxrt-bootstrap-v1-${{ github.sha }}

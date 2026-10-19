@@ -1,5 +1,8 @@
 # fluxrt-serverless
 
+> **Two engines, one image:** `Dockerfile.livecam` builds FluxRT + JoyAI-Video-Edit; set
+> `LIVECAM_ENGINE=fluxrt|joyai` on the RunPod endpoint. See [LIVECAM_ENGINES.md](LIVECAM_ENGINES.md).
+
 Clean RunPod Serverless Load Balancer wrapper for TensorForger FluxRT.
 
 Reference:
@@ -159,3 +162,13 @@ can answer /ping.
 <!-- trigger rebuild: bake HF model weights (f93c64a) -->
 
 <!-- trigger rebuild: bake HF model weights (f93c64a) -->
+
+## Auth and session cap
+
+- The server refuses to start if `SESSION_SIGNING_SECRET` is unset.
+- `/warmup`, `/api/load`, `/api/predict`, `/debug/startup` need a session token in
+  `X-Session-Token` or `?token=` (RunPod's gateway uses `Authorization`). `/ping`, `/health` stay public.
+- Tokens: `userId.garmentId.tier.maxSessionSeconds.exp.<hmac>` (current) or `userId.garmentId.exp.<hmac>`
+  (legacy, treated as Standard). The expiry segment is required. See `session_token.py`.
+- `ACCEPTED_TIERS` (default `standard,premium`) and `MAX_SESSION_SECONDS` (default 300): after
+  `ready`, a session streams for at most that long, then gets `{"type":"status","status":"session_limit"}`.

@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from PIL import Image
+
+from session_token import SessionClock, SessionToken, parse_and_verify
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -43,7 +45,26 @@ DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
+ENABLE_PLAYBACK_SCHEDULER = os.getenv("ENABLE_PLAYBACK_SCHEDULER", "false").strip().lower() in ("1", "true", "yes", "on")
+PLAYBACK_TARGET_FPS = float(os.getenv("PLAYBACK_TARGET_FPS", "12"))
+PLAYBACK_MAX_JITTER_MS = float(os.getenv("PLAYBACK_MAX_JITTER_MS", "40"))
+REPEAT_LAST_FRAME_WHEN_IDLE = os.getenv("REPEAT_LAST_FRAME_WHEN_IDLE", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_LIVECAM_TIMING_LOG = os.getenv("ENABLE_LIVECAM_TIMING_LOG", "true").strip().lower() in ("1", "true", "yes", "on")
+LIVECAM_LOG_EVERY = max(1, int(os.getenv("LIVECAM_LOG_EVERY", "30")))
+
 SESSION_SIGNING_SECRET = os.getenv("SESSION_SIGNING_SECRET", "")
+# Streaming cap per session (D4). The token can lower it, never raise it.
+MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "300"))
+# Token tiers this worker serves. Both by default: with LIVECAM_ENGINE one
+# endpoint can serve either tier; the Cloudflare Worker decides routing.
+ACCEPTED_TIERS = {t.strip() for t in os.getenv("ACCEPTED_TIERS", "standard,premium").split(",") if t.strip()}
+
+# Fail closed: without a signing secret every token check would be meaningless.
+# bootstrap.py re-raises SystemExit, so the container exits instead of serving.
+if not SESSION_SIGNING_SECRET:
+    raise SystemExit("SESSION_SIGNING_SECRET is not set; refusing to start")
+
+SESSION_CLOCK = SessionClock()
 
 STATE_LOCK = threading.RLock()
 STATE: Dict[str, Any] = {
@@ -57,34 +78,25 @@ STATE: Dict[str, Any] = {
 }
 
 
-def verify_token(token: str) -> bool:
-    if not SESSION_SIGNING_SECRET:
-        return True
+def verify_token(token: str) -> Optional[SessionToken]:
+    """Valid, unexpired token for an accepted tier, else None. Expiry segment is required."""
+    tok = parse_and_verify(token, SESSION_SIGNING_SECRET)
+    if tok is None or tok.tier not in ACCEPTED_TIERS:
+        return None
+    return tok
 
-    if not token or "." not in token:
-        return False
 
-    try:
-        payload, sig = token.rsplit(".", 1)
-        expected = hmac.new(
-            SESSION_SIGNING_SECRET.encode("utf-8"),
-            payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+def unauthorized() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-        if not hmac.compare_digest(expected, sig):
-            return False
 
-        parts = payload.split(".")
-        if parts:
-            maybe_exp = parts[-1]
-            if maybe_exp.isdigit() and len(maybe_exp) >= 9:
-                if int(maybe_exp) < int(time.time()):
-                    return False
+def request_token(header_token: Optional[str], query_token: Optional[str]) -> Optional[SessionToken]:
+    """Admin HTTP routes take the session token in X-Session-Token or ?token=.
 
-        return True
-    except Exception:
-        return False
+    The Authorization header is not used: RunPod's gateway consumes it for the
+    RunPod API key.
+    """
+    return verify_token(header_token or query_token or "")
 
 
 def _strip_data_url(value: str) -> str:
@@ -287,11 +299,11 @@ async def lifespan(app: FastAPI):
 
     with STATE_LOCK:
         proc = STATE.get("processor")
-    if proc is not None:
-        try:
-            proc.stop()
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                proc.stop()
+            except Exception:
+                pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -313,7 +325,13 @@ async def health():
 
 
 @app.get("/debug/startup")
-async def debug_startup(deep: bool = Query(False)):
+async def debug_startup(
+    deep: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     total, used, free = shutil.disk_usage("/")
     info = {
         "ok": True,
@@ -350,7 +368,13 @@ async def debug_startup(deep: bool = Query(False)):
 
 
 @app.post("/warmup")
-async def warmup(wait: bool = Query(False)):
+async def warmup(
+    wait: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     start_warmup_background()
 
     if wait:
@@ -364,8 +388,14 @@ async def warmup(wait: bool = Query(False)):
 
 
 @app.post("/api/load")
-async def api_load(wait: bool = Query(False)):
+async def api_load(
+    wait: bool = Query(False),
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
     """Alias for /warmup. Triggers background model loading. Owen-style HTTP-first."""
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
     start_warmup_background()
     if wait:
         for _ in range(WARMUP_TIMEOUT_S):
@@ -377,16 +407,21 @@ async def api_load(wait: bool = Query(False)):
 
 
 @app.post("/api/predict")
-async def api_predict(payload: Dict[str, Any]):
+async def api_predict(
+    payload: Dict[str, Any],
+    token: Optional[str] = Query(default=None),
+    x_session_token: Optional[str] = Header(default=None),
+):
     """Single-frame HTTP predict endpoint (Owen-style).
-
     Body:
-        {"base64_image": "...", "prompt": "...", "reference_image_b64": "optional"}
-
+      {"base64_image": "...", "prompt": "...", "reference_image_b64": "optional"}
     Returns:
-        {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
-        warmup has not completed yet.
+      {"base64_image": "..."} on success, or {"error": "model_not_ready"} if
+      warmup has not completed yet.
     """
+    if request_token(x_session_token, token) is None:
+        return unauthorized()
+
     state = public_state()
     if state["status"] != "ready":
         return JSONResponse({"error": "model_not_ready", "state": state}, status_code=503)
@@ -440,7 +475,8 @@ async def api_predict(payload: Dict[str, Any]):
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str = Query(default="")):
-    if not verify_token(token):
+    session_tok = verify_token(token)
+    if session_tok is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
@@ -461,7 +497,13 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 return
             await asyncio.sleep(1)
 
-    await websocket.send_json({"type": "ready"})
+    deadline = SESSION_CLOCK.deadline(session_tok, MAX_SESSION_SECONDS)
+    if time.time() >= deadline:
+        await websocket.send_json({"type": "status", "status": "session_limit"})
+        await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        return
+
+    await websocket.send_json({"type": "ready", "session_deadline": int(deadline)})
 
     with STATE_LOCK:
         proc = STATE["processor"]
@@ -472,55 +514,283 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     res = proc.get_resolution()
     h, w = int(res["height"]), int(res["width"])
 
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "invalid_json"})
-                continue
+    # ------------------------------------------------------------------
+    # Latest-frame-wins live-cam pipeline.
+    #
+    # Receiver task: continuously reads WebSocket messages. set_prompt /
+    # set_reference_image / set_param / ping are handled inline. For
+    # "frame" messages we keep only the NEWEST pending frame; if a
+    # previous pending frame is still unprocessed we DROP it (and bump
+    # dropped_frame_count). Max backlog is 1.
+    #
+    # Processor task: loops, takes the latest pending frame (if any),
+    # runs it through FluxRT, publishes output to sender hand-off state.
+    #
+    # Sender task: waits on output_event and sends frames to client,
+    # either immediately (scheduler off) or on cadence (scheduler on).
+    #
+    # An asyncio.Event coordinates clean shutdown when either side
+    # finishes (disconnect / error). No base64 is ever logged.
+    # ------------------------------------------------------------------
 
-            msg_type = data.get("type")
+    pending_lock = asyncio.Lock()
+    pending_frame_b64: Optional[str] = None
+    pending_recv_ts: float = 0.0
+    dropped_frame_count = 0
+    stop_event = asyncio.Event()
 
-            if msg_type == "set_prompt":
-                proc.set_prompt(str(data.get("prompt", "")))
-                await websocket.send_json({"type": "ack", "name": "set_prompt"})
+    # Track B: sender hand-off state.
+    latest_output_b64: Optional[str] = None
+    latest_output_seq: int = 0
+    latest_output_ts: float = 0.0
+    last_sent_seq: int = 0
+    output_event = asyncio.Event()
 
-            elif msg_type == "set_param":
+    async def receiver():
+        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count
+        try:
+            while not stop_event.is_set():
+                raw = await websocket.receive_text()
                 try:
-                    proc.set_param(str(data["name"]), data["value"])
-                    await websocket.send_json({"type": "ack", "name": "set_param"})
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"set_param_failed:{e}"})
+                    data = json.loads(raw)
+                except Exception:
+                    await websocket.send_json({"type": "error", "message": "invalid_json"})
+                    continue
 
-            elif msg_type == "set_reference_image":
-                try:
-                    ref = b64_to_bgr(data["image_b64"])
-                    proc.set_reference_image(ref)
-                    await websocket.send_json({"type": "ack", "name": "set_reference_image"})
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
+                msg_type = data.get("type")
 
-            elif msg_type == "frame":
+                if msg_type == "set_prompt":
+                    try:
+                        proc.set_prompt(str(data.get("prompt", "")))
+                        await websocket.send_json({"type": "ack", "name": "set_prompt"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_prompt_failed:{e}"})
+
+                elif msg_type == "set_param":
+                    try:
+                        proc.set_param(str(data["name"]), data["value"])
+                        await websocket.send_json({"type": "ack", "name": "set_param"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_param_failed:{e}"})
+
+                elif msg_type == "set_reference_image":
+                    try:
+                        ref = b64_to_bgr(data["image_b64"])
+                        proc.set_reference_image(ref)
+                        await websocket.send_json({"type": "ack", "name": "set_reference_image"})
+                    except Exception as e:
+                        await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
+
+                elif msg_type == "frame":
+                    # Latest-frame-wins: overwrite any pending frame.
+                    frame_b64 = data.get("frame_b64")
+                    if isinstance(frame_b64, str) and frame_b64:
+                        async with pending_lock:
+                            if pending_frame_b64 is not None:
+                                dropped_frame_count += 1
+                            pending_frame_b64 = frame_b64
+                            pending_recv_ts = time.time()
+
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong", "state": public_state()})
+
+                else:
+                    await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
+        except WebSocketDisconnect:
+            log.info("livecam receiver: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam receiver failure: %s", e)
+        finally:
+            stop_event.set()
+
+    async def processor_loop():
+        nonlocal pending_frame_b64, pending_recv_ts, latest_output_b64, latest_output_seq, latest_output_ts
+        processed = 0
+        try:
+            while not stop_event.is_set():
+                async with pending_lock:
+                    frame_b64 = pending_frame_b64
+                    recv_ts = pending_recv_ts
+                    pending_frame_b64 = None
+
+                if frame_b64 is None:
+                    # No work; brief idle to avoid busy loop.
+                    await asyncio.sleep(0.01)
+                    continue
+
+                t_proc_start = time.time()
                 try:
-                    frame = b64_to_bgr(data["frame_b64"])
+                    frame = b64_to_bgr(frame_b64)
                     resized = crop_fn(frame, h, w)
                     input_t.copy_from(resized)
                     output = output_t.to_numpy()
-                    await websocket.send_json({
-                        "type": "frame",
-                        "frame_b64": bgr_to_b64_jpeg(output),
-                    })
+                    out_b64 = bgr_to_b64_jpeg(output)
                 except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
+                    try:
+                        await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
+                    except Exception:
+                        pass
+                    continue
+                t_proc_end = time.time()
 
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong", "state": public_state()})
+                # Publish to sender hand-off.
+                latest_output_b64 = out_b64
+                latest_output_seq += 1
+                latest_output_ts = t_proc_end
+                output_event.set()
 
+                processed += 1
+
+                if ENABLE_LIVECAM_TIMING_LOG and processed % LIVECAM_LOG_EVERY == 0:
+                    proc_ms = (t_proc_end - t_proc_start) * 1000.0
+                    pending_age_ms = (t_proc_start - recv_ts) * 1000.0
+                    log.info(
+                        "livecam timing: proc_ms=%.1f pending_age_ms=%.1f "
+                        "dropped=%d processed=%d latest_seq=%d",
+                        proc_ms,
+                        pending_age_ms,
+                        dropped_frame_count,
+                        processed,
+                        latest_output_seq,
+                    )
+        except WebSocketDisconnect:
+            log.info("livecam processor: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam processor failure: %s", e)
+        finally:
+            stop_event.set()
+            output_event.set()
+
+    async def sender_loop():
+        nonlocal latest_output_b64, latest_output_seq, last_sent_seq
+
+        try:
+            unique_frames_sent = 0
+            repeated_frames_sent = 0
+            last_send_ts = 0.0
+
+            if not ENABLE_PLAYBACK_SCHEDULER:
+                # Scheduler OFF: send immediately on new output_event.
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(output_event.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    output_event.clear()
+
+                    if latest_output_b64 is not None and latest_output_seq > last_sent_seq:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            last_sent_seq = latest_output_seq
+                            unique_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+
+                        if ENABLE_LIVECAM_TIMING_LOG and (unique_frames_sent + repeated_frames_sent) % LIVECAM_LOG_EVERY == 0:
+                            sender_interval_ms = (time.time() - last_send_ts) * 1000.0 if last_send_ts > 0 else 0.0
+                            log.info(
+                                "livecam sender: scheduler_enabled=False sender_interval_ms=%.1f "
+                                "unique_frames_sent=%d repeated_frames_sent=%d latest_seq=%d last_sent_seq=%d",
+                                sender_interval_ms,
+                                unique_frames_sent,
+                                repeated_frames_sent,
+                                latest_output_seq,
+                                last_sent_seq,
+                            )
             else:
-                await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
+                # Scheduler ON: cadence-based with jitter handling.
+                period_s = 1.0 / PLAYBACK_TARGET_FPS if PLAYBACK_TARGET_FPS > 0 else 0.0
+                max_jitter_s = PLAYBACK_MAX_JITTER_MS / 1000.0
+                next_tick_ts = time.time()
 
+                while not stop_event.is_set():
+                    cadence_deadline = next_tick_ts
+
+                    # Check if new frame available.
+                    have_new_frame = latest_output_b64 is not None and latest_output_seq > last_sent_seq
+
+                    if have_new_frame:
+                        freshness_deadline = latest_output_ts + max_jitter_s
+                        emit_deadline = min(cadence_deadline, freshness_deadline)
+                    else:
+                        emit_deadline = cadence_deadline
+
+                    # Wait until emit_deadline or output_event.
+                    wait_time = max(0, emit_deadline - time.time())
+                    try:
+                        await asyncio.wait_for(output_event.wait(), timeout=wait_time)
+                        # Early wake: clear event and recompute, do NOT send immediately.
+                        output_event.clear()
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+
+                    if stop_event.is_set():
+                        break
+
+                    # emit_deadline reached.
+                    if have_new_frame:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            last_sent_seq = latest_output_seq
+                            unique_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+                    elif REPEAT_LAST_FRAME_WHEN_IDLE and latest_output_b64 is not None:
+                        try:
+                            await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
+                            last_send_ts = time.time()
+                            repeated_frames_sent += 1
+                        except Exception as e:
+                            log.warning("livecam sender: send failed: %s", e)
+                            break
+
+                    # Advance cadence.
+                    next_tick_ts += period_s
+
+                    # Log periodically.
+                    total_sent = unique_frames_sent + repeated_frames_sent
+                    if ENABLE_LIVECAM_TIMING_LOG and total_sent > 0 and total_sent % LIVECAM_LOG_EVERY == 0:
+                        sender_interval_ms = (time.time() - last_send_ts) * 1000.0 if last_send_ts > 0 else 0.0
+                        log.info(
+                            "livecam sender: scheduler_enabled=True sender_interval_ms=%.1f "
+                            "unique_frames_sent=%d repeated_frames_sent=%d latest_seq=%d last_sent_seq=%d",
+                            sender_interval_ms,
+                            unique_frames_sent,
+                            repeated_frames_sent,
+                            latest_output_seq,
+                            last_sent_seq,
+                        )
+        except WebSocketDisconnect:
+            log.info("livecam sender: websocket disconnected")
+        except Exception as e:
+            log.exception("livecam sender failure: %s", e)
+        finally:
+            stop_event.set()
+
+    async def session_cap():
+        # D4: end the session at the deadline (5 minutes by default).
+        remaining = deadline - time.time()
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=remaining)
+                return  # session ended on its own
+            except asyncio.TimeoutError:
+                pass
+        log.info("livecam: session time limit reached")
+        stop_event.set()
+        try:
+            await websocket.send_json({"type": "status", "status": "session_limit"})
+            await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        except Exception:
+            pass
+
+    try:
+        await asyncio.gather(receiver(), processor_loop(), sender_loop(), session_cap())
     except WebSocketDisconnect:
         log.info("websocket disconnected")
     except Exception as e:

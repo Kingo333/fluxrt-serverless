@@ -60,11 +60,23 @@ def _run_fallback(exc: BaseException):
     print("[bootstrap] !!! server.py failed to import/run; starting fallback", flush=True)
     print(tb_text, flush=True)
 
-    from fastapi import FastAPI
+    from typing import Optional
+
+    from fastapi import FastAPI, Header, Query
     from fastapi.responses import JSONResponse
     import uvicorn as _uv
 
     fb = FastAPI()
+
+    def _authorized(header_token: Optional[str], query_token: Optional[str]) -> bool:
+        # Diagnostics include tracebacks, so they need a valid session token.
+        # Fails closed if the secret or the token module is missing.
+        try:
+            from session_token import parse_and_verify
+        except Exception:
+            return False
+        secret = os.getenv("SESSION_SIGNING_SECRET", "")
+        return parse_and_verify(header_token or query_token or "", secret) is not None
 
     def _diag():
         return {
@@ -84,7 +96,7 @@ def _run_fallback(exc: BaseException):
 
     @fb.get("/")
     async def root():
-        return JSONResponse(_diag())
+        return JSONResponse({"ok": False, "mode": "fallback"})
 
     @fb.get("/ping")
     async def ping():
@@ -96,7 +108,12 @@ def _run_fallback(exc: BaseException):
         return JSONResponse({"ok": True, "mode": "fallback"})
 
     @fb.get("/debug/startup")
-    async def debug_startup():
+    async def debug_startup(
+        token: Optional[str] = Query(default=None),
+        x_session_token: Optional[str] = Header(default=None),
+    ):
+        if not _authorized(x_session_token, token):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse(_diag())
 
     _uv.run(
@@ -111,7 +128,29 @@ def _run_fallback(exc: BaseException):
 
 _BOOT_TS = time.time()
 
+def _maybe_exec_engine() -> None:
+    """LIVECAM_ENGINE picks the model this worker runs.
+
+    fluxrt (default)  FluxRT, exactly as before (this process).
+    joyai             JoyAI-Video-Edit via its adapter, in its own Python venv.
+    Anything else stops the container rather than guessing.
+    """
+    engine = os.getenv("LIVECAM_ENGINE", "fluxrt").strip().lower() or "fluxrt"
+    print(f"[bootstrap] LIVECAM_ENGINE={engine}", flush=True)
+    if engine == "fluxrt":
+        return
+    if engine == "joyai":
+        py = os.getenv("JOYAI_PYTHON", "/opt/joyai-venv/bin/python")
+        if not Path(py).exists():
+            raise SystemExit(f"LIVECAM_ENGINE=joyai but {py} is missing (use the livecam-dual image)")
+        os.chdir(APP_DIR)
+        os.execv(py, [py, "-u", "-m", "joyai.adapter.app"])  # replaces this process
+        return
+    raise SystemExit(f"Unknown LIVECAM_ENGINE={engine!r}; use 'fluxrt' or 'joyai'")
+
+
 if __name__ == "__main__":
+    _maybe_exec_engine()
     try:
         _run_real_server()
     except SystemExit:

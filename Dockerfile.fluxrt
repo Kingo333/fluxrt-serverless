@@ -74,9 +74,11 @@ PY
 
 COPY server.py /app/server.py
 COPY bootstrap.py /app/bootstrap.py
+COPY session_token.py /app/session_token.py
 
 # Build-time smoke check: fail the build early if either app file has a syntax error.
-RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py
+RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py \
+    && cd /app && SESSION_SIGNING_SECRET=build-check /usr/bin/python3.12 -c "import server; print('server import ok')"
 
 EXPOSE 8765
 
