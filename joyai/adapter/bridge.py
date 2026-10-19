@@ -52,6 +52,10 @@ class Bridge:
         self.send_client = send_client
         self.ref_b64: Optional[str] = None
         self.prompt: Optional[str] = None
+        # Short edit instruction from the app (Lucy-style); preferred over the
+        # long FluxRT-oriented prompt when present.
+        self.instruction: Optional[str] = None
+        self._restart_task: Optional[asyncio.Task] = None
         self.params: dict[str, Any] = {}
         self.upstream: Optional[Any] = None  # websockets connection
         self.upstream_started = False
@@ -66,7 +70,8 @@ class Bridge:
 
     # ---- start payload -------------------------------------------------
     def start_payload(self) -> dict[str, Any]:
-        prompt = self.s.prompt_template.replace("{prompt}", self.prompt or "")
+        text = self.instruction or self.prompt or ""
+        prompt = self.s.prompt_template.replace("{prompt}", text)
         payload: dict[str, Any] = {
             "type": "start",
             "prompt": prompt,
@@ -80,6 +85,7 @@ class Bridge:
             "output_codec": "mjpeg",
             "use_pe": False,  # D3: prompt enhancement off
             "gate_enabled": self.s.gate_enabled,
+            "max_temporal_ids": self.s.max_temporal_ids,
             "source": "camera",
         }
         if self.ref_b64:
@@ -101,11 +107,16 @@ class Bridge:
             self.ref_b64 = b64
             await self.send_client({"type": "ack", "name": "set_reference_image"})
             if self.upstream is not None:
-                await self._send_start()
+                self._schedule_restart()  # garment swap: one restart for image + prompt
         elif t == "set_prompt":
             self.prompt = str(data.get("prompt") or "")
+            instruction = data.get("instruction")
+            self.instruction = str(instruction).strip() if isinstance(instruction, str) and instruction.strip() else None
             await self.send_client({"type": "ack", "name": "set_prompt"})
-            await self._ensure_upstream_and_start()
+            if self.upstream is None:
+                await self._ensure_upstream_and_start()
+            else:
+                self._schedule_restart()
         elif t == "set_param":
             name = str(data.get("name") or "")
             if name not in PARAM_MAP:
@@ -121,7 +132,7 @@ class Bridge:
                 if name == "output_quality":
                     await self._upstream_send_json({"type": "set_output_quality", "value": self.params[name]})
                 else:
-                    await self._send_start()
+                    self._schedule_restart()
         elif t == "frame":
             await self._forward_frame(str(data.get("frame_b64") or ""))
         elif t == "ping":
@@ -146,6 +157,18 @@ class Bridge:
             pass  # reader task handles reconnect
 
     # ---- upstream connection --------------------------------------------
+    def _schedule_restart(self, delay_s: float = 0.25) -> None:
+        """Coalesce back-to-back changes (reference image + prompt on a garment
+        swap) into a single JoyAI restart on the same upstream socket."""
+        if self._restart_task is not None and not self._restart_task.done():
+            self._restart_task.cancel()
+
+        async def _later() -> None:
+            await asyncio.sleep(delay_s)
+            await self._send_start()
+
+        self._restart_task = asyncio.create_task(_later(), name="joyai-restart")
+
     async def _ensure_upstream_and_start(self) -> None:
         if self.upstream is None:
             await self._connect()
@@ -229,6 +252,8 @@ class Bridge:
 
     async def close(self) -> None:
         self._closing = True
+        if self._restart_task is not None and not self._restart_task.done():
+            self._restart_task.cancel()
         if self.reader_task is not None and not self.reader_task.done():
             self.reader_task.cancel()
         if self.upstream is not None:

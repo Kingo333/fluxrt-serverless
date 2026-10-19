@@ -49,6 +49,8 @@ class Settings:
     fps: int = field(default_factory=lambda: _int("JOYOMNI_FPS", 24))
     num_inference_steps: int = field(default_factory=lambda: _int("JOYAI_STEPS", 2))
     kv_reset_frames: int = field(default_factory=lambda: _int("JOYAI_KV_RESET_FRAMES", 600))
+    # Recent-chunk memory (JoyAI's max_temporal_ids). Smaller = faster, larger = steadier.
+    max_temporal_ids: int = field(default_factory=lambda: _int("JOYAI_MAX_TEMPORAL_IDS", 8))
     output_quality: int = field(default_factory=lambda: _int("JOYAI_OUTPUT_QUALITY", 70))
     gate_enabled: bool = field(default_factory=lambda: _bool("JOYAI_GATE_ENABLED", True))
     # Optional wrapper around the app's prompt, e.g.

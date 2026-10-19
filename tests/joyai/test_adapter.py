@@ -169,3 +169,32 @@ def test_session_cap_closes():
                     got = m
                     break
             assert got is not None
+
+
+def test_instruction_preferred_and_garment_swap_is_one_restart():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port, max_temporal_ids=4))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            while ws.receive_json()["type"] != "ready":
+                pass
+            ws.send_json({"type": "set_reference_image", "image_b64": base64.b64encode(b"TOP1").decode()})
+            assert ws.receive_json()["name"] == "set_reference_image"
+            ws.send_json({"type": "set_prompt", "prompt": "long fluxrt prompt",
+                          "instruction": "Substitute the current top with the garment in the reference image."})
+            assert ws.receive_json()["name"] == "set_prompt"
+            assert wait_for(lambda: len(fake.starts) == 1)
+            first = fake.starts[0]
+            assert first["prompt"].startswith("Substitute the current top")
+            assert first["max_temporal_ids"] == 4
+
+            # Mid-session swap: new image + new prompt -> exactly one restart.
+            ws.send_json({"type": "set_reference_image", "image_b64": base64.b64encode(b"DRESS2").decode()})
+            assert ws.receive_json()["name"] == "set_reference_image"
+            ws.send_json({"type": "set_prompt", "prompt": "long dress prompt",
+                          "instruction": "Substitute the current outfit with the dress in the reference image."})
+            assert ws.receive_json()["name"] == "set_prompt"
+            assert wait_for(lambda: len(fake.starts) == 2)
+            time.sleep(0.6)
+            assert len(fake.starts) == 2
+            second = fake.starts[1]
+            assert second["ref_image"] == base64.b64encode(b"DRESS2").decode()
+            assert second["prompt"].startswith("Substitute the current outfit")

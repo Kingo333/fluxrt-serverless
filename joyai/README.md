@@ -56,9 +56,10 @@ How messages map to JoyAI (verified against upstream commit `d875895`,
 
 | App | JoyAI |
 |---|---|
-| `set_prompt` (after `set_reference_image`) | `start {prompt, ref_image, width:480, height:840, fps:24, num_inference_steps:2, kv_reset_frames:600, input_codec:"mjpeg", output_codec:"mjpeg", use_pe:false, gate_enabled:true}` |
+| `set_prompt` (after `set_reference_image`); uses the app's short `instruction` when sent | `start {prompt, ref_image, width:480, height:840, fps:24, num_inference_steps:2, kv_reset_frames:600, input_codec:"mjpeg", output_codec:"mjpeg", use_pe:false, gate_enabled:true}` |
 | `frame` | `frame_meta` + binary JPEG (dropped until JoyAI replies `started`) |
 | `set_param steps/seed/kv_reset_frames` | new `start` with the value |
+| mid-session `set_reference_image` / `set_prompt` (garment swap) | one coalesced `start` on the same socket |
 | `set_param output_quality` | `set_output_quality` |
 | ← `output_frame` + binary JPEG | `frame {frame_b64}` |
 | ← `session_timeout` / socket closed | reconnect + `start` (up to 3 times), `status: session_reset` |
@@ -81,6 +82,7 @@ Behaviors worth knowing:
 | `JOYAI_SESSION_WIDTH` / `_HEIGHT` | `480` / `840` | Session size sent in `start` (portrait) |
 | `JOYAI_STEPS` | `2` | Denoise steps |
 | `JOYAI_KV_RESET_FRAMES` | `600` | KV-cache reset interval |
+| `JOYAI_MAX_TEMPORAL_IDS` | `8` | Recent-chunk memory (smaller = faster, larger = steadier) |
 | `JOYAI_OUTPUT_QUALITY` | `70` | JPEG quality of returned frames |
 | `JOYAI_GATE_ENABLED` | `true` | Face/person presence gates |
 | `JOYAI_PROMPT_TEMPLATE` | `{prompt}` | Optional wrapper, e.g. `Replace the subject's outfit with the garment from the reference image. {prompt}` |

@@ -48,3 +48,44 @@ Edit endpoint → `LIVECAM_ENGINE` = `fluxrt` (or delete it) → tick **48 GB** 
 
 See `joyai/README.md` for the adapter, message mapping, env vars and licenses, and
 `joyai/RUNPOD_SETUP.md` for creating and filling the volume.
+
+## Option B: two endpoints from the same image (Standard and Premium side by side)
+
+Same image, no code change: a second Load Balancing endpoint with `LIVECAM_ENGINE=joyai`.
+Then the Cloudflare Worker's `PREMIUM_RUNPOD_LB_ENDPOINT_ID` points at it, Standard keeps
+running on the existing endpoint, and the app's Premium HD button reaches JoyAI.
+
+| Premium endpoint setting | Value |
+|---|---|
+| Type | Load Balancing (same as Standard), HTTP port **8765** |
+| Image | `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>` + GHCR registry credentials (package is private) |
+| GPU | **32 GB PRO** (RTX 5090) only |
+| Max workers | your concurrent Premium sessions (one shopper per GPU) |
+| Active workers | 1 during testing hours, 0 otherwise (a warm worker bills all the time) |
+| Idle timeout | 300 s (longer than Standard, so shoppers don't hit cold starts) |
+| FlashBoot | On |
+| Network volume | `azyah-joyai` (locks the endpoint to that datacenter) |
+| Container disk | start at 60 GB; lower it once you see the pulled image size |
+| Env | `LIVECAM_ENGINE=joyai`, `SESSION_SIGNING_SECRET` (same as the Worker, as a RunPod Secret), `ACCEPTED_TIERS=premium`, `MAX_SESSION_SECONDS=300` |
+
+## JoyAI tuning (Lucy-VTON-like feel)
+
+JoyAI reaches real-time with 2 denoising steps, FP8 weights and short chunks, keeping the
+first chunk as an anchor so the person doesn't drift. JD reports ~30 fps at 720×1280 on a
+B200; there are no published RTX 5090 numbers, so treat these as starting points.
+
+| Knob | Setting | Default here | Notes |
+|---|---|---|---|
+| Denoising steps | `JOYAI_STEPS` | `2` | The distilled real-time path |
+| FP8 | `JOYOMNI_FP8_IMG` / `JOYOMNI_FP8_TXT` | `1` / `1` | Plus `JOYOMNI_FP8_FAST_ACCUM=1` on the 5090 |
+| Compile / CUDA graphs | `JOYOMNI_CUDA_GRAPH` | `1` | torch.compile caches persist on the volume |
+| Attention | `JOYOMNI_SAGE_ATTN` | `1` | SageAttention, built for the 5090 |
+| Mode | reference image in `start` | on | Garment photo drives the edit (IV2V) |
+| Garment swap | app → `set_reference_image` + `set_prompt` | live | Coalesced into one JoyAI restart on the same socket, no reconnect |
+| Prompt | app's `instruction` | "Substitute the current top with the garment in the reference image. …" | Optional wrapper: `JOYAI_PROMPT_TEMPLATE` (default `{prompt}`) |
+| Chunk size / first-chunk anchor | built into JoyAI | native | Not exposed as settings upstream |
+| Recent-chunk memory | `JOYAI_MAX_TEMPORAL_IDS` | `8` | Smaller = faster, larger = steadier |
+| KV reset | `JOYAI_KV_RESET_FRAMES` | `600` | |
+| Resolution | `JOYAI_SESSION_WIDTH/HEIGHT` | `480` / `840` | For 720p also set `JOYOMNI_WIDTH=1248 JOYOMNI_HEIGHT=720`, session `720`×`1248`; only if the 5090 holds 24 fps |
+| Boot warm-up | built into JoyAI's load | on | `POST /load` runs a 4-chunk warm-up in both orientations before `/ping` turns 200 |
+| CUDA / PyTorch | image | CUDA 12.8, torch 2.9.1 cu128 | Blackwell (sm_120a) |
