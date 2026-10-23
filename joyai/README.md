@@ -77,7 +77,9 @@ Behaviors worth knowing:
 | `MAX_SESSION_SECONDS` | `300` | Streaming cap after `ready` (token can only lower it) |
 | `PORT` / `PORT_HEALTH` | `8765` | RunPod LB port + health port |
 | `AUTO_LOAD` | `true` | Start loading JoyAI at boot (so `/ping` goes 204 → 200) |
-| `LOAD_TIMEOUT_S` | `2400` | Max wait for JoyAI `POST /load` |
+| `LOAD_TIMEOUT_S` | `3600` | Max wait for JoyAI `POST /load` (a cold start compiles kernels) |
+| `JOYOMNI_WARMUP_WAIT_S` | `900` | Patched JoyAI: how long the boot warm-up waits for its test chunks (upstream: 120) |
+| `JOYOMNI_WARMUP_CLOSE_TIMEOUT_S` | `600` | Patched JoyAI: how long the warm-up waits for busy workers to stop (upstream: 5) |
 | `PING_READY_WHILE_LOADING` | `false` | `true`: `/ping` answers 200 while loading, so RunPod (which stops workers still answering 204 after ~8 min) lets a slow first start finish. Sessions wait with `warming`. |
 | `UPSTREAM_BOOT_TIMEOUT_S` | `300` | Max wait for JoyAI `/health` after spawn |
 | `JOYAI_SESSION_WIDTH` / `_HEIGHT` | `480` / `840` | Session size sent in `start` (portrait) |

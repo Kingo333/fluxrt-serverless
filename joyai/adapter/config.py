@@ -41,7 +41,7 @@ class Settings:
     )
     auto_load: bool = field(default_factory=lambda: _bool("AUTO_LOAD", True))
     upstream_boot_timeout_s: int = field(default_factory=lambda: _int("UPSTREAM_BOOT_TIMEOUT_S", 300))
-    load_timeout_s: int = field(default_factory=lambda: _int("LOAD_TIMEOUT_S", 2400))
+    load_timeout_s: int = field(default_factory=lambda: _int("LOAD_TIMEOUT_S", 3600))
     # RunPod stops a load-balancing worker whose /ping still says 204 after ~8 minutes,
     # and a first JoyAI start (weights + kernel compile) takes longer. When true, /ping
     # answers 200 while loading; sessions that arrive early get "warming" and wait.

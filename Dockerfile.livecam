@@ -72,8 +72,11 @@ ENV TORCH_CUDA_ARCH_LIST=12.0 \
     JOYOMNI_OPS_CUDA_ARCHS=120a
 RUN python3.10 -m venv /opt/joyai-venv \
     && /opt/joyai-venv/bin/pip install --upgrade pip setuptools wheel
+# Small Azyah patches to JoyAI (joyai/patches/*.patch); git apply fails the build if upstream drifts.
+COPY joyai/patches /tmp/joyai-patches
 RUN git clone https://github.com/jd-opensource/JoyAI-Video-Edit.git /opt/JoyAI-Video-Edit \
     && git -C /opt/JoyAI-Video-Edit checkout ${JOYAI_COMMIT} \
+    && git -C /opt/JoyAI-Video-Edit apply /tmp/joyai-patches/*.patch \
     && /opt/joyai-venv/bin/pip install -r /opt/JoyAI-Video-Edit/deploy/requirements.txt
 RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
     && cd /tmp/SageAttention && git checkout ${SAGE_COMMIT} \
