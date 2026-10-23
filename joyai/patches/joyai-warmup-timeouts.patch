@@ -1,0 +1,24 @@
+diff --git a/deploy/xvideo/serving/joyomni_streaming.py b/deploy/xvideo/serving/joyomni_streaming.py
+index e4f695c..bc3af7c 100644
+--- a/deploy/xvideo/serving/joyomni_streaming.py
++++ b/deploy/xvideo/serving/joyomni_streaming.py
+@@ -438,7 +438,8 @@ class JoyOmniRuntime:
+                 if completed >= num_chunks:
+                     break
+ 
+-            deadline = time.time() + 120.0
++            # Azyah patch: a cold start compiles kernels inside this wait; 120 s is too short.
++            deadline = time.time() + float(os.environ.get("JOYOMNI_WARMUP_WAIT_S", "900"))
+             while completed < num_chunks and time.time() < deadline:
+                 r = session.wait_async_result(timeout=0.5)
+                 if r is not None:
+@@ -448,7 +449,8 @@ class JoyOmniRuntime:
+             print(f"#####[STREAM] full-pipeline warmup skipped/failed: {exc!r}")
+         finally:
+             if session is not None:
+-                session.close()
++                # Azyah patch: let busy workers (first-time compile) finish instead of failing /load.
++                session.close(timeout=float(os.environ.get("JOYOMNI_WARMUP_CLOSE_TIMEOUT_S", "600")))
+ 
+ class JoyOmniV2VStreamingSession:
+     _session_serial_counter = 0
