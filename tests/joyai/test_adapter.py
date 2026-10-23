@@ -44,6 +44,20 @@ def test_ping_204_then_200():
         assert wait_for(lambda: c.get("/ping").status_code == 200)
 
 
+def test_ping_200_while_loading_when_enabled():
+    with FakeJoyAI(load_delay=1.0) as fake, \
+            TestClient(create_app(settings(fake.port, ping_ready_while_loading=True))) as c:
+        r = c.get("/ping")
+        assert r.status_code == 200 and r.json()["status"] != "ready"
+        assert wait_for(lambda: c.get("/ping").json()["status"] == "ready")
+
+
+def test_ping_503_on_failure_even_when_enabled():
+    with FakeJoyAI(load_ok=False) as fake, \
+            TestClient(create_app(settings(fake.port, ping_ready_while_loading=True))) as c:
+        assert wait_for(lambda: c.get("/ping").status_code == 503)
+
+
 def test_ping_503_when_load_fails():
     with FakeJoyAI(load_ok=False) as fake, TestClient(create_app(settings(fake.port))) as c:
         assert wait_for(lambda: c.get("/ping").status_code == 503)

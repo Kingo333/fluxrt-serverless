@@ -42,6 +42,10 @@ class Settings:
     auto_load: bool = field(default_factory=lambda: _bool("AUTO_LOAD", True))
     upstream_boot_timeout_s: int = field(default_factory=lambda: _int("UPSTREAM_BOOT_TIMEOUT_S", 300))
     load_timeout_s: int = field(default_factory=lambda: _int("LOAD_TIMEOUT_S", 2400))
+    # RunPod stops a load-balancing worker whose /ping still says 204 after ~8 minutes,
+    # and a first JoyAI start (weights + kernel compile) takes longer. When true, /ping
+    # answers 200 while loading; sessions that arrive early get "warming" and wait.
+    ping_ready_while_loading: bool = field(default_factory=lambda: _bool("PING_READY_WHILE_LOADING", False))
 
     # Session `start` sent to JoyAI (480x840 portrait, mjpeg both ways, gates on).
     width: int = field(default_factory=lambda: _int("JOYAI_SESSION_WIDTH", 480))

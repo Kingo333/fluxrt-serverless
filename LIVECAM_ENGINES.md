@@ -20,7 +20,8 @@ On the endpoint → **Edit endpoint**:
 1. Container image: `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>` (once; it also runs FluxRT).
 2. GPU configuration: untick **48 GB**, tick **32 GB PRO**.
 3. Network volume: attach **azyah-joyai** (the endpoint then runs only in that volume's datacenter).
-4. Environment variables: set `LIVECAM_ENGINE` = `joyai`. Keep the others; FluxRT-only ones are ignored.
+4. Environment variables: set `LIVECAM_ENGINE` = `joyai` and `PING_READY_WHILE_LOADING` = `true`.
+   Keep the others; FluxRT-only ones are ignored.
 5. Container disk: at least **60 GB** (the dual image is large).
 6. Save. Workers restart; anyone mid-session is cut off.
 
@@ -36,6 +37,11 @@ Edit endpoint → `LIVECAM_ENGINE` = `fluxrt` (or delete it) → tick **48 GB** 
 ## Notes
 
 - **Max workers must be ≥ 1** or nothing runs (the endpoint showed 0).
+- **`PING_READY_WHILE_LOADING=true` is needed for JoyAI.** RunPod stops a load-balancing worker
+  whose `/ping` still answers 204 after about 8 minutes, and a first JoyAI start (48 GB of weights
+  plus kernel compile) takes longer, so the worker restarts forever. With this set, `/ping`
+  answers 200 while loading and a session that arrives early gets `warming` until JoyAI is ready.
+  Errors still answer 503.
 - JoyAI serves **one session per worker**; raise Max workers for more shoppers.
 - Unknown `LIVECAM_ENGINE` values stop the container instead of guessing.
 - `ACCEPTED_TIERS` (default `standard,premium`) lets either engine accept tokens for either
