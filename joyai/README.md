@@ -78,6 +78,7 @@ Behaviors worth knowing:
 | `PORT` / `PORT_HEALTH` | `8765` | RunPod LB port + health port |
 | `AUTO_LOAD` | `true` | Start loading JoyAI at boot (so `/ping` goes 204 → 200) |
 | `LOAD_TIMEOUT_S` | `2400` | Max wait for JoyAI `POST /load` |
+| `PING_READY_WHILE_LOADING` | `false` | `true`: `/ping` answers 200 while loading, so RunPod (which stops workers still answering 204 after ~8 min) lets a slow first start finish. Sessions wait with `warming`. |
 | `UPSTREAM_BOOT_TIMEOUT_S` | `300` | Max wait for JoyAI `/health` after spawn |
 | `JOYAI_SESSION_WIDTH` / `_HEIGHT` | `480` / `840` | Session size sent in `start` (portrait) |
 | `JOYAI_STEPS` | `2` | Denoise steps |

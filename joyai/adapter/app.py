@@ -1,6 +1,7 @@
 """Azyah Premium HD adapter: FastAPI on :8765 in front of unmodified JoyAI on 127.0.0.1:8080.
 
 GET  /ping            204 while loading, 200 when ready, 503 on error (RunPod LB health)
+                      PING_READY_WHILE_LOADING=true: 200 while loading too
 GET  /health          state as JSON (always 200)
 POST /warmup          start loading (auth)            ?wait=true blocks until ready/error
 POST /api/load        alias of /warmup (auth)
@@ -67,6 +68,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return JSONResponse({"status": "ready"}, status_code=200)
         if upstream.status == "error":
             return JSONResponse({"status": "error"}, status_code=503)
+        if s.ping_ready_while_loading:
+            # Keeps RunPod from stopping a slow first start; /ws holds sessions until ready.
+            return JSONResponse({"status": upstream.status}, status_code=200)
         return Response(status_code=204)  # initializing
 
     @app.get("/health")
