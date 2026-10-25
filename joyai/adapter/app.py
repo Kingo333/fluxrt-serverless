@@ -163,7 +163,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             await send_client({"type": "status", "status": "session_limit"})
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
             return
-        await send_client({"type": "ready", "session_deadline": int(deadline)})
+        # Tell the app what to send: JoyAI needs full-size frames at its own frame rate
+        # (FluxRT's "ready" has no engine field, so the app keeps its own settings there).
+        await send_client({
+            "type": "ready",
+            "session_deadline": int(deadline),
+            "engine": "joyai",
+            "input_width": s.width,
+            "input_height": s.height,
+            "input_fps": s.fps,
+            "input_jpeg_quality": s.input_jpeg_quality,
+        })
 
         bridge = Bridge(s, send_client)
         try:

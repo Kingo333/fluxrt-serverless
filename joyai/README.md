@@ -86,13 +86,14 @@ Behaviors worth knowing:
 | `JOYAI_STEPS` | `2` | Denoise steps |
 | `JOYAI_KV_RESET_FRAMES` | `600` | KV-cache reset interval |
 | `JOYAI_MAX_TEMPORAL_IDS` | `8` | Recent-chunk memory (smaller = faster, larger = steadier) |
-| `JOYAI_OUTPUT_QUALITY` | `70` | JPEG quality of returned frames |
+| `JOYAI_OUTPUT_QUALITY` | `90` | JPEG quality of returned frames (70 blurred prints and logos) |
+| `JOYAI_INPUT_JPEG_QUALITY` | `85` | Camera JPEG quality the app is asked to use (sent in `ready`, with the session size and fps) |
 | `JOYAI_GATE_ENABLED` | `true` | Face/person presence gates |
 | `JOYAI_PROMPT_TEMPLATE` | `{prompt}` | Optional wrapper, e.g. `Replace the subject's outfit with the garment from the reference image. {prompt}` |
 | `ENABLE_PERSON_GATE` | `false` | Use YOLOv8n body gate (AGPL-3.0, see Licenses) |
 | `JOYOMNI_CKPT_ROOT` | `/runpod-volume/joyai/checkpoints` | Weights on the network volume |
-| `JOYOMNI_CACHE_ROOT` | `/runpod-volume/joyai/cache_rtx5090` | torchinductor / triton / nv caches (persist across workers) |
-| `JOYOMNI_SAGE_ATTN` / `JOYOMNI_FP8_FAST_ACCUM` / `JOYOMNI_LOW_VRAM` | `1` / `1` / `1` | Upstream's RTX 5090 settings |
+| `JOYOMNI_CACHE_ROOT` | `/runpod-volume/joyai/cache_rtx5090` (5090) or `…/cache_full` (48 GB+) | torchinductor / triton / nv caches (persist across workers) |
+| `JOYOMNI_SAGE_ATTN` / `JOYOMNI_FP8_FAST_ACCUM` / `JOYOMNI_LOW_VRAM` | picked per GPU | RTX 5090: `1`/`1`/`1` (needed to fit and run fast). 48 GB+ cards such as the RTX PRO 6000: `0`/`0`/`0` (full precision, as upstream recommends). Setting them on the endpoint overrides this. |
 | `JOYOMNI_FPS` | `24` | Target fps |
 | `LOG_LEVEL` | `INFO` | |
 

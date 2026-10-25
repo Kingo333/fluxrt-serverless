@@ -10,7 +10,24 @@ set -euo pipefail
 JOYAI_DIR="${JOYAI_DIR:-/opt/JoyAI-Video-Edit/deploy}"
 VOL="${JOYAI_VOLUME_ROOT:-/runpod-volume/joyai}"
 CKPT_ROOT="${JOYOMNI_CKPT_ROOT:-$VOL/checkpoints}"
-CACHE_ROOT="${JOYOMNI_CACHE_ROOT:-$VOL/cache_rtx5090}"
+# In the dual-engine image plain `python` is FluxRT's 3.12; JoyAI has its own venv.
+PY="${JOYAI_PYTHON:-python}"
+
+# Per-GPU defaults, from upstream DEPLOYMENT.md:
+#   RTX 5090 (32 GB): int8 SageAttention, fp16-accumulate FP8 GEMMs, low-VRAM layout (needed to fit).
+#   48 GB+ cards (RTX PRO 6000 ...): cuDNN attention, fp32 accumulate, full layout:
+#   higher numeric fidelity at the same 480p @ 24 FPS.
+# Anything set on the endpoint wins over these.
+GPU_INFO="$("$PY" -c 'import torch; p = torch.cuda.get_device_properties(0); print(f"{p.name}|{p.total_memory >> 30}")' 2>/dev/null || echo "unknown|0")"
+GPU_NAME="${GPU_INFO%|*}"
+GPU_GIB="${GPU_INFO##*|}"
+if [[ "$GPU_NAME" != *5090* ]] && [ "${GPU_GIB:-0}" -ge 46 ]; then
+  GPU_PROFILE=full; PROFILE_LOW_VRAM=0; PROFILE_SAGE=0; PROFILE_FAST_ACCUM=0; PROFILE_CACHE=cache_full
+else
+  GPU_PROFILE=rtx5090; PROFILE_LOW_VRAM=1; PROFILE_SAGE=1; PROFILE_FAST_ACCUM=1; PROFILE_CACHE=cache_rtx5090
+fi
+echo "[start_upstream] GPU: $GPU_NAME (${GPU_GIB} GiB) -> profile $GPU_PROFILE"
+CACHE_ROOT="${JOYOMNI_CACHE_ROOT:-$VOL/$PROFILE_CACHE}"
 
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_ROOT/torchinductor}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_ROOT/triton}"
@@ -21,13 +38,13 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$JOYAI_DIR"
-# RTX 5090 settings from upstream DEPLOYMENT.md (480p @ 24 FPS, fits 32 GB).
 export JOYOMNI_FP8_IMG="${JOYOMNI_FP8_IMG:-1}"
 export JOYOMNI_FP8_TXT="${JOYOMNI_FP8_TXT:-1}"
 export JOYOMNI_CUDA_GRAPH="${JOYOMNI_CUDA_GRAPH:-1}"
-export JOYOMNI_SAGE_ATTN="${JOYOMNI_SAGE_ATTN:-1}"
-export JOYOMNI_FP8_FAST_ACCUM="${JOYOMNI_FP8_FAST_ACCUM:-1}"
-export JOYOMNI_LOW_VRAM="${JOYOMNI_LOW_VRAM:-1}"
+export JOYOMNI_SAGE_ATTN="${JOYOMNI_SAGE_ATTN:-$PROFILE_SAGE}"
+export JOYOMNI_FP8_FAST_ACCUM="${JOYOMNI_FP8_FAST_ACCUM:-$PROFILE_FAST_ACCUM}"
+export JOYOMNI_LOW_VRAM="${JOYOMNI_LOW_VRAM:-$PROFILE_LOW_VRAM}"
+echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_FAST_ACCUM LOW_VRAM=$JOYOMNI_LOW_VRAM cache=$CACHE_ROOT"
 # D3: no prompt enhancement. Make sure no key leaks in from the environment.
 unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
 
@@ -50,8 +67,6 @@ for f in "$DIT_CKPT" "$VAE_CKPT" "$TE_CKPT"; do
 done
 
 DEVICE="${JOYOMNI_DEVICE:-cuda:0}"
-# In the dual-engine image plain `python` is FluxRT's 3.12; JoyAI has its own venv.
-PY="${JOYAI_PYTHON:-python}"
 cd "$JOYAI_DIR"
 exec "$PY" xvideo/serving/serve_joyomni_streaming.py \
   --dit-ckpt "$DIT_CKPT" \
