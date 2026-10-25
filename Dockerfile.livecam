@@ -107,11 +107,10 @@ ENV LIVECAM_ENGINE=fluxrt \
     JOYAI_PYTHON=/opt/joyai-venv/bin/python \
     JOYAI_DIR=/opt/JoyAI-Video-Edit/deploy \
     JOYAI_VOLUME_ROOT=/runpod-volume/joyai \
-    JOYOMNI_CKPT_ROOT=/runpod-volume/joyai/checkpoints \
-    JOYOMNI_CACHE_ROOT=/runpod-volume/joyai/cache_rtx5090 \
-    JOYOMNI_SAGE_ATTN=1 \
-    JOYOMNI_FP8_FAST_ACCUM=1 \
-    JOYOMNI_LOW_VRAM=1
+    JOYOMNI_CKPT_ROOT=/runpod-volume/joyai/checkpoints
+# JOYOMNI_SAGE_ATTN / _FP8_FAST_ACCUM / _LOW_VRAM / _CACHE_ROOT are picked per GPU by
+# joyai/start_upstream.sh (RTX 5090 shortcuts vs full precision on 48 GB+ cards).
+# Setting any of them on the RunPod endpoint overrides that choice.
 
 EXPOSE 8765
 WORKDIR /workspace/FluxRT

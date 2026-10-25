@@ -61,7 +61,7 @@ Everything else uses image defaults (README → Environment variables).
 ## 4. First start (fills the compile cache)
 
 The very first worker compiles kernels and writes them to
-`/runpod-volume/joyai/cache_rtx5090`. Expect it to be much slower than later
+`/runpod-volume/joyai/cache_rtx5090` (or `cache_full` on 48 GB+ cards). Expect it to be much slower than later
 starts (**check** the actual time in the logs). Warm it once before testing the app:
 
 ```bash

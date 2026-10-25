@@ -85,7 +85,9 @@ B200; there are no published RTX 5090 numbers, so treat these as starting points
 | Denoising steps | `JOYAI_STEPS` | `2` | The distilled real-time path |
 | FP8 | `JOYOMNI_FP8_IMG` / `JOYOMNI_FP8_TXT` | `1` / `1` | Plus `JOYOMNI_FP8_FAST_ACCUM=1` on the 5090 |
 | Compile / CUDA graphs | `JOYOMNI_CUDA_GRAPH` | `1` | torch.compile caches persist on the volume |
-| Attention | `JOYOMNI_SAGE_ATTN` | `1` | SageAttention, built for the 5090 |
+| Attention / precision | `JOYOMNI_SAGE_ATTN`, `JOYOMNI_FP8_FAST_ACCUM`, `JOYOMNI_LOW_VRAM` | per GPU | 5090: int8 SageAttention, fp16 accumulate, low-VRAM (needed). RTX PRO 6000: cuDNN, fp32 accumulate, full layout (more faithful). Picked by `joyai/start_upstream.sh` |
+| Output JPEG | `JOYAI_OUTPUT_QUALITY` | `90` | Was 70, which blurred prints and logos |
+| Camera frames | sent to the app in `ready` | 480×840, 24 fps, JPEG 0.85 | The app adopts these when the engine is JoyAI |
 | Mode | reference image in `start` | on | Garment photo drives the edit (IV2V) |
 | Garment swap | app → `set_reference_image` + `set_prompt` | live | Coalesced into one JoyAI restart on the same socket, no reconnect |
 | Prompt | app's `instruction` | "Substitute the current top with the garment in the reference image. …" | Optional wrapper: `JOYAI_PROMPT_TEMPLATE` (default `{prompt}`) |

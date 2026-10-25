@@ -55,7 +55,10 @@ class Settings:
     kv_reset_frames: int = field(default_factory=lambda: _int("JOYAI_KV_RESET_FRAMES", 600))
     # Recent-chunk memory (JoyAI's max_temporal_ids). Smaller = faster, larger = steadier.
     max_temporal_ids: int = field(default_factory=lambda: _int("JOYAI_MAX_TEMPORAL_IDS", 8))
-    output_quality: int = field(default_factory=lambda: _int("JOYAI_OUTPUT_QUALITY", 70))
+    # 90 keeps prints, logos and small text; 70 visibly blurred them.
+    output_quality: int = field(default_factory=lambda: _int("JOYAI_OUTPUT_QUALITY", 90))
+    # Camera JPEG quality the app should use (sent to the app in "ready").
+    input_jpeg_quality: float = field(default_factory=lambda: _int("JOYAI_INPUT_JPEG_QUALITY", 85) / 100.0)
     gate_enabled: bool = field(default_factory=lambda: _bool("JOYAI_GATE_ENABLED", True))
     # Optional wrapper around the app's prompt, e.g.
     # "Replace the subject's outfit with the garment from the reference image. {prompt}"

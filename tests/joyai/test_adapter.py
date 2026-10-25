@@ -101,6 +101,9 @@ def handshake(ws, prompt="Put the red dress from the reference image on the subj
         m = ws.receive_json()
         msgs.append(m)
         if m["type"] == "ready":
+            assert m["engine"] == "joyai"
+            assert (m["input_width"], m["input_height"], m["input_fps"]) == (480, 840, 24)
+            assert m["input_jpeg_quality"] == 0.85
             break
     ws.send_json({"type": "set_reference_image", "image_b64": base64.b64encode(b"REFJPEG").decode()})
     assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
