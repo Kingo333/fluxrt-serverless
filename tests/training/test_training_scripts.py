@@ -118,3 +118,22 @@ def test_prune_keeps_latest_and_marked_saves(tmp_path):
     left = sorted(p.name for p in run.iterdir())
     assert left == ["global_step1000", "global_step1250", "global_step1500", "global_step500"]
     assert len(removed) == 2
+
+
+def test_model_card_states_vivid_and_blocks_commercial_use():
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS.parent))
+    from data_tools import manifests
+    mod = load("model_card")
+    entries = [{"path": "a.tar", "group": "v2v", "source": "vivid", "split": "train", "num_samples": 10},
+               {"path": "b.tar", "group": "i2i", "source": "glance", "split": "train", "num_samples": 5}]
+    res = manifests.build(entries, "research", "train")
+    assert res["trained_with_vivid"] and not res["commercial_use_cleared"] and res["research_only_sources"] == ["vivid"]
+    card, entry = mod.build(res, "dit.pth", "azyah-vton-experimental", "stage1 step 2000", "n", "abc")
+    assert "Not cleared for commercial use" in card and "Trained with ViViD: **yes**" in card
+    assert "Glance VTON Synthetic Dataset (2026)" in card
+    assert entry["commercial_use_cleared"] is False and entry["trained_with_vivid"] is True
+    com = manifests.build(entries, "commercial", "train")
+    assert not com["trained_with_vivid"] and com["commercial_use_cleared"] and com["notice"] == ""
+    card2, entry2 = mod.build(com, "dit.pth", "azyah-vton-candidate", "x", "n", "abc")
+    assert "Not cleared" not in card2 and entry2["commercial_use_cleared"] is True

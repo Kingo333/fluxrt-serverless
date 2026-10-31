@@ -26,6 +26,12 @@ sha256sum dit_merged.pth
 
 `joyai-baseline` needs no entry: it's always the deployed upstream `joyai_video_edit_dit_0811.pth`.
 
+**Write entries with `scripts/model_card.py`**, which also writes `MODEL_CARD.md` from the run's `selection.json`. A model trained with ViViD gets `"commercial_use_cleared": false`. The worker then **refuses to serve it unless `JOYAI_ALLOW_RESEARCH_MODEL=1`**, which goes on the staging endpoint only.
+
+**Pre-launch gate (Phase K):** before production, either
+- record legal sign-off by setting `"commercial_use_cleared": true` and noting the sign-off in the model card, **or**
+- promote the ViViD-free retrain (`--mode commercial`) instead.
+
 ## 3. Staging endpoint (paid, owner approval)
 
 - **Endpoint:** a copy of the production settings with:

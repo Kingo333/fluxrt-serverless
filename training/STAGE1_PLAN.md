@@ -6,12 +6,20 @@ Everything below is **estimated** until the Phase B smoke test measures real ste
 
 ## Data mix (from `data_tools.manifests`)
 
+**Owner decision (2026-10-31): ViViD is in the default mix.** Experiments run in `--mode research`, so Stage 1 gets real video and motion data.
+
 | Run | Manifest mode | Image pairs (`i2i.json`, `r2i` samples) | Clips (`v2v.json`, `iv2v` samples) |
 |---|---|---|---|
-| **exp1, commercial** | `--mode commercial` | Glance upper-wear (about 23.7K train pairs, minus failed pseudo-sources) | Own clips (when recorded) |
-| exp1-research | `--mode research` | Same | Own clips + **ViViD** (R&D only, not shippable without legal sign-off) |
+| **exp1 (default)** | `--mode research` | Glance upper-wear (about 23.7K train pairs, minus failed pseudo-sources) | **ViViD** (about 7.8K train clips) + own clips when recorded |
+| exp1-commercial (fallback, only if legal says no) | `--mode commercial` | Same | Own clips only |
 
-**Task weights:** `AZ_I2I_PROB` and `AZ_V2V_PROB` (default 1:1). If there are no own clips yet, the clip task switches off automatically: its manifest is missing, so its probability becomes 0.
+**Provenance is enforced, not optional:**
+- every run's `selection.json` records `trained_with_vivid: true`, `research_only_sources: ["vivid"]`, `commercial_use_cleared: false` and a notice
+- `scripts/model_card.py` writes a `MODEL_CARD.md` that opens with "Not cleared for commercial use… Trained with ViViD: yes", plus a registry entry with `commercial_use_cleared: false`
+- the worker **refuses** such a model unless `JOYAI_ALLOW_RESEARCH_MODEL=1`, which is set on staging only (Phase K gate)
+- `--mode commercial` keeps working, so a ViViD-free retrain stays a one-flag change
+
+**Task weights:** `AZ_I2I_PROB` and `AZ_V2V_PROB` (default 1:1: half the steps on Glance stills for garment fidelity, half on ViViD and own clips for motion). If there are no own clips yet, the clip task switches off automatically: its manifest is missing, so its probability becomes 0.
 
 **Captions (review R2):** both forms the app sends live, built by a Python twin of the app's `buildTryOnInstruction` (tested on identical strings in both repos):
 - `caption`: the short form ("Substitute the current top with the garment in the reference image. Keep the person's face…")
@@ -45,7 +53,7 @@ Costs come from `scripts/estimate.py` at 45 s per step (a guess): 2× B200 at ab
 | Step | What | Hours | Cost | Go to the next step only if |
 |---|---|---|---|---|
 | S0 | Phase B smoke test (ToyData, 20 + 10 steps) | about 1 | $9–18 (maximum $25) | It trains, saves and resumes; real step time and memory measured |
-| S1 | exp1, 500 steps, Glance only | about 6.5 | **about $75** | Loss falls; held-out garment colour and detail improve over the base model; flicker and preservation not worse |
+| S1 | exp1, 500 steps, Glance + ViViD (research mode) | about 6.5 | **about $75** | Loss falls; held-out garment colour and detail improve over the base model; flicker and preservation not worse |
 | S2 | exp1, continue to 2000 steps (+ own clips if ready) | about 19 more | **about $225** | Clear win on held-out clips and in the blinded A/B |
 | S3 | Stage 2 distillation from the best S1/S2 checkpoint (LoRA) | estimated separately once S2 passes (`estimate.py stage2`) | — | Real-time 2-step model at least matches the baseline speed |
 
@@ -55,7 +63,9 @@ Costs come from `scripts/estimate.py` at 45 s per step (a guess): 2× B200 at ab
 
 ```bash
 # on a CPU Pod: data -> shards -> manifests
+python3 -m data_tools.manifests $AZ/shards/*.catalog.json --out $AZ/manifests/research-train --mode research --split train
+# fallback only if legal says no to ViViD:
 python3 -m data_tools.manifests $AZ/shards/*.catalog.json --out $AZ/manifests/commercial-train --mode commercial --split train
 # on the GPU Pod
-curl -fsSL …/run_fashion.sh | GPUS=2 HSDP=2 AZ_MANIFEST_DIR=$AZ/manifests/commercial-train AZ_EXP=fashion-exp1 AZ_MAX_STEPS=500 bash
+curl -fsSL …/run_fashion.sh | GPUS=2 HSDP=2 AZ_MANIFEST_DIR=$AZ/manifests/research-train AZ_EXP=fashion-exp1 AZ_MAX_STEPS=500 bash
 ```

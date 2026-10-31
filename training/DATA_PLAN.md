@@ -7,12 +7,17 @@ How we turn public datasets plus a small set of our own recordings into JoyAI tr
 | Source | Licence | Commercial checkpoint? | Use |
 |---|---|---|---|
 | `glanceai/VTON-Synthetic-Pairs` | CC-BY-4.0 | **Yes, with attribution** (see G6) | Garment fidelity on stills (`r2i`). About 53K pairs, 4 configs, **19.6 GB of parquet** (upper-wear only is about 6.1 GB). Front-facing, grey background, no motion |
-| `alibaba-yuanjing-aigclab/ViViD` | Hugging Face tag Apache-2.0, but the paper says "available for research purposes" and the footage is scraped from Net-A-Porter | **No.** R&D only until legal sign-off | Motion and video (`iv2v`). 32 GB zip, about 9.7K video-garment pairs, full-body studio and catwalk |
+| `alibaba-yuanjing-aigclab/ViViD` | Hugging Face tag Apache-2.0, but the paper says "available for research purposes" and the footage is scraped from Net-A-Porter | **No, until legal sign-off.** **In the default training mix by owner decision (2026-10-31)**, with provenance tracked on every checkpoint | Motion and video (`iv2v`). 32 GB zip, about 9.7K video-garment pairs (7,759 train / 1,941 test), full-body studio and catwalk |
 | Own recordings (Azyah) | Owned, under signed consent | Yes, if consent covers commercial use | Phone/webcam half-body clips at home: fine-tuning **and** the held-out test |
 | JoyAI ToyData | — | No | Smoke tests only |
 | Rejected | Tstars-VTON (CC-BY-NC-ND), mikusama99 (no licence), VITON-HD, DressCode, TikTokDress (non-commercial) | — | — |
 
-**Enforcement:** `data_tools/sources.py` records each source's terms. `data_tools/manifests.py --mode commercial` **drops ViViD and ToyData automatically** and writes the required attribution lines to `selection.json`. Research runs use `--mode research`, which keeps them switchable.
+**Enforcement:**
+- `data_tools/sources.py` records each source's terms.
+- **Default experiments use `--mode research`** (Glance + ViViD + own). `selection.json` then states `trained_with_vivid: true` and `commercial_use_cleared: false`.
+- `scripts/model_card.py` puts that at the top of every model card and in the registry entry.
+- The worker refuses such a model unless `JOYAI_ALLOW_RESEARCH_MODEL=1` (staging only).
+- `--mode commercial` still **drops ViViD and ToyData automatically**, for a ViViD-free retrain if legal says no.
 
 ## G1: train/inference mismatch → **pseudo-pairs** (decided)
 

@@ -17,7 +17,7 @@ def run(tmp_path: Path, gpu: str, **env_overrides) -> dict:
         (ckpt / p).parent.mkdir(parents=True, exist_ok=True)
         (ckpt / p).write_text("x")
     joyai_dir = tmp_path / "deploy"
-    (joyai_dir / "xvideo" / "serving").mkdir(parents=True)
+    (joyai_dir / "xvideo" / "serving").mkdir(parents=True, exist_ok=True)
     (joyai_dir / "xvideo" / "serving" / "serve_joyomni_streaming.py").write_text("")
     # Fake python: the GPU query prints `gpu`; running the server dumps the env it got.
     fake_py = tmp_path / "python"
@@ -70,8 +70,17 @@ def test_model_version_from_registry(tmp_path):
     models = tmp_path / "vol" / "models"
     (models / "exp1").mkdir(parents=True)
     (models / "exp1" / "dit.pth").write_text("x")
-    (models / "registry.json").write_text(json.dumps({"azyah-vton-experimental": {"dit": "exp1/dit.pth"}}))
-    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-experimental")
+    (models / "registry.json").write_text(json.dumps({
+        "azyah-vton-experimental": {"dit": "exp1/dit.pth", "commercial_use_cleared": False, "notice": "trained with ViViD"},
+        "azyah-vton-candidate": {"dit": "exp1/dit.pth", "commercial_use_cleared": True},
+    }))
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-candidate")
+    assert f"-> {models}/exp1/dit.pth" in env["_stdout"]
+    # Research-only (e.g. ViViD) models: refused unless the staging opt-in is set (Phase K gate).
+    with pytest.raises(RuntimeError, match="not cleared for commercial use"):
+        run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-experimental")
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-experimental",
+              JOYAI_ALLOW_RESEARCH_MODEL="1")
     assert f"-> {models}/exp1/dit.pth" in env["_stdout"]
 
 
