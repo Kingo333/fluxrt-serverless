@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Phase B: download everything training needs onto the training volume.
 # Run on a CHEAP CPU Pod with the azyah-vton-train volume attached (no GPU needed):
-#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/download_assets.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/download_assets.sh | bash
 # About 50 GB. Safe to re-run: finished files are skipped.
 set -euo pipefail
-SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts}"
+# Pin every download to one commit (review R4). AZ_REF = a commit SHA; if unset, main's
+# current SHA is looked up once and logged, so each run records exactly which code it used.
+AZ_REF="${AZ_REF:-$(curl -fsSL https://api.github.com/repos/Kingo333/fluxrt-serverless/commits/main | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')}"
+export AZ_REF
+SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/scripts}"
+echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$SCRIPTS_URL/common.sh")
 
 command -v pip3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3-pip git >/dev/null; }

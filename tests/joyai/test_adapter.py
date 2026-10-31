@@ -102,6 +102,7 @@ def handshake(ws, prompt="Put the red dress from the reference image on the subj
         msgs.append(m)
         if m["type"] == "ready":
             assert m["engine"] == "joyai"
+            assert m["model_version"] == "joyai-baseline"
             assert (m["input_width"], m["input_height"], m["input_fps"]) == (480, 840, 24)
             assert m["input_jpeg_quality"] == 0.85
             break
@@ -249,3 +250,24 @@ def test_profile_timings_opt_in():
             assert wait_for(lambda: len(fake.starts) >= 1)
             assert fake.starts[-1]["profile_timings"] is True
 
+
+
+def test_client_hints_can_be_switched_off_for_baseline_runs():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port, client_hints=False))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            m = ws.receive_json()
+            while m["type"] != "ready":
+                m = ws.receive_json()
+            assert m["engine"] == "joyai" and "input_width" not in m and "input_fps" not in m
+
+
+def test_short_instruction_style():
+    from joyai.adapter.bridge import short_instruction
+    full = ("Substitute the current top with the garment in the reference image. The reference garment is the Tee: Navy tee. "
+            "Match its exact color, pattern, print, logo, fabric and construction details. "
+            "Keep the person's face, body, pose and the background unchanged.")
+    assert short_instruction(full) == ("Substitute the current top with the garment in the reference image. "
+                                       "Keep the person's face, body, pose and the background unchanged.")
+    assert short_instruction("Substitute the current top with the garment in the reference image. "
+                             "Keep the person's face, body, pose and the background unchanged.").count("Keep") == 1
+    assert short_instruction("Just one sentence") == "Just one sentence"

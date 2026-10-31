@@ -73,3 +73,71 @@ def test_estimator_matches_the_audit():
     assert rows[("h100-80", 4)]["fits"] == "maybe"
     s2 = {(r["gpu"], r["count"]): r for r in est.options("stage2", 10, 60)}
     assert s2[("b200", 1)]["fits"] == "yes"
+    lora = {(r["gpu"], r["count"]): r for r in est.options("stage1-lora", 10, 60)}
+    assert lora[("b200", 1)]["fits"] == "yes"            # one GPU is enough with LoRA
+    assert lora[("rtxpro6000", 1)]["fits"] in ("yes", "maybe")
+    assert lora[("rtx5090", 1)]["fits"] == "no"
+
+
+def test_lora_merge_math_and_layout_check(tmp_path):
+    np = pytest.importorskip("numpy")
+    mod = load("merge_lora")
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((6, 4)).astype("float32")
+    a = rng.standard_normal((2, 4)).astype("float32")
+    b = rng.standard_normal((6, 2)).astype("float32")
+    base = mod.unwrap_backbone({"model": {"module.blocks.0.attn.q.weight": w, "blocks.0.norm.weight": np.ones(4)}})
+    assert set(base) == {"blocks.0.attn.q.weight", "blocks.0.norm.weight"}
+    lora = {"base_model.model.blocks.0.attn.q.lora_A.weight": a, "base_model.model.blocks.0.attn.q.lora_B.weight": b}
+    merged, n = mod.merge(base, lora, r=2, alpha=4)
+    assert n == 1 and np.allclose(merged["blocks.0.attn.q.weight"], w + 2.0 * (b @ a))
+    keys = tmp_path / "serving.json"
+    keys.write_text(json.dumps({"keys": {"blocks.0.attn.q.weight": {"shape": [6, 4]}, "blocks.0.norm.weight": {"shape": [4]}}}))
+    assert mod.check_keys(merged, str(keys)) == []
+    keys.write_text(json.dumps({"keys": {"blocks.0.attn.q.weight": {"shape": [6, 5]}}}))
+    problems = mod.check_keys(merged, str(keys))
+    assert any("shape" in p for p in problems) and any("not in serving" in p for p in problems)
+    with pytest.raises(SystemExit, match="not in the Stage 1 backbone"):
+        mod.merge(base, {"x.lora_A.weight": a, "x.lora_B.weight": b}, 2, 4)
+
+
+def test_prune_keeps_latest_and_marked_saves(tmp_path):
+    import os
+    import time
+    mod = load("prune_checkpoints")
+    run = tmp_path / "run" / "checkpoints"
+    old = time.time() - 600
+    for step in (250, 500, 750, 1000, 1250):
+        d = run / f"global_step{step}"
+        d.mkdir(parents=True)
+        f = d / f"step_{step}.pth"
+        f.write_text("x")
+        os.utime(f, (old, old))
+    (run / "global_step500" / "KEEP").write_text("")
+    # a save still being written: no settle time yet
+    d = run / "global_step1500"
+    d.mkdir()
+    (d / "step_1500.pth").write_text("x")
+    removed = mod.prune(str(tmp_path / "run"), keep_last=2)
+    left = sorted(p.name for p in run.iterdir())
+    assert left == ["global_step1000", "global_step1250", "global_step1500", "global_step500"]
+    assert len(removed) == 2
+
+
+def test_model_card_states_vivid_and_blocks_commercial_use():
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS.parent))
+    from data_tools import manifests
+    mod = load("model_card")
+    entries = [{"path": "a.tar", "group": "v2v", "source": "vivid", "split": "train", "num_samples": 10},
+               {"path": "b.tar", "group": "i2i", "source": "glance", "split": "train", "num_samples": 5}]
+    res = manifests.build(entries, "research", "train")
+    assert res["trained_with_vivid"] and not res["commercial_use_cleared"] and res["research_only_sources"] == ["vivid"]
+    card, entry = mod.build(res, "dit.pth", "azyah-vton-experimental", "stage1 step 2000", "n", "abc")
+    assert "Not cleared for commercial use" in card and "Trained with ViViD: **yes**" in card
+    assert "Glance VTON Synthetic Dataset (2026)" in card
+    assert entry["commercial_use_cleared"] is False and entry["trained_with_vivid"] is True
+    com = manifests.build(entries, "commercial", "train")
+    assert not com["trained_with_vivid"] and com["commercial_use_cleared"] and com["notice"] == ""
+    card2, entry2 = mod.build(com, "dit.pth", "azyah-vton-candidate", "x", "n", "abc")
+    assert "Not cleared" not in card2 and entry2["commercial_use_cleared"] is True

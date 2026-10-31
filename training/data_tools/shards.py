@@ -44,6 +44,9 @@ class Sample:
     person_id: str | None = None
     consent_id: str | None = None
     extra: dict = field(default_factory=dict)
+    # Extra caption fields, e.g. {"caption_detailed": ...}; the training config samples
+    # between "caption" and these (missing ones are skipped by the upstream loader).
+    captions: dict = field(default_factory=dict)
 
     def check(self) -> None:
         if "." in self.key or "/" in self.key or not self.key:
@@ -77,7 +80,7 @@ class Sample:
             "consent_id": self.consent_id,
             **self.extra,
         }
-        return {"caption": self.caption, "metadata": meta}
+        return {"caption": self.caption, **{k: v for k, v in self.captions.items() if v}, "metadata": meta}
 
 
 def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:

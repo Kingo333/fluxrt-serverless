@@ -7,12 +7,17 @@ How we turn public datasets plus a small set of our own recordings into JoyAI tr
 | Source | Licence | Commercial checkpoint? | Use |
 |---|---|---|---|
 | `glanceai/VTON-Synthetic-Pairs` | CC-BY-4.0 | **Yes, with attribution** (see G6) | Garment fidelity on stills (`r2i`). About 53K pairs, 4 configs, **19.6 GB of parquet** (upper-wear only is about 6.1 GB). Front-facing, grey background, no motion |
-| `alibaba-yuanjing-aigclab/ViViD` | Hugging Face tag Apache-2.0, but the paper says "available for research purposes" and the footage is scraped from Net-A-Porter | **No.** R&D only until legal sign-off | Motion and video (`iv2v`). 32 GB zip, about 9.7K video-garment pairs, full-body studio and catwalk |
+| `alibaba-yuanjing-aigclab/ViViD` | Hugging Face tag Apache-2.0, but the paper says "available for research purposes" and the footage is scraped from Net-A-Porter | **No, until legal sign-off.** **In the default training mix by owner decision (2026-10-31)**, with provenance tracked on every checkpoint | Motion and video (`iv2v`). 32 GB zip, about 9.7K video-garment pairs (7,759 train / 1,941 test), full-body studio and catwalk |
 | Own recordings (Azyah) | Owned, under signed consent | Yes, if consent covers commercial use | Phone/webcam half-body clips at home: fine-tuning **and** the held-out test |
 | JoyAI ToyData | — | No | Smoke tests only |
 | Rejected | Tstars-VTON (CC-BY-NC-ND), mikusama99 (no licence), VITON-HD, DressCode, TikTokDress (non-commercial) | — | — |
 
-**Enforcement:** `data_tools/sources.py` records each source's terms. `data_tools/manifests.py --mode commercial` **drops ViViD and ToyData automatically** and writes the required attribution lines to `selection.json`. Research runs use `--mode research`, which keeps them switchable.
+**Enforcement:**
+- `data_tools/sources.py` records each source's terms.
+- **Default experiments use `--mode research`** (Glance + ViViD + own). `selection.json` then states `trained_with_vivid: true` and `commercial_use_cleared: false`.
+- `scripts/model_card.py` puts that at the top of every model card and in the registry entry.
+- The worker refuses such a model unless `JOYAI_ALLOW_RESEARCH_MODEL=1` (staging only).
+- `--mode commercial` still **drops ViViD and ToyData automatically**, for a ViViD-free retrain if legal says no.
 
 ## G1: train/inference mismatch → **pseudo-pairs** (decided)
 
@@ -73,9 +78,11 @@ Each clip is a person wearing **the real garment**, plus a flat photo of that ga
 |---|---|---|
 | Phase B smoke test only | 200 GB | about $14 |
 | Data prep (Glance + ViViD + own clips) | 400 GB | about $28 |
-| Stage 1 real runs (2 checkpoints kept) | 600–700 GB | about $42–49 |
+| Stage 1 real runs, **keep-last-2 + 1 marked best** (`scripts/prune_checkpoints.py`, runs automatically in `run_fashion.sh`) | **500 GB** (3 × up to 160 GB + data) | about $35 |
 
-**Recommendation:** start at **200 GB** and grow when each phase starts.
+**Cost-cut revision:** with Stage 1 LoRA (about 1 GB checkpoints), data subsets and ViViD read straight from the zip (`vivid_zip extract --sample`), **200 GB is enough for exp1**: about 50 GB weights + 32.5 GB `0811` + 32 GB zip (deleted after sampling) + about 25 GB staged, sources and shards + a few GB of checkpoints. The larger sizes below apply only to the full fine-tune fallback.
+
+**Recommendation (full fine-tune only):** start at **200 GB** and grow when each phase starts (200 → 400 for data prep → 500 before Stage 1). Without pruning, upstream keeps every save: about 8 saves at 100–160 GB each over 2000 steps ≈ 0.8–1.3 TB (review R1).
 - Hugging Face private storage: back up final model weights and small reports only. Stage 1 optimizer checkpoints stay on the volume.
 - Free-tier private storage on Hugging Face is limited, so check `kingo333`'s quota before large uploads.
 

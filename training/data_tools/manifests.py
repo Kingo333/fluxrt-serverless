@@ -42,7 +42,14 @@ def build(entries: list[dict], mode: str, split: str, include: set[str] | None =
         g["num_samples"] += e["num_samples"]
         used.add(e["source"])
     attribution = sorted({sources.get(s).attribution for s in used if sources.get(s).attribution})
-    return {"groups": groups, "used_sources": sorted(used), "mode": mode, "split": split, "attribution": attribution}
+    research_only = sorted(s for s in used if not sources.get(s).commercial_ok)
+    return {"groups": groups, "used_sources": sorted(used), "mode": mode, "split": split, "attribution": attribution,
+            # Provenance travels with every run and model (owner decision 2026-10-31).
+            "research_only_sources": research_only,
+            "trained_with_vivid": "vivid" in used,
+            "commercial_use_cleared": not research_only,
+            "notice": ("Trained with research-only data (" + ", ".join(research_only) + "). Not cleared for commercial "
+                       "release without legal sign-off; a commercial-mode retrain excludes it.") if research_only else ""}
 
 
 def write(selection: dict, out_dir: str | Path) -> None:

@@ -26,8 +26,9 @@ REPLACEMENTS = [
     ("    lr_warmup_steps: int = 0", "    lr_warmup_steps: int = 5"),
     ("    sp_size: int = 1",
      '    sp_size: int = field(default_factory=lambda: int(os.getenv("AZ_SP_SIZE", "1")))'),
-    ("    hsdp_shard_dim: int = 1",
-     '    hsdp_shard_dim: int = field(default_factory=lambda: int(os.getenv("AZ_HSDP_SHARD", "1")))'),
+    ("    hsdp_shard_dim: int = 1", '    hsdp_shard_dim: int = field(default_factory=lambda: int(os.getenv("AZ_HSDP_SHARD", "1")))\n    # Azyah: Stage 1 LoRA (patches/stage1-lora.patch). AZ_STAGE1_LORA=0 = upstream full fine-tune.\n    stage1_lora: bool = field(default_factory=lambda: os.getenv("AZ_STAGE1_LORA", "1") == "1")\n    lora_rank: int = field(default_factory=lambda: int(os.getenv("AZ_LORA_RANK", "64")))\n    lora_alpha: int = field(default_factory=lambda: int(os.getenv("AZ_LORA_ALPHA", os.getenv("AZ_LORA_RANK", "64"))))'),
+    ("    resume_optimizer: bool = False", "    resume_optimizer: bool = True  # Azyah: auto-resume restores the optimizer too"),
+    ("    resume_dataloader: bool = False", "    resume_dataloader: bool = True"),
 ]
 
 
