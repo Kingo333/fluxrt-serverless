@@ -184,3 +184,34 @@ def test_edit_prompt_is_reproducible_and_category_aware():
     assert "pants or skirt" in pseudo_source.edit_prompt("k2", "lower")
     assert pseudo_source._session_size(768, 1024) == (624, 840)
     assert pseudo_source._session_size(832, 624) == (840, 624)
+
+
+def test_ingest_own_respects_consent_and_holds_out_test(tmp_path):
+    from data_tools import ingest_own
+    raw = tmp_path / "raw"
+    (raw / "garments").mkdir(parents=True)
+    (raw / "consent.csv").write_text(
+        "person_id,consent_id,train,test,commercial\n"
+        "p01,C1,yes,yes,yes\np02,C2,yes,yes,no\np03,C3,no,no,no\np05,C5,no,yes,yes\n")
+    (raw / "garments" / "garments.csv").write_text("garment_id,category,name,description\n"
+                                                   "g01,upper,Tee,Navy tee\ng02,upper,Shirt,\ng09,upper,Test top,\n")
+    for g in ("g01", "g02", "g09"):
+        (raw / "garments" / f"{g}.jpg").write_bytes(png((3, 3, 3)))
+    for person, garment in (("p01", "g01"), ("p02", "g02"), ("p03", "g01"), ("p05", "g09"), ("p04", "g01")):
+        d = raw / "clips" / person / garment
+        d.mkdir(parents=True)
+        (d / "phone.mp4").write_bytes(b"\x00" * 4096)
+    r = ingest_own.ingest(str(raw), str(tmp_path / "st"), test_people={"p05"}, test_garments={"g09"})
+    assert r["staged"] == {"train": 2, "test": 1} and r["leakage"] == 0
+    assert any("p03" in s and "does not cover training" in s for s in r["skipped"])
+    assert any("p04" in s and "no consent row" in s for s in r["skipped"])
+    metas = {d.name: json.loads((d / "meta.json").read_text()) for d in (tmp_path / "st").iterdir()}
+    sources_used = {m["person_id"]: m["source"] for m in metas.values()}
+    assert sources_used["own-p02"] == "own_research" and sources_used["own-p01"] == "own"
+    assert all(m["consent_id"] for m in metas.values())
+
+
+def test_mask_box_picker():
+    from data_tools.masks import pick_box
+    assert pick_box([[0, 0, 1, 1], [1, 1, 2, 2]], [0.2, 0.9]) == ([1.0, 1.0, 2.0, 2.0], 0.9)
+    assert pick_box([[0, 0, 1, 1]], [0.1]) is None

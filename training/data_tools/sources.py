@@ -38,6 +38,13 @@ SOURCES: dict[str, Source] = {
         needs_consent=True,
         note="Phone/webcam half-body clips. Each sample must carry a consent_id with commercial use agreed.",
     ),
+    "own_research": Source(
+        name="own_research",
+        licence="Azyah-owned recordings; consent excludes commercial use",
+        commercial_ok=False,
+        needs_consent=True,
+        note="Own clips whose consent said commercial=no: R&D runs only.",
+    ),
     "toy": Source(
         name="toy",
         licence="JoyAI ToyData (smoke tests only)",
