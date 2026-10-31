@@ -87,6 +87,7 @@ Behaviors worth knowing:
 | `JOYAI_KV_RESET_FRAMES` | `600` | KV-cache reset interval |
 | `JOYAI_MAX_TEMPORAL_IDS` | `8` | Recent-chunk memory (smaller = faster, larger = steadier) |
 | `JOYAI_OUTPUT_QUALITY` | `90` | JPEG quality of returned frames (70 blurred prints and logos) |
+| `JOYAI_PROFILE_TIMINGS` | `false` | `true`: ask JoyAI for per-chunk stage timings and pass them to the app as `profile` on each frame (benchmarking only) |
 | `JOYAI_INPUT_JPEG_QUALITY` | `85` | Camera JPEG quality the app is asked to use (sent in `ready`, with the session size and fps) |
 | `JOYAI_GATE_ENABLED` | `true` | Face/person presence gates |
 | `JOYAI_PROMPT_TEMPLATE` | `{prompt}` | Optional wrapper, e.g. `Replace the subject's outfit with the garment from the reference image. {prompt}` |

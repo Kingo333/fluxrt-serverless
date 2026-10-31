@@ -23,6 +23,7 @@ import binascii
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 import websockets
@@ -41,6 +42,13 @@ PARAM_MAP = {
     "kv_reset_frames": "kv_reset_frames",
     "output_quality": "output_quality",
 }
+
+FRAME_META_KEEP = 512
+
+
+def _num_or_none(v: Any) -> Any:
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
 
 STATUS_PASSTHROUGH = {"waiting_face", "no_person", "session_reset"}
 MAX_RECONNECTS = 3
@@ -63,6 +71,9 @@ class Bridge:
         self.reconnects = 0
         self.frames_in = 0
         self.frames_out = 0
+        # Adapter seq -> (client seq, client send time, adapter receive time), for
+        # matching each output frame to the camera frame it came from.
+        self._frame_meta: "OrderedDict[int, tuple[Any, Any, float]]" = OrderedDict()
         self._closing = False
         # Set when the upstream can't be recovered; the WS handler then closes.
         self.failed = False
@@ -88,6 +99,8 @@ class Bridge:
             "max_temporal_ids": self.s.max_temporal_ids,
             "source": "camera",
         }
+        if self.s.profile_timings:
+            payload["profile_timings"] = True
         if self.ref_b64:
             payload["ref_image"] = self.ref_b64
         for name, value in self.params.items():
@@ -134,13 +147,36 @@ class Bridge:
                 else:
                     self._schedule_restart()
         elif t == "frame":
-            await self._forward_frame(str(data.get("frame_b64") or ""))
+            await self._forward_frame(str(data.get("frame_b64") or ""),
+                                      _num_or_none(data.get("seq")), _num_or_none(data.get("t_client_ms")))
         elif t == "ping":
             await self.send_client({"type": "pong", "frames_in": self.frames_in, "frames_out": self.frames_out})
         else:
             await self.send_client({"type": "error", "message": f"unknown_type:{t}"})
 
-    async def _forward_frame(self, frame_b64: str) -> None:
+    def _remember(self, seq: int, client_seq: Any, t_client_ms: Any) -> None:
+        self._frame_meta[seq] = (client_seq, t_client_ms, time.monotonic())
+        while len(self._frame_meta) > FRAME_META_KEEP:
+            self._frame_meta.popitem(last=False)
+
+    def _timing_for(self, header: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Fields added to an output frame so the app can measure latency on its own clock."""
+        if not header:
+            return {}
+        meta = self._frame_meta.get(header.get("source_seq"))
+        out: dict[str, Any] = {}
+        if meta is not None:
+            client_seq, t_client_ms, t_recv = meta
+            if client_seq is not None:
+                out["seq"] = client_seq
+            if t_client_ms is not None:
+                out["t_client_ms"] = t_client_ms
+            out["server_ms"] = round((time.monotonic() - t_recv) * 1000.0, 1)
+        if self.s.profile_timings and isinstance(header.get("profile"), dict):
+            out["profile"] = header["profile"]
+        return out
+
+    async def _forward_frame(self, frame_b64: str, client_seq: Any = None, t_client_ms: Any = None) -> None:
         if self.upstream is None or not self.upstream_started:
             return  # not editing yet; drop
         try:
@@ -148,6 +184,7 @@ class Bridge:
         except (binascii.Error, ValueError):
             return
         self.frames_in += 1
+        self._remember(self.frames_in, client_seq, t_client_ms)
         try:
             async with self._send_lock:
                 await self.upstream.send(json.dumps({"type": "frame_meta", "seq": self.frames_in,
@@ -198,9 +235,11 @@ class Bridge:
         try:
             async for message in conn:
                 if isinstance(message, (bytes, bytearray)):
+                    timing = self._timing_for(pending_header)
                     pending_header = None
                     self.frames_out += 1
-                    await self.send_client({"type": "frame", "frame_b64": base64.b64encode(message).decode("ascii")})
+                    await self.send_client({"type": "frame", "frame_b64": base64.b64encode(message).decode("ascii"),
+                                            **timing})
                     continue
                 try:
                     data = json.loads(message)
