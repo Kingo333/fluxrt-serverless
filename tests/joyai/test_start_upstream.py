@@ -24,14 +24,20 @@ def run(tmp_path: Path, gpu: str, **env_overrides) -> dict:
     fake_py.write_text(
         "#!/usr/bin/env bash\n"
         f'if [ "$1" = "-c" ]; then echo "{gpu}"; exit 0; fi\n'
+        'case "$1" in *resolve_model.py) exec python3 "$@";; esac\n'
         "env | grep -E '^(JOYOMNI_|TORCHINDUCTOR_CACHE_DIR)' \n"
     )
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
     env = {k: v for k, v in os.environ.items() if not k.startswith("JOYOMNI_")}
     env.update(JOYAI_PYTHON=str(fake_py), JOYAI_DIR=str(joyai_dir), JOYAI_VOLUME_ROOT=str(vol))
     env.update(env_overrides)
-    out = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, check=True).stdout
-    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line and not line.startswith("["))
+    proc = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr)
+    out = proc.stdout
+    env_out = dict(line.split("=", 1) for line in out.splitlines() if "=" in line and not line.startswith("["))
+    env_out["_stdout"] = out
+    return env_out
 
 
 @pytest.mark.parametrize("gpu,expected,cache", [
@@ -51,3 +57,24 @@ def test_endpoint_env_overrides_profile(tmp_path):
     env = run(tmp_path, "NVIDIA RTX PRO 6000 Blackwell Server Edition|94", JOYOMNI_SAGE_ATTN="1")
     assert env["JOYOMNI_SAGE_ATTN"] == "1"
     assert env["JOYOMNI_LOW_VRAM"] == "0"
+
+
+def test_model_version_baseline_by_default(tmp_path):
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31")
+    assert "model version: joyai-baseline" in env["_stdout"]
+    assert "joyai_video_edit_dit_0811.pth" in env["_stdout"]
+
+
+def test_model_version_from_registry(tmp_path):
+    import json
+    models = tmp_path / "vol" / "models"
+    (models / "exp1").mkdir(parents=True)
+    (models / "exp1" / "dit.pth").write_text("x")
+    (models / "registry.json").write_text(json.dumps({"azyah-vton-experimental": {"dit": "exp1/dit.pth"}}))
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-experimental")
+    assert f"-> {models}/exp1/dit.pth" in env["_stdout"]
+
+
+def test_unknown_model_version_stops_the_worker(tmp_path):
+    with pytest.raises(RuntimeError, match="no registry|not in"):
+        run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-candidate")

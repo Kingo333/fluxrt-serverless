@@ -73,3 +73,25 @@ def test_estimator_matches_the_audit():
     assert rows[("h100-80", 4)]["fits"] == "maybe"
     s2 = {(r["gpu"], r["count"]): r for r in est.options("stage2", 10, 60)}
     assert s2[("b200", 1)]["fits"] == "yes"
+
+
+def test_lora_merge_math_and_layout_check(tmp_path):
+    np = pytest.importorskip("numpy")
+    mod = load("merge_lora")
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((6, 4)).astype("float32")
+    a = rng.standard_normal((2, 4)).astype("float32")
+    b = rng.standard_normal((6, 2)).astype("float32")
+    base = mod.unwrap_backbone({"model": {"module.blocks.0.attn.q.weight": w, "blocks.0.norm.weight": np.ones(4)}})
+    assert set(base) == {"blocks.0.attn.q.weight", "blocks.0.norm.weight"}
+    lora = {"base_model.model.blocks.0.attn.q.lora_A.weight": a, "base_model.model.blocks.0.attn.q.lora_B.weight": b}
+    merged, n = mod.merge(base, lora, r=2, alpha=4)
+    assert n == 1 and np.allclose(merged["blocks.0.attn.q.weight"], w + 2.0 * (b @ a))
+    keys = tmp_path / "serving.json"
+    keys.write_text(json.dumps({"keys": {"blocks.0.attn.q.weight": {"shape": [6, 4]}, "blocks.0.norm.weight": {"shape": [4]}}}))
+    assert mod.check_keys(merged, str(keys)) == []
+    keys.write_text(json.dumps({"keys": {"blocks.0.attn.q.weight": {"shape": [6, 5]}}}))
+    problems = mod.check_keys(merged, str(keys))
+    assert any("shape" in p for p in problems) and any("not in serving" in p for p in problems)
+    with pytest.raises(SystemExit, match="not in the Stage 1 backbone"):
+        mod.merge(base, {"x.lora_A.weight": a, "x.lora_B.weight": b}, 2, 4)

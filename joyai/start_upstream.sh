@@ -48,7 +48,14 @@ echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_
 # D3: no prompt enhancement. Make sure no key leaks in from the environment.
 unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
 
-DIT_CKPT="${JOYOMNI_DIT_CKPT:-$CKPT_ROOT/JoyAI-Video-Edit/dit/joyai_video_edit_dit_0811.pth}"
+DEFAULT_DIT="${JOYOMNI_DIT_CKPT:-$CKPT_ROOT/JoyAI-Video-Edit/dit/joyai_video_edit_dit_0811.pth}"
+# JOYAI_MODEL_VERSION picks a trained model from the registry on the volume (staging);
+# unset or joyai-baseline = the deployed upstream model. Unknown versions stop the worker.
+MODEL_VERSION="${JOYAI_MODEL_VERSION:-joyai-baseline}"
+REGISTRY="${JOYAI_MODEL_REGISTRY:-$VOL/models/registry.json}"
+DIT_CKPT="$("$PY" "$(dirname "$0")/tools/resolve_model.py" "$MODEL_VERSION" "$REGISTRY" "$DEFAULT_DIT")" || {
+  echo "[start_upstream] cannot load model version $MODEL_VERSION (see above)" >&2; exit 2; }
+echo "[start_upstream] model version: $MODEL_VERSION -> $DIT_CKPT"
 VAE_CKPT="${JOYOMNI_VAE_CKPT:-$CKPT_ROOT/JoyAI-Video-Edit/vae}"
 TE_CKPT="${JOYOMNI_TEXT_ENCODER_CKPT:-$CKPT_ROOT/MiMo-VL-7B-RL-2508}"
 FACE_ONNX="${JOYOMNI_FACE_ONNX:-$CKPT_ROOT/face_detection_yunet_2023mar.onnx}"

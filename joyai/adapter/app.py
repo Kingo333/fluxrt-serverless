@@ -75,7 +75,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse({"ok": upstream.status != "error", **upstream.public_state()})
+        return JSONResponse({"ok": upstream.status != "error", "model_version": s.model_version, **upstream.public_state()})
 
     async def _warmup(wait: bool) -> JSONResponse:
         await upstream.ensure_started()
@@ -169,6 +169,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "type": "ready",
             "session_deadline": int(deadline),
             "engine": "joyai",
+            "model_version": s.model_version,
             "input_width": s.width,
             "input_height": s.height,
             "input_fps": s.fps,
