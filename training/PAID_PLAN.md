@@ -2,29 +2,31 @@
 
 > **Cost-cut revision (2026-10-31, owner budget $15–20 now).** Stage 1 is **LoRA on 1 GPU** (`patches/stage1-lora.patch`, about 1 GB checkpoints). The smoke test and exp1 run in **one Pod session** (`scripts/run_first_session.sh`). exp1 uses **data subsets** (5,000 Glance + 2,000 ViViD) and **short captions only**. **Only exp1 (≤500 steps) is pre-planned**; then a go/no-go. The volume stays at **200 GB**. The full fine-tune, Gemini captions and 400/500 GB volumes come back only if exp1 shows a need.
 
+> **Live Pod prices (extension, 2026-10-31, on-demand; spot not shown):** RTX 5090 $1.19/h, RTX PRO 6000 $2.49/h, B200 $7.99/h, H100 SXM $3.99/h, A100 $1.79/h. Serverless (P3) is unchanged: 32 GB PRO $1.79/h.
+> **Datacenter for `azyah-vton-train`: EU-RO-1.** It has both the 5090 (P8, P8L) and the PRO 6000 (P9), and it is the same DC as `azyah-joyai`, which B5b needs. A volume ties every Pod to its DC. **No B200 is listed there**, so the B200 fallback would need a new volume elsewhere (or the 2× PRO 6000 route); decide only if P9's smoke runs out of memory.
+
 ## Steps to the first evaluated result
 
 | # | Step | Who | Expected / cap | Notes |
 |---|---|---|---|---|
-| P0 | Merge fluxrt-serverless #19 → #20 → #21 → #22 → #23, then azyah-shopping #9 → #10 → #11 (free); the image builds itself | Owner says "merge" | $0 | — |
-| P1 | Top up; **immediately** set Active workers = 0 | Owner; extension | top-up **$15–20 now** | — |
+| P0 | ✅ **Merged 2026-10-31**: fluxrt-serverless #19 → #23 (main `3673d0c`), azyah-shopping #9 → #11 (main `70a2bcb`) | Owner said "merge" | $0 | Done |
+| P1 | ✅ Topped up $15; Active workers 0 (balance $14.72) | Owner; extension | — | Done |
 | P2 | New image on the endpoint, with the baseline switches (`JOYAI_CLIENT_HINTS=false`, `JOYAI_OUTPUT_QUALITY=70`). **Write down the current image tag (ending `62a8da4f`) as the rollback first.** The image also carries the pinned FluxRT `32206e8` (TAEF2 + Flow Upscaler on, cu128 torch) | Extension | $0 | — |
 | P3 | **Before/after baseline**, 3 garment swaps each. **JoyAI** — A: today's behaviour + `?livecam_legacy=1`; B: new. **FluxRT** (same window, set `LIVECAM_ENGINE=fluxrt`, same 32 GB PRO card) — A: `ENABLE_FLOW_UPSCALER=false ENABLE_TINY_VAE=false FLUXRT_REF_WIDTH=288 FLUXRT_REF_HEIGHT=512 FLUXRT_CLIENT_HINTS=false`; B: remove them. Record fps, latency, GPU memory and garment colour/logo | Extension | ~**$3** / **$6**, about 100 min | Kept: necessary (+$1 for FluxRT) |
 | P4 | Volume `azyah-vton-train` **200 GB** (enough: LoRA checkpoints are about 1 GB; ViViD is read from the zip) | Extension | ~$14/month (~$0.47/day) | Kept |
 | P5 | **CPU Pod:** weights + env + checkpoint key dumps (`PHASE_B_RUNBOOK.md` B5a/B5b) | Extension | ~$0.35 / **$2** | Kept: necessary |
 | P7 | **CPU Pod, data subsets:** Glance upper-wear `convert_glance --per-config 2500` (5,000 train pairs); ViViD zip download, `vivid_zip inspect` (I confirm the pairing), `vivid_zip extract --sample 2000`, `convert_vivid convert`, then delete the zip | Extension | ~$0.50 / **$3**, 4 h | Changed (C5) |
-| P8 | **Pseudo-sources** for the subsets on 1× 5090 Pod (spot if available): trial 50 stills + 20 clips, then about 5,000 stills × ~1.5 s + 2,000 clips × ~9 s ≈ 7 h | Extension | trial ~$1; full ~**$7** on-demand / ~$4 spot (re-priced from the trial) / **$10** | Changed (C5) |
-| P8L | **FluxRT garment LoRA** (lite/backup path, `fluxrt_lora/README.md`): 1× **RTX 5090** Pod, same pseudo-source data (3,000 triples incl. 2 stills per ViViD clip). Trial 100 steps, then 1,500 steps | Extension | trial ~$1; full ~**$2–4** / **$8** | New, optional; can run before P9 |
-| P9 | **First session, 1× RTX PRO 6000 Pod (spot if available)** with `run_first_session.sh`: setup, ToyData smoke (20 + resume to 30, LoRA; proves the patch, measures memory and step time), then exp1 **≤500 steps**, LoRA r64, checkpoints every 50 steps, auto-resume after interruption | Extension | ~**$27** on-demand (about 13.5 h at ~90 s/step, a guess until the smoke measures it) / ~$14–18 spot (live price unverified) / **$32** | Changed (C1, C2, C3, C6). If the 96 GB card runs out of memory: 1× B200 (~$75), owner's yes first |
-| P9e | **Evaluate exp1 vs baseline** offline on held-out Glance/ViViD test items (+ own clips when recorded): `eval/run_eval.py` + blinded A/B | Extension; Claude Code | ~$2 / **$4** | The go/no-go |
+| P8 | **Pseudo-sources** for the subsets on 1× 5090 Pod (spot if available): trial 50 stills + 20 clips, then about 5,000 stills × ~1.5 s + 2,000 clips × ~9 s ≈ 7 h | Extension | trial ~$1.20; full ~**$8.50** on-demand at $1.19/h (re-priced from the trial) / **$12** | Changed (C5); live price |
+| P8L | **FluxRT garment LoRA** (lite/backup path, `fluxrt_lora/README.md`): 1× **RTX 5090** Pod, same pseudo-source data (3,000 triples incl. 2 stills per ViViD clip). Trial 100 steps, then 1,500 steps | Extension | trial ~$1.20; full ~**$3–5** / **$8** | New, optional; can run before P9 |
+| P9 | **First session, 1× RTX PRO 6000 Pod (spot if available)** with `run_first_session.sh`: setup, ToyData smoke (20 + resume to 30, LoRA; proves the patch, measures memory and step time), then exp1 **≤500 steps**, LoRA r64, checkpoints every 50 steps, auto-resume after interruption | Extension | ~**$34** on-demand (about 13.5 h at ~90 s/step × $2.49/h, a guess until the smoke measures it) / spot unknown / **$40** | Changed (C1, C2, C3, C6); live price. If the 96 GB card runs out of memory: 1× B200 (~$100 at $7.99/h, not in EU-RO-1), owner's yes first |
+| P9e | **Evaluate exp1 vs baseline** offline on held-out Glance/ViViD test items (+ own clips when recorded): `eval/run_eval.py` + blinded A/B | Extension; Claude Code | ~$2.50 / **$5** | The go/no-go |
 
-**Total to the first evaluated result:**
-- about **$43** on-demand (JoyAI path; P3 now also covers FluxRT)
-- about **$28–31** with spot Pods for P8/P9 (spot prices to confirm)
-- the old plan was about $145–175
-- **plus the FluxRT LoRA (P8L) if approved: about $3–5 more.** A cheaper alternative first result is P3–P8 + P8L + its eval, about **$20–22**
+**Total to the first evaluated result (live on-demand prices, volume for about 2 weeks ≈ $7 included):**
+- **JoyAI path** (P3–P9e): about **$56** (was $43 at the older prices); spot could cut P8/P9 if RunPod offers it in EU-RO-1
+- **FluxRT LoRA path** (P3–P8 + P8L + eval): about **$24–26**
+- both: about $60
 
-**With $15–20 now:** P3, P4, P5, P7 and P8 (about $14 plus the volume) are covered; P8L fits too if P8 comes in near its estimate. **Top up about $20–30 more before P9.**
+**With $14.72 now:** the approved steps P3 (~$3), P4 (accrues ~$0.47/day) and P5 (~$0.35) fit with room to spare. **P7 + P8 (~$9) also fit; P8L needs about $5 more, P9 about $35 more.**
 
 ## Only after a "go" from P9e (each re-priced from P9's measured step time)
 
