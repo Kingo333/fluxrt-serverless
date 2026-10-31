@@ -1,0 +1,189 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index 562f629..1b5a2f6 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -328,6 +328,20 @@ def parse_args(input_args=None):
+         default=None,
+         help="Column in the dataset containing the condition image. Must be specified when performing I2I fine-tuning",
+     )
++    parser.add_argument(
++        "--cond_image_column_2",
++        type=str,
++        default=None,
++        help="Azyah: optional second condition image (the garment). It is passed after the first one, "
++        "like FluxRT's image=[camera_frame, garment] at inference.",
++    )
++    parser.add_argument(
++        "--cond_2_size",
++        type=str,
++        default="384x512",
++        help="Azyah: WIDTHxHEIGHT for the second condition image. It is padded with white to this size, "
++        "never stretched, the same as the FluxRT worker does with the garment reference.",
++    )
+     parser.add_argument(
+         "--caption_column",
+         type=str,
+@@ -807,6 +821,12 @@ class DreamBoothDataset(Dataset):
+             if cond_image_column is not None:
+                 cond_images = [dataset["train"][i][cond_image_column] for i in range(len(dataset["train"]))]
+                 assert len(instance_images) == len(cond_images)
++            cond_images_2 = None
++            if args.cond_image_column_2 is not None:
++                if args.cond_image_column_2 not in column_names:
++                    raise ValueError(f"`--cond_image_column_2` value '{args.cond_image_column_2}' not found in dataset columns.")
++                cond_images_2 = dataset["train"][args.cond_image_column_2]
++                assert len(instance_images) == len(cond_images_2)
+ 
+             if args.caption_column is None:
+                 logger.info(
+@@ -835,13 +855,18 @@ class DreamBoothDataset(Dataset):
+ 
+         self.instance_images = []
+         self.cond_images = []
++        self.cond_images_2 = []
+         for i, img in enumerate(instance_images):
+             self.instance_images.extend(itertools.repeat(img, repeats))
+             if args.dataset_name is not None and cond_images is not None:
+                 self.cond_images.extend(itertools.repeat(cond_images[i], repeats))
++            if args.dataset_name is not None and cond_images_2 is not None:
++                self.cond_images_2.extend(itertools.repeat(cond_images_2[i], repeats))
++        cond_2_w, cond_2_h = (int(v) for v in args.cond_2_size.lower().split("x"))
+ 
+         self.pixel_values = []
+         self.cond_pixel_values = []
++        self.cond_2_pixel_values = []
+         self.buckets = []
+         bucket_to_idx = {}
+         for i, image in enumerate(self.instance_images):
+@@ -900,6 +925,8 @@ class DreamBoothDataset(Dataset):
+             self.pixel_values.append((image, bucket_idx))
+             if dest_image is not None:
+                 self.cond_pixel_values.append((dest_image, bucket_idx))
++            if self.cond_images_2:
++                self.cond_2_pixel_values.append(_azyah_pad_to(self.cond_images_2[i], cond_2_w, cond_2_h))
+ 
+         self.num_instance_images = len(self.instance_images)
+         self._length = self.num_instance_images
+@@ -915,6 +942,8 @@ class DreamBoothDataset(Dataset):
+         if self.cond_pixel_values:
+             dest_image, _ = self.cond_pixel_values[index % self.num_instance_images]
+             example["cond_images"] = dest_image
++        if self.cond_2_pixel_values:
++            example["cond_images_2"] = self.cond_2_pixel_values[index % self.num_instance_images]
+ 
+         if self.custom_instance_prompts:
+             caption = self.custom_instance_prompts[index % self.num_instance_images]
+@@ -974,6 +1003,19 @@ class DreamBoothDataset(Dataset):
+         return (image, dest_image) if dest_image is not None else (image, None)
+ 
+ 
++def _azyah_pad_to(image, width, height):
++    """Fit inside width x height and pad with white (no stretch, no crop, no flip)."""
++    image = exif_transpose(image)
++    if image.mode != "RGB":
++        image = image.convert("RGB")
++    scale = min(width / image.width, height / image.height)
++    w, h = max(1, round(image.width * scale)), max(1, round(image.height * scale))
++    image = image.resize((w, h), Image.LANCZOS)
++    canvas = Image.new("RGB", (width, height), (255, 255, 255))
++    canvas.paste(image, ((width - w) // 2, (height - h) // 2))
++    return TF.normalize(TF.to_tensor(canvas), [0.5], [0.5])
++
++
+ def collate_fn(examples):
+     pixel_values = [example["instance_images"] for example in examples]
+     prompts = [example["instance_prompt"] for example in examples]
+@@ -987,6 +1029,9 @@ def collate_fn(examples):
+         cond_pixel_values = torch.stack(cond_pixel_values)
+         cond_pixel_values = cond_pixel_values.to(memory_format=torch.contiguous_format).float()
+         batch.update({"cond_pixel_values": cond_pixel_values})
++    if any("cond_images_2" in example for example in examples):
++        cond_2 = torch.stack([example["cond_images_2"] for example in examples])
++        batch["cond_2_pixel_values"] = cond_2.to(memory_format=torch.contiguous_format).float()
+     return batch
+ 
+ 
+@@ -1530,6 +1575,8 @@ def main(args):
+         text_ids_cache = []
+         latents_cache = []
+         cond_latents_cache = []
++        cond_2_latents_cache = []
++        _azyah_prompt_memo = {}
+         for batch in tqdm(train_dataloader, desc="Caching latents"):
+             with torch.no_grad():
+                 if args.cache_latents:
+@@ -1542,12 +1589,23 @@ def main(args):
+                             accelerator.device, non_blocking=True, dtype=vae.dtype
+                         )
+                         cond_latents_cache.append(vae.encode(batch["cond_pixel_values"]).latent_dist)
++                        if "cond_2_pixel_values" in batch:
++                            batch["cond_2_pixel_values"] = batch["cond_2_pixel_values"].to(
++                                accelerator.device, non_blocking=True, dtype=vae.dtype
++                            )
++                            cond_2_latents_cache.append(vae.encode(batch["cond_2_pixel_values"]).latent_dist)
+                 if train_dataset.custom_instance_prompts:
+-                    if args.fsdp_text_encoder:
++                    # Azyah: our captions repeat (one FluxRT prompt per category), so identical
++                    # batches share one tensor instead of ~8 MB of GPU memory per sample.
++                    memo_key = tuple(batch["prompts"])
++                    if memo_key in _azyah_prompt_memo:
++                        prompt_embeds, text_ids = _azyah_prompt_memo[memo_key]
++                    elif args.fsdp_text_encoder:
+                         prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
+                     else:
+                         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+                             prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
++                    _azyah_prompt_memo[memo_key] = (prompt_embeds, text_ids)
+                     prompt_embeds_cache.append(prompt_embeds)
+                     text_ids_cache.append(text_ids)
+ 
+@@ -1687,24 +1745,37 @@ def main(args):
+                 if args.cache_latents:
+                     model_input = latents_cache[step].mode()
+                     cond_model_input = cond_latents_cache[step].mode()
++                    cond_2_model_input = cond_2_latents_cache[step].mode() if cond_2_latents_cache else None
+                 else:
+                     with offload_models(vae, device=accelerator.device, offload=args.offload):
+                         pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
+                         cond_pixel_values = batch["cond_pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
+                         model_input = vae.encode(pixel_values).latent_dist.mode()
+                         cond_model_input = vae.encode(cond_pixel_values).latent_dist.mode()
++                        cond_2_model_input = None
++                        if "cond_2_pixel_values" in batch:
++                            cond_2_pixel_values = batch["cond_2_pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
++                            cond_2_model_input = vae.encode(cond_2_pixel_values).latent_dist.mode()
+ 
+                 model_input = Flux2KleinPipeline._patchify_latents(model_input)
+                 model_input = (model_input - latents_bn_mean) / latents_bn_std
+ 
+                 cond_model_input = Flux2KleinPipeline._patchify_latents(cond_model_input)
+                 cond_model_input = (cond_model_input - latents_bn_mean) / latents_bn_std
++                if cond_2_model_input is not None:
++                    cond_2_model_input = Flux2KleinPipeline._patchify_latents(cond_2_model_input)
++                    cond_2_model_input = (cond_2_model_input - latents_bn_mean) / latents_bn_std
+ 
+                 model_input_ids = Flux2KleinPipeline._prepare_latent_ids(model_input).to(device=model_input.device)
+                 # Each batch element is an independent training sample with a single
+                 # conditional image. Generate temporal IDs for one sample and expand
+                 # across the batch, avoiding incorrect cross-sample temporal offsets.
+-                cond_model_input_ids = Flux2KleinPipeline._prepare_image_ids([cond_model_input[0:1]]).to(
++                # Azyah: with a garment, ids are built for [person, garment] together so each
++                # image gets its own time offset (10, 20), exactly as the pipeline does.
++                cond_list = [cond_model_input[0:1]]
++                if cond_2_model_input is not None:
++                    cond_list.append(cond_2_model_input[0:1])
++                cond_model_input_ids = Flux2KleinPipeline._prepare_image_ids(cond_list).to(
+                     device=cond_model_input.device
+                 )
+                 cond_model_input_ids = cond_model_input_ids.expand(cond_model_input.shape[0], -1, -1)
+@@ -1734,6 +1805,10 @@ def main(args):
+                 # concatenate the model inputs with the cond inputs
+                 packed_noisy_model_input = Flux2KleinPipeline._pack_latents(noisy_model_input)
+                 packed_cond_model_input = Flux2KleinPipeline._pack_latents(cond_model_input)
++                if cond_2_model_input is not None:
++                    packed_cond_model_input = torch.cat(
++                        [packed_cond_model_input, Flux2KleinPipeline._pack_latents(cond_2_model_input)], dim=1
++                    )
+                 orig_input_shape = packed_noisy_model_input.shape
+                 orig_input_ids_shape = model_input_ids.shape
+ 

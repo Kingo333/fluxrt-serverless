@@ -6,23 +6,25 @@
 
 | # | Step | Who | Expected / cap | Notes |
 |---|---|---|---|---|
-| P0 | Merge fluxrt-serverless #19 → #20 → #21 → #22, azyah-shopping #9 → #10 (free); the image builds itself | Owner says "merge" | $0 | — |
+| P0 | Merge fluxrt-serverless #19 → #20 → #21 → #22 → #23, then azyah-shopping #9 → #10 → #11 (free); the image builds itself | Owner says "merge" | $0 | — |
 | P1 | Top up; **immediately** set Active workers = 0 | Owner; extension | top-up **$15–20 now** | — |
-| P2 | New image on the endpoint, with the baseline switches (`JOYAI_CLIENT_HINTS=false`, `JOYAI_OUTPUT_QUALITY=70`) | Extension | $0 | — |
-| P3 | **Before/after baseline** (A: today's behaviour + `?livecam_legacy=1`; B: new), 3 garment swaps | Extension | ~$2 / **$5**, 75 min | Kept: necessary |
+| P2 | New image on the endpoint, with the baseline switches (`JOYAI_CLIENT_HINTS=false`, `JOYAI_OUTPUT_QUALITY=70`). **Write down the current image tag (ending `62a8da4f`) as the rollback first.** The image also carries the pinned FluxRT `32206e8` (TAEF2 + Flow Upscaler on, cu128 torch) | Extension | $0 | — |
+| P3 | **Before/after baseline**, 3 garment swaps each. **JoyAI** — A: today's behaviour + `?livecam_legacy=1`; B: new. **FluxRT** (same window, set `LIVECAM_ENGINE=fluxrt`, same 32 GB PRO card) — A: `ENABLE_FLOW_UPSCALER=false ENABLE_TINY_VAE=false FLUXRT_REF_WIDTH=288 FLUXRT_REF_HEIGHT=512 FLUXRT_CLIENT_HINTS=false`; B: remove them. Record fps, latency, GPU memory and garment colour/logo | Extension | ~**$3** / **$6**, about 100 min | Kept: necessary (+$1 for FluxRT) |
 | P4 | Volume `azyah-vton-train` **200 GB** (enough: LoRA checkpoints are about 1 GB; ViViD is read from the zip) | Extension | ~$14/month (~$0.47/day) | Kept |
 | P5 | **CPU Pod:** weights + env + checkpoint key dumps (`PHASE_B_RUNBOOK.md` B5a/B5b) | Extension | ~$0.35 / **$2** | Kept: necessary |
 | P7 | **CPU Pod, data subsets:** Glance upper-wear `convert_glance --per-config 2500` (5,000 train pairs); ViViD zip download, `vivid_zip inspect` (I confirm the pairing), `vivid_zip extract --sample 2000`, `convert_vivid convert`, then delete the zip | Extension | ~$0.50 / **$3**, 4 h | Changed (C5) |
 | P8 | **Pseudo-sources** for the subsets on 1× 5090 Pod (spot if available): trial 50 stills + 20 clips, then about 5,000 stills × ~1.5 s + 2,000 clips × ~9 s ≈ 7 h | Extension | trial ~$1; full ~**$7** on-demand / ~$4 spot (re-priced from the trial) / **$10** | Changed (C5) |
+| P8L | **FluxRT garment LoRA** (lite/backup path, `fluxrt_lora/README.md`): 1× **RTX 5090** Pod, same pseudo-source data (3,000 triples incl. 2 stills per ViViD clip). Trial 100 steps, then 1,500 steps | Extension | trial ~$1; full ~**$2–4** / **$8** | New, optional; can run before P9 |
 | P9 | **First session, 1× RTX PRO 6000 Pod (spot if available)** with `run_first_session.sh`: setup, ToyData smoke (20 + resume to 30, LoRA; proves the patch, measures memory and step time), then exp1 **≤500 steps**, LoRA r64, checkpoints every 50 steps, auto-resume after interruption | Extension | ~**$27** on-demand (about 13.5 h at ~90 s/step, a guess until the smoke measures it) / ~$14–18 spot (live price unverified) / **$32** | Changed (C1, C2, C3, C6). If the 96 GB card runs out of memory: 1× B200 (~$75), owner's yes first |
 | P9e | **Evaluate exp1 vs baseline** offline on held-out Glance/ViViD test items (+ own clips when recorded): `eval/run_eval.py` + blinded A/B | Extension; Claude Code | ~$2 / **$4** | The go/no-go |
 
 **Total to the first evaluated result:**
-- about **$42** on-demand
-- about **$27–30** with spot Pods for P8/P9 (spot prices to confirm)
+- about **$43** on-demand (JoyAI path; P3 now also covers FluxRT)
+- about **$28–31** with spot Pods for P8/P9 (spot prices to confirm)
 - the old plan was about $145–175
+- **plus the FluxRT LoRA (P8L) if approved: about $3–5 more.** A cheaper alternative first result is P3–P8 + P8L + its eval, about **$20–22**
 
-**With $15–20 now:** P3, P4, P5, P7 and P8 (about $13 plus the volume) are covered. **Top up about $20–30 more before P9.**
+**With $15–20 now:** P3, P4, P5, P7 and P8 (about $14 plus the volume) are covered; P8L fits too if P8 comes in near its estimate. **Top up about $20–30 more before P9.**
 
 ## Only after a "go" from P9e (each re-priced from P9's measured step time)
 
