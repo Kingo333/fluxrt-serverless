@@ -28,7 +28,13 @@ VENV="$AZ_ROOT/venv"
 "$VENV/bin/pip" install -q --upgrade pip wheel setuptools
 # Pinned serving requirements (torch 2.9.1 cu128 etc.) plus what training/ imports.
 "$VENV/bin/pip" install -q -r "$AZ_UPSTREAM/deploy/requirements.txt"
-"$VENV/bin/pip" install -q datasets decord torchdata ftfy peft pyarrow regex safetensors tensorboard "huggingface_hub[cli]>=0.34"
+# One resolver call that repeats upstream's pins, so pip picks extras that fit them.
+# A separate unpinned call upgraded huggingface_hub to 2.x, which breaks
+# transformers 4.57 and diffusers 0.36 (both need <1.0 / <2.0) (P5, 2026-10-31).
+"$VENV/bin/pip" install -q --extra-index-url https://download.pytorch.org/whl/cu128 \
+  "torch==2.9.1+cu128" "torchvision==0.24.1+cu128" "transformers>=4.57.1,<4.58" "diffusers==0.36.0" "accelerate==1.10.1" \
+  "huggingface_hub>=0.34,<1.0" datasets decord torchdata ftfy peft pyarrow regex safetensors tensorboard
+"$VENV/bin/pip" check || echo "WARNING: pip check reported conflicts (see above)"
 # flash-attn is optional: training falls back to PyTorch SDPA when it is missing.
 
 echo "== Azyah training patches (Stage 1 LoRA)"
@@ -44,8 +50,11 @@ curl -fsSL "$SCRIPTS_URL/make_smoke_config.py" -o "$AZ_ROOT/make_smoke_config.py
 
 echo "== checks"
 "$VENV/bin/python" - <<'PY'
-import torch, datasets, peft, decord, torchdata
+import torch, datasets, peft, decord, torchdata, transformers, diffusers, huggingface_hub
 print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+print("transformers", transformers.__version__, "diffusers", diffusers.__version__,
+      "huggingface_hub", huggingface_hub.__version__, "peft", peft.__version__, "datasets", datasets.__version__)
+assert int(huggingface_hub.__version__.split(".")[0]) < 1, "huggingface_hub must be <1.0 for transformers 4.57"
 for i in range(torch.cuda.device_count()):
     p = torch.cuda.get_device_properties(i)
     print(f"gpu{i}: {p.name} {p.total_memory / 2**30:.0f} GiB sm_{p.major}{p.minor}")
