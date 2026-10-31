@@ -6,7 +6,7 @@
 
 | # | Step | Who | Expected / cap | Notes |
 |---|---|---|---|---|
-| P0 | Merge fluxrt-serverless #19 → #20 → #21 → #22 → FluxRT upgrade PR, then azyah-shopping #9 → #10 → FluxRT upscale PR (free); the image builds itself | Owner says "merge" | $0 | — |
+| P0 | Merge fluxrt-serverless #19 → #20 → #21 → #22 → #23, then azyah-shopping #9 → #10 → #11 (free); the image builds itself | Owner says "merge" | $0 | — |
 | P1 | Top up; **immediately** set Active workers = 0 | Owner; extension | top-up **$15–20 now** | — |
 | P2 | New image on the endpoint, with the baseline switches (`JOYAI_CLIENT_HINTS=false`, `JOYAI_OUTPUT_QUALITY=70`). **Write down the current image tag (ending `62a8da4f`) as the rollback first.** The image also carries the pinned FluxRT `32206e8` (TAEF2 + Flow Upscaler on, cu128 torch) | Extension | $0 | — |
 | P3 | **Before/after baseline**, 3 garment swaps each. **JoyAI** — A: today's behaviour + `?livecam_legacy=1`; B: new. **FluxRT** (same window, set `LIVECAM_ENGINE=fluxrt`, same 32 GB PRO card) — A: `ENABLE_FLOW_UPSCALER=false ENABLE_TINY_VAE=false FLUXRT_REF_WIDTH=288 FLUXRT_REF_HEIGHT=512 FLUXRT_CLIENT_HINTS=false`; B: remove them. Record fps, latency, GPU memory and garment colour/logo | Extension | ~**$3** / **$6**, about 100 min | Kept: necessary (+$1 for FluxRT) |
