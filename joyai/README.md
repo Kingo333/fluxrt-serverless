@@ -87,6 +87,11 @@ Behaviors worth knowing:
 | `JOYAI_KV_RESET_FRAMES` | `600` | KV-cache reset interval |
 | `JOYAI_MAX_TEMPORAL_IDS` | `8` | Recent-chunk memory (smaller = faster, larger = steadier) |
 | `JOYAI_OUTPUT_QUALITY` | `90` | JPEG quality of returned frames (70 blurred prints and logos) |
+| `JOYAI_INSTRUCTION_STYLE` | `full` | `short`: send JoyAI only the first sentence and the keep-the-person sentence of the app's instruction (for a model trained on short captions) |
+| `JOYAI_CLIENT_HINTS` | `true` | `false`: leave the frame size/fps/quality hints out of `ready`, so the app keeps its own (pre-#18) capture settings. For before/after benchmarks |
+| `JOYAI_MODEL_VERSION` | `joyai-baseline` | Which model to serve: `joyai-baseline` (deployed upstream DiT) or a name in the registry (`azyah-vton-experimental`, `azyah-vton-candidate`). Unknown names or missing files stop the worker, never a silent fallback. Reported in `ready` and `/health` |
+| `JOYAI_ALLOW_RESEARCH_MODEL` | unset | `1` lets the worker serve a registry model with `commercial_use_cleared: false` (e.g. trained with ViViD). **Staging only**; never on production (Phase K gate) |
+| `JOYAI_MODEL_REGISTRY` | `/runpod-volume/joyai/models/registry.json` | `{"<version>": {"dit": "<path>", "sha256": …, "notes": …}}` (relative paths are resolved from the registry's folder) |
 | `JOYAI_PROFILE_TIMINGS` | `false` | `true`: ask JoyAI for per-chunk stage timings and pass them to the app as `profile` on each frame (benchmarking only) |
 | `JOYAI_INPUT_JPEG_QUALITY` | `85` | Camera JPEG quality the app is asked to use (sent in `ready`, with the session size and fps) |
 | `JOYAI_GATE_ENABLED` | `true` | Face/person presence gates |

@@ -41,18 +41,26 @@ def _bytes(cell) -> bytes:
     raise ValueError("unexpected image cell")
 
 
-def convert(parquet_dir: str, staging_dir: str, configs: list[str], limit: int | None = None) -> int:
+def convert(parquet_dir: str, staging_dir: str, configs: list[str], limit: int | None = None,
+            per_config: int | None = None) -> int:
+    """per_config: stage at most N train pairs (and N/5 test pairs) per config, so a
+    subset stays balanced between e.g. men's and women's (cost cut C5)."""
     import pyarrow.parquet as pq
 
     root = Path(staging_dir)
     n = 0
+    taken: dict[tuple[str, str], int] = {}
     for f in sorted(Path(parquet_dir).rglob("*.parquet")):
         cfg, split = _cfg_split(f.relative_to(parquet_dir))
         if cfg not in configs:
             continue
+        cap = None if per_config is None else (per_config if split == "train" else max(1, per_config // 5))
         category = "upper" if "upper" in cfg else "lower"
         table = pq.read_table(f, columns=["cloth", "image", "agnostic-mask"])
         for row in table.to_pylist():
+            if cap is not None and taken.get((cfg, split), 0) >= cap:
+                break
+            taken[(cfg, split)] = taken.get((cfg, split), 0) + 1
             cloth, image, mask = _bytes(row["cloth"]), _bytes(row["image"]), _bytes(row["agnostic-mask"])
             garment_id = "glance-" + hashlib.sha1(cloth).hexdigest()[:16]
             key = f"glance_{cfg.replace('-', '_')}_{split}_{n:07d}"
@@ -72,8 +80,9 @@ def main() -> None:
     ap.add_argument("staging_dir")
     ap.add_argument("--configs", nargs="*", default=["mens-upperwear", "womens-upperwear"])
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--per-config", type=int, help="balanced subset: N train pairs (+N/5 test) per config")
     a = ap.parse_args()
-    print(f"staged {convert(a.parquet_dir, a.staging_dir, a.configs, a.limit)} Glance pairs")
+    print(f"staged {convert(a.parquet_dir, a.staging_dir, a.configs, a.limit, a.per_config)} Glance pairs")
 
 
 if __name__ == "__main__":

@@ -30,12 +30,17 @@ from pathlib import Path
 from .staging import stage_pair
 
 
+def _find_roots(d: Path) -> list[Path]:
+    """Every folder that holds videos/ and cloth/ (e.g. upper_body/, lower_body/, dresses/)."""
+    roots = [c for c in [d, *sorted(p for p in d.rglob("*") if p.is_dir())]
+             if (c / "videos").is_dir() and (c / "cloth").is_dir()]
+    if not roots:
+        raise SystemExit(f"no folder with videos/ and cloth/ under {d}")
+    return roots
+
+
 def _find_root(d: Path) -> Path:
-    """The folder that holds videos/ and cloth/ (the zip may add a top-level folder)."""
-    for cand in [d, *sorted(p for p in d.rglob("*") if p.is_dir())]:
-        if (cand / "videos").is_dir() and (cand / "cloth").is_dir():
-            return cand
-    raise SystemExit(f"no folder with videos/ and cloth/ under {d}")
+    return _find_roots(d)[0]
 
 
 def _pattern(name: str) -> str:
@@ -77,15 +82,17 @@ def _is_test(key: str, frac: float) -> bool:
 
 def convert(extracted: str, staging: str, pairing: str, pairs_csv: str | None = None,
             test_frac: float = 0.2, limit: int | None = None) -> dict:
-    root = _find_root(Path(extracted))
+    roots = _find_roots(Path(extracted))
+    root = Path(extracted)
     pairs: list[tuple[Path, Path, str]] = []
     if pairing == "stem":
-        cloth_by_stem = {p.stem: p for p in (root / "cloth").rglob("*")
-                         if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
-        for v in sorted((root / "videos").rglob("*.mp4")):
-            c = cloth_by_stem.get(v.stem)
-            if c is not None:
-                pairs.append((v, c, _category(v)))
+        for r in roots:
+            cloth_by_stem = {p.stem: p for p in (r / "cloth").rglob("*")
+                             if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
+            for v in sorted((r / "videos").rglob("*.mp4")):
+                c = cloth_by_stem.get(v.stem)
+                if c is not None:
+                    pairs.append((v, c, _category(v)))
     elif pairing == "csv":
         with open(pairs_csv, newline="") as f:
             for row in csv.DictReader(f):

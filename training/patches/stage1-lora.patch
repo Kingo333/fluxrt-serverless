@@ -1,0 +1,121 @@
+diff --git a/training/src/models/__init__.py b/training/src/models/__init__.py
+index 7605c36..597b676 100644
+--- a/training/src/models/__init__.py
++++ b/training/src/models/__init__.py
+@@ -33,6 +33,28 @@ def _normalize_train_modules(train_modules: str | Sequence[str] | None) -> list[
+     return normalized or None
+ 
+ 
++def _add_stage1_lora(model: torch.nn.Module, cfg) -> None:
++    """Azyah patch: Stage 1 with LoRA adapters only (cfg.stage1_lora). Reuses the Stage 2
++    LoRA builder and the "generator" adapter name, so checkpoints use the same
++    generator_lora format that load_dit/_merge_generator_lora already read."""
++    from src.train_t2v_dmd import build_lora_config
++
++    logger = get_logger()
++    model.requires_grad_(False)
++    model.add_adapter(build_lora_config(cfg, model), adapter_name="generator")
++    model.set_adapter("generator")
++    dtype = PRECISION_TO_TYPE[cfg.dit_precision]
++    trainable = 0
++    for name, param in model.named_parameters():
++        if "lora_" in name:
++            if param.dtype != dtype:
++                param.data = param.data.to(dtype=dtype)
++            param.requires_grad_(True)
++            trainable += param.numel()
++    model._azyah_stage1_lora = True
++    logger.info(f"Stage 1 LoRA: {trainable / 1e6:.1f}M trainable adapter parameters; base frozen")
++
++
+ def _configure_dit_trainable_modules(model: torch.nn.Module, cfg) -> None:
+     logger = get_logger()
+     train_modules = _normalize_train_modules(getattr(cfg, "dit_train_modules", None))
+@@ -192,7 +214,10 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
+ 
+     if adapter_checkpoint is not None:
+         _merge_generator_lora(model, adapter_checkpoint, cfg)
+-    _configure_dit_trainable_modules(model, cfg)
++    if getattr(cfg, "stage1_lora", False):
++        _add_stage1_lora(model, cfg)
++    else:
++        _configure_dit_trainable_modules(model, cfg)
+ 
+     model = maybe_load_fsdp_model(
+         model=model,
+diff --git a/training/src/utils/checkpoint.py b/training/src/utils/checkpoint.py
+index 7b319c3..234c97b 100644
+--- a/training/src/utils/checkpoint.py
++++ b/training/src/utils/checkpoint.py
+@@ -15,6 +15,12 @@ from src.utils.logging import get_logger
+ _SAVE_OPTIONS = StateDictOptions(full_state_dict=True, cpu_offload=True)
+ _LOAD_OPTIONS = StateDictOptions(
+     full_state_dict=True, broadcast_from_rank0=True)
++_LOAD_OPTIONS_PARTIAL = StateDictOptions(
++    full_state_dict=True, broadcast_from_rank0=True, strict=False)
++
++
++def _is_stage1_lora(model) -> bool:
++    return bool(getattr(model, "_azyah_stage1_lora", False))
+ 
+ 
+ def save_checkpoint(
+@@ -32,11 +38,34 @@ def save_checkpoint(
+     save_path = Path(save_dir / f"global_step{step}")
+     save_path.mkdir(parents=True, exist_ok=True)
+ 
+-    state_dict = {
+-        "step": step,
+-        "epoch": epoch,
+-        "model": get_model_state_dict(model, options=_SAVE_OPTIONS)
+-    }
++    full_state = get_model_state_dict(model, options=_SAVE_OPTIONS)
++    if _is_stage1_lora(model):
++        # Azyah patch: save only the LoRA adapter (about 1 GB, not the 32.5 GB backbone),
++        # in the Stage 2 generator_lora format.
++        from peft.utils import get_peft_model_state_dict
++        adapter_cfg = model.peft_config["generator"]
++        targets = adapter_cfg.target_modules
++        state_dict = {
++            "step": step,
++            "epoch": epoch,
++            "dmd_use_lora": True,
++            "stage1_lora": True,
++            "generator_adapter_name": "generator",
++            "generator_lora": get_peft_model_state_dict(model, state_dict=full_state, adapter_name="generator"),
++            "generator_lora_config": {
++                "r": adapter_cfg.r,
++                "lora_alpha": adapter_cfg.lora_alpha,
++                "target_modules": targets if isinstance(targets, str) else sorted(targets),
++                "bias": adapter_cfg.bias,
++            },
++        }
++    else:
++        state_dict = {
++            "step": step,
++            "epoch": epoch,
++            "model": full_state,
++        }
++    del full_state
+ 
+     if optimizer is not None:
+         state_dict["optimizer"] = get_optimizer_state_dict(
+@@ -87,7 +116,17 @@ def load_checkpoint(
+     logger.info(f"Loading checkpoint from {checkpoint_path}")
+     state_dict = torch.load(checkpoint_path, map_location="cpu")
+ 
+-    set_model_state_dict(model, state_dict["model"], options=_LOAD_OPTIONS)
++    if "generator_lora" in state_dict and "model" not in state_dict:
++        # Azyah patch: resume a Stage 1 LoRA checkpoint (adapter weights only).
++        from peft.utils.save_and_load import _insert_adapter_name_into_state_dict
++        named = _insert_adapter_name_into_state_dict(
++            dict(state_dict["generator_lora"]), adapter_name="generator", parameter_prefix="lora_")
++        result = set_model_state_dict(model, named, options=_LOAD_OPTIONS_PARTIAL)
++        unexpected = list(getattr(result, "unexpected_keys", []) or [])
++        if unexpected:
++            raise RuntimeError(f"Stage 1 LoRA resume: {len(unexpected)} unexpected keys, e.g. {unexpected[:5]}")
++    else:
++        set_model_state_dict(model, state_dict["model"], options=_LOAD_OPTIONS)
+ 
+     if optimizer is not None and "optimizer" in state_dict:
+         set_optimizer_state_dict(

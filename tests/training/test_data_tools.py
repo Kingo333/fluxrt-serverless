@@ -46,7 +46,7 @@ def test_glance_to_shards_to_manifest(tmp_path):
     for d in pairs[:-1]:
         (d / "source.png").write_bytes(png((0, 200, 0)))
     out = tmp_path / "shards"
-    result = pack.pack(str(staging), str(out), "glance_upper")
+    result = pack.pack(str(staging), str(out), "glance_upper", identity_frac=0.0)
     assert result["samples"] == 7 and result["skipped_no_source"] == 1
     catalog = json.loads(Path(result["catalog"]).read_text())
     shards = [e["path"] for e in catalog]
@@ -215,3 +215,100 @@ def test_mask_box_picker():
     from data_tools.masks import pick_box
     assert pick_box([[0, 0, 1, 1], [1, 1, 2, 2]], [0.2, 0.9]) == ([1.0, 1.0, 2.0, 2.0], 0.9)
     assert pick_box([[0, 0, 1, 1]], [0.1]) is None
+
+
+def test_training_caption_matches_the_app_instruction_exactly():
+    # Same case and expected string as azyah-shopping
+    # src/components/ai-studio/live-cam/__tests__/buildTryOnInstruction.test.ts (review R2).
+    from data_tools.staging import instruction
+    assert instruction("upper", "Striped linen shirt", "Navy and white vertical stripes, mandarin collar, two chest pockets") == (
+        "Substitute the current top with the garment in the reference image. "
+        "The reference garment is the Striped linen shirt: Navy and white vertical stripes, mandarin collar, two chest pockets. "
+        "Match its exact color, pattern, print, logo, fabric and construction details. "
+        "Keep the person's face, body, pose and the background unchanged."
+    )
+    assert instruction("upper") == (
+        "Substitute the current top with the garment in the reference image. "
+        "Keep the person's face, body, pose and the background unchanged."
+    )
+    assert instruction("upper", None, "Red tee!").startswith(
+        "Substitute the current top with the garment in the reference image. The reference garment: Red tee.")
+
+
+class FakeCaptioner:
+    name = "fake-vlm"
+
+    def describe(self, image_bytes, mime):
+        return "Navy crew-neck tee with a white chest logo. <b>Soft</b> jersey."
+
+
+def test_captioner_then_pack_writes_both_caption_styles(tmp_path):
+    from data_tools import caption_garments
+    staging = tmp_path / "st"
+    _stage_still(staging, "p1")
+    (staging / "p1" / "source.png").write_bytes(png((0, 200, 0)))
+    res = caption_garments.process(str(staging), FakeCaptioner())
+    assert res == {"described": 1, "skipped": 0, "failed": 0}
+    meta = json.loads((staging / "p1" / "meta.json").read_text())
+    assert meta["garment_description"] == "Navy crew-neck tee with a white chest logo. Soft jersey."
+    out = pack.pack(str(staging), str(tmp_path / "sh"), "t")
+    shard = json.loads(Path(out["catalog"]).read_text())[0]["path"]
+    with tarfile.open(shard) as t:
+        rec = json.loads(next(t.extractfile(m).read() for m in t.getmembers() if m.name.endswith(".json")))
+    assert rec["caption"].startswith("Substitute the current top") and "Navy" not in rec["caption"]
+    assert "The reference garment: Navy crew-neck tee with a white chest logo. Soft jersey." in rec["caption_detailed"]
+    assert caption_garments.process(str(staging), FakeCaptioner())["skipped"] == 1
+
+
+def test_identity_pairs_use_the_real_target_as_clean_input(tmp_path):
+    staging = tmp_path / "st"
+    for i in range(20):
+        _stage_still(staging, f"p{i:02d}")
+        (staging / f"p{i:02d}" / "source.png").write_bytes(png((0, 200, 0)))
+    out = pack.pack(str(staging), str(tmp_path / "sh"), "t", identity_frac=0.5)
+    assert 0 < out["identity_pairs"] < 20 and out["samples"] == 20 + out["identity_pairs"]
+    shards = [e["path"] for e in json.loads(Path(out["catalog"]).read_text())]
+    found = 0
+    for s in shards:
+        with tarfile.open(s) as t:
+            members = {m.name: t.extractfile(m).read() for m in t.getmembers()}
+        for name, data in members.items():
+            if name.endswith("_id.json"):
+                key = name[:-len(".json")]
+                assert json.loads(data)["metadata"]["identity_pair"] is True
+                assert members[f"{key}.1.png"] == members[f"{key}.2.png"]
+                found += 1
+        _, problems = validate.validate_shard(s)
+        assert problems == []
+    assert found == out["identity_pairs"]
+
+
+def test_vivid_zip_inspect_and_sampled_extract_across_groups(tmp_path):
+    import zipfile as zf
+    from data_tools import convert_vivid, vivid_zip
+    zp = tmp_path / "ViViD.zip"
+    with zf.ZipFile(zp, "w") as z:
+        for group in ("upper_body", "dresses"):
+            for i in range(6):
+                z.writestr(f"ViViD/{group}/videos/{i:05d}.mp4", b"\x00" * 2048 + bytes([i]))
+                z.writestr(f"ViViD/{group}/cloth/{i:05d}.jpg", png((i * 30, 5, 5)))
+        z.writestr("ViViD/upper_body/videos/orphan.mp4", b"\x00" * 2048)
+    rep = vivid_zip.inspect(str(zp))
+    assert rep["videos"] == 13 and rep["pairs_by_stem"] == 12
+    out = vivid_zip.extract(str(zp), str(tmp_path / "sub"), sample=5, seed=1)
+    assert out == {"pairs_available": 12, "extracted": 5}
+    res = convert_vivid.convert(str(tmp_path / "sub"), str(tmp_path / "st"), "stem")
+    assert res["staged"] == 5
+    cats = {json.loads((d / "meta.json").read_text())["category"] for d in (tmp_path / "st").iterdir()}
+    assert cats <= {"upper", "dress"}
+
+
+def test_glance_per_config_subset_is_balanced(tmp_path):
+    src = fake_glance(tmp_path, rows=6)
+    n = convert_glance.convert(str(src), str(tmp_path / "st"), ["mens-upperwear", "mens-lowerwear"], per_config=2)
+    metas = [json.loads((d / "meta.json").read_text()) for d in (tmp_path / "st").iterdir()]
+    by = {}
+    for m in metas:
+        by[(m["config"], m["split"])] = by.get((m["config"], m["split"]), 0) + 1
+    assert by == {("mens-upperwear", "train"): 2, ("mens-upperwear", "test"): 1, ("mens-lowerwear", "train"): 2}
+    assert n == 5

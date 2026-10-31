@@ -2,10 +2,15 @@
 # Phase B: build the training Python env on the volume. Run after download_assets.sh,
 # with the azyah-vton-train volume attached at /workspace. Works on the cheap CPU Pod
 # (installs only; saves paid GPU time) and again on the GPU Pod (quick re-check):
-#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/setup_training_pod.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/setup_training_pod.sh | bash
 # The Python env lives on the volume (/workspace/azyah-vton/venv) so later Pods reuse it.
 set -euo pipefail
-SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts}"
+# Pin every download to one commit (review R4). AZ_REF = a commit SHA; if unset, main's
+# current SHA is looked up once and logged, so each run records exactly which code it used.
+AZ_REF="${AZ_REF:-$(curl -fsSL https://api.github.com/repos/Kingo333/fluxrt-serverless/commits/main | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')}"
+export AZ_REF
+SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/scripts}"
+echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$SCRIPTS_URL/common.sh")
 
 echo "== GPU"
@@ -25,6 +30,13 @@ VENV="$AZ_ROOT/venv"
 "$VENV/bin/pip" install -q -r "$AZ_UPSTREAM/deploy/requirements.txt"
 "$VENV/bin/pip" install -q datasets decord torchdata ftfy peft pyarrow regex safetensors tensorboard "huggingface_hub[cli]>=0.34"
 # flash-attn is optional: training falls back to PyTorch SDPA when it is missing.
+
+echo "== Azyah training patches (Stage 1 LoRA)"
+git -C "$AZ_UPSTREAM" checkout -q -- training
+for p in stage1-lora.patch; do
+  curl -fsSL "${SCRIPTS_URL%/scripts}/patches/$p" -o "$AZ_ROOT/$p"
+  git -C "$AZ_UPSTREAM" apply "$AZ_ROOT/$p" && echo "applied $p"
+done
 
 echo "== smoke config"
 curl -fsSL "$SCRIPTS_URL/make_smoke_config.py" -o "$AZ_ROOT/make_smoke_config.py"

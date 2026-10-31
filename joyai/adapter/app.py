@@ -75,7 +75,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse({"ok": upstream.status != "error", **upstream.public_state()})
+        return JSONResponse({"ok": upstream.status != "error", "model_version": s.model_version, **upstream.public_state()})
 
     async def _warmup(wait: bool) -> JSONResponse:
         await upstream.ensure_started()
@@ -165,15 +165,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return
         # Tell the app what to send: JoyAI needs full-size frames at its own frame rate
         # (FluxRT's "ready" has no engine field, so the app keeps its own settings there).
-        await send_client({
+        ready: dict[str, Any] = {
             "type": "ready",
             "session_deadline": int(deadline),
             "engine": "joyai",
-            "input_width": s.width,
-            "input_height": s.height,
-            "input_fps": s.fps,
-            "input_jpeg_quality": s.input_jpeg_quality,
-        })
+            "model_version": s.model_version,
+        }
+        if s.client_hints:
+            ready.update(input_width=s.width, input_height=s.height, input_fps=s.fps,
+                         input_jpeg_quality=s.input_jpeg_quality)
+        await send_client(ready)
 
         bridge = Bridge(s, send_client)
         try:

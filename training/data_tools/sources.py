@@ -47,7 +47,7 @@ SOURCES: dict[str, Source] = {
     ),
     "toy": Source(
         name="toy",
-        licence="JoyAI ToyData (smoke tests only)",
+        licence="No licence stated on the Hugging Face card or tags (checked 2026-10-31): smoke tests only",
         commercial_ok=False,
         note="Data-loading checks only.",
     ),

@@ -23,9 +23,39 @@ CATEGORY_INSTRUCTION = {
 KEEP = "Keep the person's face, body, pose and the background unchanged."
 
 
-def instruction(category: str) -> str:
-    """Same wording the Azyah app sends at inference (buildTryOnPrompt.ts), so training matches live use."""
-    return f"{CATEGORY_INSTRUCTION[category]} {KEEP}"
+FIDELITY = "Match its exact color, pattern, print, logo, fabric and construction details."
+
+
+def clean_product_text(raw: str | None, max_chars: int = 320) -> str:
+    """Python twin of cleanProductText() in the app's buildTryOnPrompt.ts."""
+    import re
+    if not raw:
+        return ""
+    s = re.sub(r"<[^>]*>", " ", raw)
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_chars:
+        cut = s[:max_chars]
+        last_space = cut.rfind(" ")
+        s = cut[:last_space] if last_space > max_chars * 0.6 else cut
+        s = re.sub(r"[\s,;:.-]+$", "", s)
+    return s
+
+
+def instruction(category: str, name: str | None = None, description: str | None = None) -> str:
+    """Exact twin of buildTryOnInstruction() in the app (azyah-shopping
+    src/components/ai-studio/live-cam/buildTryOnPrompt.ts), so training captions
+    match what the live app sends (review R2). Without name/description it is the
+    short form; with them, the detailed form."""
+    import re
+    parts = [CATEGORY_INSTRUCTION[category]]
+    n, d = clean_product_text(name, 120), clean_product_text(description)
+    if n or d:
+        label = f"The reference garment is the {n}" if n else "The reference garment"
+        parts.append(f"{label}: {re.sub(r'[.!]?$', '.', d, count=1)}" if d else f"{label}.")
+        parts.append(FIDELITY)
+    parts.append(KEEP)
+    return " ".join(parts)
 
 
 def stage_pair(root: Path, key: str, files: dict[str, bytes], meta: dict) -> Path:
