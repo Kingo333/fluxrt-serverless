@@ -49,3 +49,27 @@ def test_compare_same_and_different_layouts(tmp_path, capsys):
     assert mod.compare(a, b) == 0  # same names/shapes; dtype differences are reported but allowed
     assert "dtype differs 1" in capsys.readouterr().out
     assert mod.compare(a, c) == 2
+
+
+def test_fashion_config_applies_every_replacement(tmp_path):
+    mod = load("make_fashion_config")
+    cfg = tmp_path / "configs"
+    cfg.mkdir()
+    upstream = "\n".join(old for old, _ in mod.REPLACEMENTS)
+    # the generator inserts its helper before the config class
+    upstream = upstream.replace("class Stage1ARConfig(ExpConfig):", "\n@dataclass\nclass Stage1ARConfig(ExpConfig):")
+    (cfg / "stage1_ar.py").write_text(upstream + "\n")
+    out = mod.main(str(tmp_path)).read_text()
+    for _, new in mod.REPLACEMENTS:
+        assert new in out
+    assert "def _manifest(group):" in out and out.index("def _manifest") < out.index("class AzyahFashionStage1Config")
+
+
+def test_estimator_matches_the_audit():
+    est = load("estimate")
+    rows = {(r["gpu"], r["count"]): r for r in est.options("stage1", 20, 45)}
+    assert rows[("rtxpro6000", 1)]["fits"] == "no"   # one 96 GB card cannot hold Stage 1
+    assert rows[("b200", 2)]["fits"] == "yes"
+    assert rows[("h100-80", 4)]["fits"] == "maybe"
+    s2 = {(r["gpu"], r["count"]): r for r in est.options("stage2", 10, 60)}
+    assert s2[("b200", 1)]["fits"] == "yes"

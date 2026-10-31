@@ -15,6 +15,7 @@ This folder lives in a public repo on purpose, so a RunPod Pod can download its 
 | `RECORDING_GUIDE.md` | How to film our own consented clips (devices, framing, light, motion script, test set, import) |
 | `DATA_SOURCES.md`, `CONSENT_TEMPLATE.md` | Required notices; participant consent template |
 | `data_tools/` | Shard writer, licence-aware manifests, validator, Glance and ViViD converters |
+| `STAGE1_PLAN.md` | Fashion Stage 1: data mix, settings, forgetting risk, experiment ladder with costs |
 | `scripts/` | `download_assets.sh`, `setup_training_pod.sh`, `run_smoke.sh`, `make_smoke_config.py`, `dump_checkpoint_keys.py` |
 
 Production (endpoint `azyah-runpod-fluxrt-bootstrap`, volume `azyah-joyai`) is never used for training.
