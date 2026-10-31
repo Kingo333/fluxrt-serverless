@@ -23,7 +23,7 @@ echo "== 1/3 DiT (0811) + xVAE"
 hf download jdopensource/JoyAI-Video-Edit \
   --repo-type model \
   --local-dir "$CKPT/JoyAI-Video-Edit" \
-  --include "dit/joyai_video_edit_dit_0811.pth" "vae/*"
+  dit/joyai_video_edit_dit_0811.pth vae/config.json vae/diffusion_pytorch_model.safetensors
 
 echo "== 2/3 MiMo-VL-7B-RL-2508 (text/vision encoder)"
 hf download XiaomiMiMo/MiMo-VL-7B-RL-2508 \
