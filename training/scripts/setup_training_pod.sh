@@ -2,10 +2,15 @@
 # Phase B: build the training Python env on the volume. Run after download_assets.sh,
 # with the azyah-vton-train volume attached at /workspace. Works on the cheap CPU Pod
 # (installs only; saves paid GPU time) and again on the GPU Pod (quick re-check):
-#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/setup_training_pod.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/setup_training_pod.sh | bash
 # The Python env lives on the volume (/workspace/azyah-vton/venv) so later Pods reuse it.
 set -euo pipefail
-SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts}"
+# Pin every download to one commit (review R4). AZ_REF = a commit SHA; if unset, main's
+# current SHA is looked up once and logged, so each run records exactly which code it used.
+AZ_REF="${AZ_REF:-$(curl -fsSL https://api.github.com/repos/Kingo333/fluxrt-serverless/commits/main | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')}"
+export AZ_REF
+SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/scripts}"
+echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$SCRIPTS_URL/common.sh")
 
 echo "== GPU"

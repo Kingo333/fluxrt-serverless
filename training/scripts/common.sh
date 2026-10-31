@@ -23,3 +23,7 @@ export JOYAI_TEXT_ENCODER="$AZ_CKPT/MiMo-VL-7B-RL-2508"
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HF_HUB_DISABLE_XET=1
 mkdir -p "$AZ_CKPT" "$AZ_DATA" "$AZ_OUT" "$AZ_REPORTS"
+# Record which code a run used (review R4): our scripts commit + upstream JoyAI commit.
+if [ -n "${AZ_REF:-}" ]; then
+  echo "{\"azyah_scripts_ref\": \"$AZ_REF\", \"joyai_commit\": \"$JOYAI_COMMIT\", \"utc\": \"$(date -u +%FT%TZ)\"}" >> "$AZ_REPORTS/code_refs.jsonl"
+fi

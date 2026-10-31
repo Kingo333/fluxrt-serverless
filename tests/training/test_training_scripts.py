@@ -95,3 +95,26 @@ def test_lora_merge_math_and_layout_check(tmp_path):
     assert any("shape" in p for p in problems) and any("not in serving" in p for p in problems)
     with pytest.raises(SystemExit, match="not in the Stage 1 backbone"):
         mod.merge(base, {"x.lora_A.weight": a, "x.lora_B.weight": b}, 2, 4)
+
+
+def test_prune_keeps_latest_and_marked_saves(tmp_path):
+    import os
+    import time
+    mod = load("prune_checkpoints")
+    run = tmp_path / "run" / "checkpoints"
+    old = time.time() - 600
+    for step in (250, 500, 750, 1000, 1250):
+        d = run / f"global_step{step}"
+        d.mkdir(parents=True)
+        f = d / f"step_{step}.pth"
+        f.write_text("x")
+        os.utime(f, (old, old))
+    (run / "global_step500" / "KEEP").write_text("")
+    # a save still being written: no settle time yet
+    d = run / "global_step1500"
+    d.mkdir()
+    (d / "step_1500.pth").write_text("x")
+    removed = mod.prune(str(tmp_path / "run"), keep_last=2)
+    left = sorted(p.name for p in run.iterdir())
+    assert left == ["global_step1000", "global_step1250", "global_step1500", "global_step500"]
+    assert len(removed) == 2

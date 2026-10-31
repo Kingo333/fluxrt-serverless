@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Phase B smoke test: 20 Stage 1 steps on ToyData, then resume to 30 steps.
 # Success = steps run (forward + backward), a checkpoint is saved, and resume continues from it.
-#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/run_smoke.sh | GPUS=4 HSDP=4 bash
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/run_smoke.sh | GPUS=4 HSDP=4 bash
 # GPUS = processes (one per GPU). HSDP = how many GPUs share the model (shard); use GPUS for one node.
 set -euo pipefail
-SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts}"
+# Pin every download to one commit (review R4). AZ_REF = a commit SHA; if unset, main's
+# current SHA is looked up once and logged, so each run records exactly which code it used.
+AZ_REF="${AZ_REF:-$(curl -fsSL https://api.github.com/repos/Kingo333/fluxrt-serverless/commits/main | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')}"
+export AZ_REF
+SCRIPTS_URL="${SCRIPTS_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/scripts}"
+echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$SCRIPTS_URL/common.sh")
 GPUS="${GPUS:-1}"
 export AZ_HSDP_SHARD="${HSDP:-$GPUS}"

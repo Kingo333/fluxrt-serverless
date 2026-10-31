@@ -11,7 +11,7 @@ knobs come from env vars so one generated file serves every run:
   AZ_MANIFEST_DIR (required)   AZ_I2I_PROB (1.0)   AZ_V2V_PROB (1.0)
   AZ_EXP (fashion)  AZ_MAX_STEPS (2000)  AZ_CKPT_INTERVAL (250)  AZ_LR (2e-5)
   AZ_WARMUP (100)  AZ_GRAD_ACCUM (1)  AZ_MAX_FRAMES (49)  AZ_AUTO_RESUME (1)
-  AZ_HSDP_SHARD (1)  AZ_SP_SIZE (1)
+  AZ_HSDP_SHARD (1)  AZ_SP_SIZE (1)  AZ_DETAILED_CAPTION_PROB (0.7)
 
 Every replacement must match once, so an upstream change fails loudly.
 """
@@ -48,6 +48,14 @@ REPLACEMENTS = [
     ("    lr_warmup_steps: int = 0", f'    lr_warmup_steps: int = {E}int(os.getenv("AZ_WARMUP", "100")))'),
     ("    sp_size: int = 1", f'    sp_size: int = {E}int(os.getenv("AZ_SP_SIZE", "1")))'),
     ("    hsdp_shard_dim: int = 1", f'    hsdp_shard_dim: int = {E}int(os.getenv("AZ_HSDP_SHARD", "1")))'),
+('    train_multiple_images_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption"]\n    )',
+     '    train_multiple_images_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption", "caption_detailed"]\n    )'),
+    ('    train_multiple_images_caption_sampling_prob: list[float] = field(\n        default_factory=lambda: [1.0]\n    )',
+     '    train_multiple_images_caption_sampling_prob: list[float] = field(\n        default_factory=lambda: _caption_probs()\n    )'),
+    ('    train_multiple_videos_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption"]\n    )',
+     '    train_multiple_videos_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption", "caption_detailed"]\n    )'),
+    ('    train_multiple_videos_caption_sampling_prob: list[float] = field(\n        default_factory=lambda: [1.0]\n    )',
+     '    train_multiple_videos_caption_sampling_prob: list[float] = field(\n        default_factory=lambda: _caption_probs()\n    )'),
 ]
 
 HELPER = '''
@@ -59,6 +67,13 @@ def _manifest(group):
         raise RuntimeError("set AZ_MANIFEST_DIR to the folder written by data_tools.manifests")
     p = os.path.join(root, f"{group}.json")
     return p if os.path.exists(p) else None
+
+
+def _caption_probs():
+    """Short live caption vs detailed live caption (review R2). Samples without a
+    detailed caption always use the short one (the loader skips missing keys)."""
+    d = float(os.getenv("AZ_DETAILED_CAPTION_PROB", "0.7"))
+    return [1.0 - d, d]
 '''
 
 

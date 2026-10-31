@@ -13,7 +13,13 @@ Everything below is **estimated** until the Phase B smoke test measures real ste
 
 **Task weights:** `AZ_I2I_PROB` and `AZ_V2V_PROB` (default 1:1). If there are no own clips yet, the clip task switches off automatically: its manifest is missing, so its probability becomes 0.
 
-**Captions:** the same instruction the app sends live ("Substitute the current top with the garment in the reference image. Keep the person's face…"), so training matches real use.
+**Captions (review R2):** both forms the app sends live, built by a Python twin of the app's `buildTryOnInstruction` (tested on identical strings in both repos):
+- `caption`: the short form ("Substitute the current top with the garment in the reference image. Keep the person's face…")
+- `caption_detailed`: the long form with the garment name and description
+
+The config samples detailed 70% / short 30% (`AZ_DETAILED_CAPTION_PROB`); samples without a description always use the short form. Descriptions come from `garments.csv` for our own clips and from `data_tools/caption_garments.py` (paid Gemini step P7b) for Glance and ViViD.
+
+**Clean-input pairs (review R5):** `pack.py` adds about 10% "identity" pairs, where the source is the real target, so the model also sees clean camera-like input. The real-camera held-out test (own clips) checks how pseudo-source training transfers to live input.
 
 ## Settings (`scripts/make_fashion_config.py`, all set by env vars)
 
@@ -43,7 +49,7 @@ Costs come from `scripts/estimate.py` at 45 s per step (a guess): 2× B200 at ab
 | S2 | exp1, continue to 2000 steps (+ own clips if ready) | about 19 more | **about $225** | Clear win on held-out clips and in the blinded A/B |
 | S3 | Stage 2 distillation from the best S1/S2 checkpoint (LoRA) | estimated separately once S2 passes (`estimate.py stage2`) | — | Real-time 2-step model at least matches the baseline speed |
 
-**Storage needed before S1:** about 400 GB volume (see `DATA_PLAN.md` G4), because each Stage 1 checkpoint with optimizer state is about 100–160 GB.
+**Storage needed before S1:** a **500 GB** volume (see `DATA_PLAN.md` G4). Each Stage 1 save with optimizer state is about 100–160 GB; `run_fashion.sh` keeps the newest 2 plus any save marked `KEEP` (`AZ_KEEP_LAST`), and deletes the rest automatically.
 
 ## Commands (after merge; run only when approved)
 

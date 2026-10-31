@@ -16,6 +16,9 @@ This folder lives in a public repo on purpose, so a RunPod Pod can download its 
 | `DATA_SOURCES.md`, `CONSENT_TEMPLATE.md` | Required notices; participant consent template |
 | `data_tools/` | Shard writer, licence-aware manifests, validator, Glance and ViViD converters |
 | `STAGE1_PLAN.md` | Fashion Stage 1: data mix, settings, forgetting risk, experiment ladder with costs |
+| `ARCHITECTURE.md` | Diagram of the live try-on path and the separate training path |
+| `GARMENT_SWITCH.md` | What a garment swap does today and how we measure gaps and contamination |
+| `TRANSPORT_WEBRTC.md` | WebRTC/LiveKit research note (deferred) and the cheaper H.264-downlink first step |
 | `STAGING.md` | Merge a trained LoRA into a servable model, register a version, staging endpoint, promote and roll back |
 | `PAID_PLAN.md` | Every paid step in order with expected cost, cap, time limit and prerequisites |
 | `scripts/` | `download_assets.sh`, `setup_training_pod.sh`, `run_smoke.sh`, `make_smoke_config.py`, `dump_checkpoint_keys.py` |

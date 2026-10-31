@@ -250,3 +250,12 @@ def test_profile_timings_opt_in():
             assert wait_for(lambda: len(fake.starts) >= 1)
             assert fake.starts[-1]["profile_timings"] is True
 
+
+
+def test_client_hints_can_be_switched_off_for_baseline_runs():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port, client_hints=False))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            m = ws.receive_json()
+            while m["type"] != "ready":
+                m = ws.receive_json()
+            assert m["engine"] == "joyai" and "input_width" not in m and "input_fps" not in m

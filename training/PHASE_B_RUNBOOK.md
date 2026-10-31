@@ -2,7 +2,7 @@
 
 **Goal:** prove the upstream Stage 1 training runs on our hardware. That means forward and backward passes run, a checkpoint saves, resume works, and we know the peak GPU memory. Before that, two cheap checks: download all assets, and compare the checkpoint layouts.
 
-Each step says **who** runs it and **what it costs**. Steps marked 💲 need the owner's written "yes" first. Scripts are in `training/scripts/` and are fetched with `curl` from this public repo after merge, so **run nothing until the PR is merged.**
+Each step says **who** runs it and **what it costs**. **`<SHA>`** in every command is the merged commit Claude Code gives you after the merge (review R4: never run from a moving `main`). The scripts log it to `reports/code_refs.jsonl`. Steps marked 💲 need the owner's written "yes" first. Scripts are in `training/scripts/` and are fetched with `curl` from this public repo after merge, so **run nothing until the PR is merged.**
 
 Prices are the roadmap's and the extension's latest readings. **The extension must re-check live prices in B2.**
 
@@ -18,8 +18,8 @@ Prices are the roadmap's and the extension's latest readings. **The extension mu
 ## B5a: assets and environment (CPU Pod, volume at `/workspace`)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/download_assets.sh | bash
-curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/setup_training_pod.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/download_assets.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/setup_training_pod.sh | bash
 ```
 
 **Expect:**
@@ -33,7 +33,7 @@ Paste the last 30 lines of each command. Both are safe to re-run.
 1. **Pod 1** (`azyah-vton-train` volume):
    ```bash
    python3 -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-   curl -fsSLO https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts/dump_checkpoint_keys.py
+   curl -fsSLO https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts/dump_checkpoint_keys.py
    python3 dump_checkpoint_keys.py /workspace/azyah-vton/checkpoints/dit/pretrain_editing_bid_version.pth /workspace/azyah-vton/reports/keys_bid.json
    ```
 2. **Pod 2**: a CPU Pod in EU-RO-1 with `azyah-joyai` attached **read-only use, no writes** except `/tmp`. Same install and download lines as Pod 1, then:
@@ -58,7 +58,7 @@ Stage 1 trains all 16B parameters, estimated at 150–230 GB of GPU memory in to
 | B (may run out of memory: 66–108 GB per GPU against 80) | 4× H100 80 GB | `curl -fsSL …/run_smoke.sh \| GPUS=4 HSDP=4 bash` |
 | Memory probe only (risky) | 1× B200 | `GPUS=1 HSDP=1`. Likely out of memory; only if A and B are unavailable, and only to learn the limit |
 
-(`…` = `https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts`)
+(`…` = `https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/scripts`)
 
 **Steps:**
 1. Re-run `setup_training_pod.sh` first (about 1 minute; the environment is already on the volume).

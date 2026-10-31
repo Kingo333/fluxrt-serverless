@@ -73,9 +73,9 @@ Each clip is a person wearing **the real garment**, plus a flat photo of that ga
 |---|---|---|
 | Phase B smoke test only | 200 GB | about $14 |
 | Data prep (Glance + ViViD + own clips) | 400 GB | about $28 |
-| Stage 1 real runs (2 checkpoints kept) | 600–700 GB | about $42–49 |
+| Stage 1 real runs, **keep-last-2 + 1 marked best** (`scripts/prune_checkpoints.py`, runs automatically in `run_fashion.sh`) | **500 GB** (3 × up to 160 GB + data) | about $35 |
 
-**Recommendation:** start at **200 GB** and grow when each phase starts.
+**Recommendation:** start at **200 GB** and grow when each phase starts (200 → 400 for data prep → 500 before Stage 1). Without pruning, upstream keeps every save: about 8 saves at 100–160 GB each over 2000 steps ≈ 0.8–1.3 TB (review R1).
 - Hugging Face private storage: back up final model weights and small reports only. Stage 1 optimizer checkpoints stay on the volume.
 - Free-tier private storage on Hugging Face is limited, so check `kingo333`'s quota before large uploads.
 

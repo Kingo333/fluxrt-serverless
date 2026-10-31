@@ -42,7 +42,7 @@ Written from the code in `Kingo333/fluxrt-serverless` (main `00b7fb3`), `Kingo33
 | VAE | same repo, `vae/` | 1.5 GB | Apache-2.0 | Both |
 | Text encoder | `XiaomiMiMo/MiMo-VL-7B-RL-2508` | about 16 GB | MIT | Both |
 | Face detector | OpenCV Zoo YuNet | 0.2 MB | MIT | Serving gate |
-| Test data | `EasonXiao-888/JoyAI-Video-Edit_ToyData` (`t2i`, `i2i`, `t2v`, `v2v`, `iv2v`, `r2i` `.tar` files + 4 `.json` manifests) | about 0.1 GB | check the card | Smoke test only |
+| Test data | `EasonXiao-888/JoyAI-Video-Edit_ToyData` (`t2i`, `i2i`, `t2v`, `v2v`, `iv2v`, `r2i` `.tar` files + 4 `.json` manifests) | about 0.1 GB | **none stated** (checked 2026-10-31) | Smoke test only |
 
 Weights plus ToyData come to about 50 GB, so **the training volume should be at least 200 GB** to leave room for checkpoints. Each full DiT checkpoint is about 32.5 GB in bf16; a Stage 1 save with optimizer state is several times that. Nothing here is gated. YOLOv8n (AGPL) stays off.
 
