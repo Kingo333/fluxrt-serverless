@@ -97,3 +97,10 @@ def test_ws_session_cap_closes_stream(monkeypatch):
     with client.websocket_connect(f"/ws?token={token()}") as ws:
         assert ws.receive_json()["type"] == "ready"
         assert ws.receive_json() == {"type": "status", "status": "session_limit"}
+        from starlette.websockets import WebSocketDisconnect
+        # The server then closes the socket; wait for that before leaving the block, or
+        # Starlette's TestClient may cancel the handler mid-shutdown (CancelledError).
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+        # Give the handler a moment to finish its cleanup (no server-side signal to wait on).
+        time.sleep(0.2)

@@ -789,8 +789,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         except Exception:
             pass
 
+    tasks = [asyncio.ensure_future(c) for c in (receiver(), processor_loop(), sender_loop(), session_cap())]
     try:
-        await asyncio.gather(receiver(), processor_loop(), sender_loop(), session_cap())
+        await asyncio.gather(*tasks)
     except WebSocketDisconnect:
         log.info("websocket disconnected")
     except Exception as e:
@@ -799,6 +800,14 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+    finally:
+        # gather() does not stop the other loops when one fails (e.g. the receiver
+        # after the session cap closes the socket); stop and wait for them so the
+        # handler never returns with tasks still running.
+        stop_event.set()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
