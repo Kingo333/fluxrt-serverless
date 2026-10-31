@@ -215,3 +215,37 @@ def test_instruction_preferred_and_garment_swap_is_one_restart():
             second = fake.starts[1]
             assert second["ref_image"] == base64.b64encode(b"DRESS2").decode()
             assert second["prompt"].startswith("Substitute the current outfit")
+
+
+def test_output_frames_carry_client_seq_and_server_time():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            assert wait_for(lambda: len(fake.starts) >= 1)
+            time.sleep(0.3)
+            ws.send_json({"type": "frame", "frame_b64": base64.b64encode(b"J").decode(), "seq": 7, "t_client_ms": 1234.5})
+            m = ws.receive_json()
+            while m["type"] != "frame":
+                m = ws.receive_json()
+            assert m["seq"] == 7 and m["t_client_ms"] == 1234.5
+            assert isinstance(m["server_ms"], float) and m["server_ms"] >= 0
+            assert "profile" not in m
+            assert "profile_timings" not in fake.starts[-1]
+
+
+def test_frames_without_seq_still_work():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            m, raw = send_frame_until_echo(ws, fake)
+            assert raw == b"OUT:JPEG1"
+            assert "seq" not in m and "server_ms" in m
+
+
+def test_profile_timings_opt_in():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port, profile_timings=True))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            assert wait_for(lambda: len(fake.starts) >= 1)
+            assert fake.starts[-1]["profile_timings"] is True
+

@@ -46,6 +46,7 @@ class FakeJoyAI:
             conn_no = self.connections
             await websocket.send_json({"type": "session_granted"})
             frames = 0
+            last_seq = None
             try:
                 while True:
                     msg = await websocket.receive()
@@ -53,6 +54,8 @@ class FakeJoyAI:
                         return
                     if msg.get("text"):
                         data = json.loads(msg["text"])
+                        if data["type"] == "frame_meta":
+                            last_seq = data.get("seq")
                         if data["type"] == "start":
                             self.starts.append(data)
                             await websocket.send_json({"type": "started", "width": data["width"], "height": data["height"]})
@@ -60,7 +63,8 @@ class FakeJoyAI:
                                 await websocket.send_json({"type": "waiting_face", "reason": "show_full_face"})
                     elif msg.get("bytes") is not None:
                         frames += 1
-                        await websocket.send_json({"type": "output_frame", "index": 0, "count": 1})
+                        await websocket.send_json({"type": "output_frame", "index": 0, "count": 1,
+                                                   "source_seq": last_seq})
                         await websocket.send_bytes(b"OUT:" + msg["bytes"])
                         if conn_no == 1 and self.timeout_after_frames and frames >= self.timeout_after_frames:
                             await websocket.send_json({"type": "session_timeout", "message": "idle"})
