@@ -56,7 +56,7 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-garment.patch"
 
 echo "== 2. base model (once, ~16 GB on the volume)"
 if [ ! -f "$KLEIN/.downloaded" ]; then
-  "$VENV/bin/huggingface-cli" download "$KLEIN_REPO" --local-dir "$KLEIN"
+  "$VENV/bin/hf" download "$KLEIN_REPO" --local-dir "$KLEIN"
   touch "$KLEIN/.downloaded"
 fi
 

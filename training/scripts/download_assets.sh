@@ -24,8 +24,10 @@ fi
 git -C "$AZ_UPSTREAM" fetch -q origin && git -C "$AZ_UPSTREAM" checkout -q "$JOYAI_COMMIT"
 
 echo "== 2/5 bidirectional DiT (32.5 GB) + VAE (1.5 GB)"
+# Explicit filenames: this hf CLI takes ONE value per --include, so a second value
+# became a literal filename ("vae/*") and the download failed (P5, 2026-10-31).
 hf download jdopensource/JoyAI-Video-Edit --repo-type model --local-dir "$AZ_CKPT" \
-  --include "dit/pretrain_editing_bid_version.pth" "vae/*"
+  dit/pretrain_editing_bid_version.pth vae/config.json vae/diffusion_pytorch_model.safetensors
 
 echo "== 3/5 text encoder MiMo-VL-7B-RL-2508 (~16 GB)"
 hf download XiaomiMiMo/MiMo-VL-7B-RL-2508 --repo-type model --local-dir "$AZ_CKPT/MiMo-VL-7B-RL-2508"
