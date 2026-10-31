@@ -129,3 +129,58 @@ def test_vivid_inspect_and_stem_pairing(tmp_path):
     assert res == {"pairs_found": 5, "staged": 5}
     metas = [json.loads((d / "meta.json").read_text()) for d in (tmp_path / "staging").iterdir()]
     assert all(m["source"] == "vivid" and m["task"] == "iv2v" for m in metas)
+
+
+class FakeEditor:
+    """Recolours the garment area (masked lower half) like a real edit would."""
+    name = "fake"
+
+    def __init__(self, recolour_everything=False):
+        self.calls = []
+        self.everything = recolour_everything
+
+    def edit(self, frames, prompt, size):
+        from PIL import Image
+        self.calls.append((len(frames), prompt, size))
+        out = []
+        for f in frames:
+            im = f.convert("RGB").resize(size)
+            w, h = im.size
+            box = (0, 0, w, h) if self.everything else (0, h // 2, w, h)
+            im.paste(Image.new("RGB", (box[2] - box[0], box[3] - box[1]), (10, 200, 30)), box[:2])
+            out.append(im)
+        return out
+
+
+def _stage_still(staging, key):
+    from PIL import Image
+    from data_tools.staging import stage_pair
+    mask = Image.new("L", (300, 400), 0)
+    mask.paste(255, (0, 200, 300, 400))
+    buf = io.BytesIO()
+    mask.save(buf, format="PNG")
+    stage_pair(staging, key, {"ref.png": png((1, 2, 3)), "target.png": png((120, 120, 120)), "mask.png": buf.getvalue()},
+               {"source": "glance", "split": "train", "category": "upper", "task": "r2i"})
+
+
+def test_pseudo_source_keeps_good_edits_and_rejects_bad(tmp_path):
+    from data_tools import pseudo_source
+    staging = tmp_path / "staging"
+    _stage_still(staging, "good")
+    res = pseudo_source.process(str(staging), FakeEditor())
+    assert res["done"] == 1 and (staging / "good" / "source.png").exists()
+    meta = json.loads((staging / "good" / "meta.json").read_text())
+    assert meta["pseudo_source"]["ok"] and meta["pseudo_source"]["prompt"].startswith("Substitute the current top with a plain")
+    _stage_still(staging, "bad")
+    res = pseudo_source.process(str(staging), FakeEditor(recolour_everything=True))
+    assert res["rejected"] == 1 and res["skipped_has_source"] == 1
+    assert not (staging / "bad" / "source.png").exists()
+    assert "background" in json.loads((staging / "bad" / "meta.json").read_text())["pseudo_source"]["reason"]
+
+
+def test_edit_prompt_is_reproducible_and_category_aware():
+    from data_tools import pseudo_source
+    assert pseudo_source.edit_prompt("k1", "upper") == pseudo_source.edit_prompt("k1", "upper")
+    assert "pants or skirt" in pseudo_source.edit_prompt("k2", "lower")
+    assert pseudo_source._session_size(768, 1024) == (624, 840)
+    assert pseudo_source._session_size(832, 624) == (840, 624)
