@@ -54,8 +54,8 @@ Stage 1 trains all 16B parameters, estimated at 150–230 GB of GPU memory in to
 
 | Option | GPUs | Command |
 |---|---|---|
-| A (preferred if available) | 4× H100 80 GB | `curl -fsSL …/run_smoke.sh \| GPUS=4 HSDP=4 bash` |
-| B | 2× B200 180 GB | `curl -fsSL …/run_smoke.sh \| GPUS=2 HSDP=2 bash` |
+| A (preferred: fits per `scripts/estimate.py`, 99–165 GB per GPU) | 2× B200 180 GB | `curl -fsSL …/run_smoke.sh \| GPUS=2 HSDP=2 bash` |
+| B (may run out of memory: 66–108 GB per GPU against 80) | 4× H100 80 GB | `curl -fsSL …/run_smoke.sh \| GPUS=4 HSDP=4 bash` |
 | Memory probe only (risky) | 1× B200 | `GPUS=1 HSDP=1`. Likely out of memory; only if A and B are unavailable, and only to learn the limit |
 
 (`…` = `https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/main/training/scripts`)
@@ -70,8 +70,8 @@ Stage 1 trains all 16B parameters, estimated at 150–230 GB of GPU memory in to
 
 | Option | Hourly rate | Expected | Maximum (hard stop at 2 h) |
 |---|---|---|---|
-| A: 4× H100 | about 4 × $2.89 ≈ $11.6/hr (PCIe; SXM costs more) | **about $9–18** | **$25** |
-| B: 2× B200 | about 2 × $5.89 ≈ $11.8/hr | **about $9–18** | **$25** |
+| A: 2× B200 | about 2 × $5.89 ≈ $11.8/hr | **about $9–18** | **$25** |
+| B: 4× H100 | about 4 × $2.89 ≈ $11.6/hr (PCIe; SXM costs more) | **about $9–18** | **$25** |
 
 **Stop conditions:** 2 hours, $25, an out-of-memory error, or the same error twice. Stop and delete the Pod right away when done; keep the volume.
 
