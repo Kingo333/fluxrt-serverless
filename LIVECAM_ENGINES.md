@@ -6,10 +6,40 @@ The `LIVECAM_ENGINE` environment variable picks which one a worker runs.
 | | FluxRT (Standard, default) | JoyAI-Video-Edit (Premium HD) |
 |---|---|---|
 | `LIVECAM_ENGINE` | `fluxrt` (or unset) | `joyai` |
-| GPU (endpoint "GPU configuration") | today's card: **48 GB** | **32 GB PRO** (RTX 5090) only |
+| GPU (endpoint "GPU configuration") | **32 GB PRO** or **96 GB PRO** (also older 48 GB cards) | **32 GB PRO** (RTX 5090) only |
 | Network volume | none needed | **azyah-joyai** (weights at `/runpod-volume/joyai`) |
-| Resolution | `FLUXRT_WIDTH/HEIGHT` (288×512 today) | 480×840 portrait, 24 fps |
+| Resolution | input `FLUXRT_WIDTH/HEIGHT` (288×512 today), output 2× (576×1024) with the Flow Upscaler | 480×840 portrait, 24 fps |
 | Code | `server.py` (unchanged features: playback scheduler, latest-frame-wins) | `joyai/` adapter + unmodified JoyAI on 127.0.0.1:8080 |
+
+## FluxRT engine version (pinned)
+
+FluxRT is pinned to `32206e8` (2026-06-13, "flow upscaler and taef2") in both Dockerfiles.
+Change `FLUXRT_REF` on purpose, never back to `main`.
+
+Two upgrades are **on by default**. Their weights download at warm-up, next to FLUX.2-klein-4B, at pinned revisions:
+
+| Extension | Weights | Size | Licence | What it does |
+|---|---|---|---|---|
+| TAEF2 (`ENABLE_TINY_VAE`) | `madebyollin/taef2` @ `bd244eb` → `taef2/` | 11 MB | MIT | faster tiny decoder |
+| Flow Upscaler (`ENABLE_FLOW_UPSCALER`) | `TensorForger/FlowUpscaler` @ `ae33429` → `FlowUpscaler/` | 237 MB | Unlicense | 2× latent upscale of every frame (59M params, about 8 ms) |
+
+FluxRT itself is Unlicense (public domain).
+
+Other FluxRT settings in this image:
+- **Garment reference: 384×512** (`FLUXRT_REF_WIDTH/HEIGHT`, multiples of 16). FluxRT's default is 256×256; before this change we used the camera size.
+  The worker now pads the garment photo with white to 3:4 instead of letting FluxRT stretch it.
+  It also passes the photo as RGB; before, it passed BGR, so red and blue were swapped in the garment.
+- **Frames:** input stays at the model size, output is 2× that, JPEG quality `FLUXRT_OUTPUT_JPEG_QUALITY` (82).
+  The `ready` message now tells the app `engine: "fluxrt"`, the input and output size, `input_fps` 10 and `input_jpeg_quality` 0.8
+  (`FLUXRT_CLIENT_HINTS=false` turns this off). The upscaler magnifies JPEG blocks, so the app sends better frames.
+  FluxRT renders about 5–12 frames a second on a 5090 (more are dropped).
+- **PyTorch:** the dual image now installs torch 2.9.1 cu128 for FluxRT. The old cu124 build cannot run on the Blackwell cards (5090, PRO 6000).
+
+**Rollback.** Two options:
+- Fast, no rebuild: set `ENABLE_FLOW_UPSCALER=false` and `ENABLE_TINY_VAE=false` on the endpoint.
+  Add `FLUXRT_REF_WIDTH=288` and `FLUXRT_REF_HEIGHT=512` for the old reference size.
+- Full: go back to the image the endpoint runs today (tag ending `62a8da4f`).
+  Note it in the extension's log before P2. That image installs FluxRT `main` as it was on its build date, with the cu124 torch build.
 
 Both engines speak the same WebSocket messages and use the same `SESSION_SIGNING_SECRET`,
 so the app and the Cloudflare Worker don't change when you flip.

@@ -4,16 +4,18 @@
 #   LIVECAM_ENGINE=joyai             JoyAI adapter (:8765) + unmodified JoyAI on 127.0.0.1:8080
 #
 # Each engine has its own Python so their dependencies never clash:
-#   FluxRT: /usr/bin/python3.12 (torch cu124), as in the live image
+#   FluxRT: /usr/bin/python3.12 (torch 2.9.1 cu128: cu124 wheels have no Blackwell/sm_120 kernels,
+#           so FluxRT could not run on the 32 GB PRO / 96 GB PRO cards)
 #   JoyAI:  /opt/joyai-venv (python3.10, torch 2.9.1 cu128, SageAttention, joyomni_ops for sm_120a)
 #
 # GPU per engine (set on the RunPod endpoint):
-#   fluxrt -> the current 48 GB card (or any card FluxRT runs on today)
+#   fluxrt -> 32 GB PRO (RTX 5090) or 96 GB PRO; also older 48 GB cards
 #   joyai  -> RTX 5090 32 GB ("32 GB PRO") + network volume with weights at /runpod-volume/joyai
 # No model weights are baked in.
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
-ARG FLUXRT_REF=main
+# Pinned: 2026-06-13 "flow upscaler and taef2". Bump on purpose, never track main.
+ARG FLUXRT_REF=32206e8255b085b9075e05d389781bcbc728d513
 ARG JOYAI_COMMIT=d875895dd44950caf06f1a2cc4f4601c9eadc5cd
 ARG SAGE_COMMIT=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 ARG CUTLASS_COMMIT=dcf215af
@@ -59,7 +61,7 @@ RUN git clone https://github.com/tensorforger/FluxRT.git /workspace/FluxRT \
     && cd /workspace/FluxRT && git checkout ${FLUXRT_REF}
 WORKDIR /workspace/FluxRT
 RUN /usr/bin/python3.12 -m pip install --upgrade pip setuptools wheel \
-    && /usr/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
+    && /usr/bin/python3.12 -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128 \
     && /usr/bin/python3.12 -m pip install -r requirements.txt \
     && /usr/bin/python3.12 -m pip install -e . \
     && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy "huggingface_hub[hf_transfer]"

@@ -34,12 +34,48 @@ MODEL_ROOT = Path(os.getenv("MODEL_ROOT", str(FLUXRT_ROOT)))
 FLUX_REPO_ID = os.getenv("FLUX_REPO_ID", "black-forest-labs/FLUX.2-klein-4B")
 RIFE_REPO_ID = os.getenv("RIFE_REPO_ID", "TensorForger/RIFE-safetensors")
 INT8_REPO_ID = os.getenv("INT8_REPO_ID", "aydin99/FLUX.2-klein-4B-int8")
+# FluxRT 32206e8 extensions (on by default). Revisions are pinned so the
+# weights can't change under the pinned FluxRT code.
+TAEF2_REPO_ID = os.getenv("TAEF2_REPO_ID", "madebyollin/taef2")  # MIT
+TAEF2_REVISION = os.getenv("TAEF2_REVISION", "bd244ebfe4398c84fbf312a2f1c868c676b500e3")
+FLOW_UPSCALER_REPO_ID = os.getenv("FLOW_UPSCALER_REPO_ID", "TensorForger/FlowUpscaler")  # Unlicense
+FLOW_UPSCALER_REVISION = os.getenv("FLOW_UPSCALER_REVISION", "ae334296526769d7fb5065465e364049f6c45c2b")
 
 ENABLE_INT8 = os.getenv("ENABLE_INT8", "true").strip().lower() in ("1", "true", "yes", "on")
 ENABLE_REFERENCE_IMAGE = os.getenv("ENABLE_REFERENCE_IMAGE", "true").strip().lower() in ("1", "true", "yes", "on")
+# TAEF2: faster tiny decoder. Flow Upscaler: 2x latent upscale of every frame
+# (FluxRT recommends using it together with TAEF2). Set false only to roll back.
+ENABLE_TINY_VAE = os.getenv("ENABLE_TINY_VAE", "true").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_FLOW_UPSCALER = os.getenv("ENABLE_FLOW_UPSCALER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 WIDTH = int(os.getenv("FLUXRT_WIDTH", "576"))
 HEIGHT = int(os.getenv("FLUXRT_HEIGHT", "320"))
+
+
+def _mult16(v: int) -> int:
+    return max(16, (int(v) // 16) * 16)
+
+
+# Garment reference size. FluxRT's own default is 256x256, too small for
+# logos and prints. 384x512 (3:4) matches most product photos; cost is
+# (w/16)*(h/16) extra tokens (768 here vs 576 for a 288x512 camera frame).
+REF_WIDTH = _mult16(int(os.getenv("FLUXRT_REF_WIDTH", "384")))
+REF_HEIGHT = _mult16(int(os.getenv("FLUXRT_REF_HEIGHT", "512")))
+UPSCALE = 2 if ENABLE_FLOW_UPSCALER else 1
+OUT_WIDTH = WIDTH * UPSCALE
+OUT_HEIGHT = HEIGHT * UPSCALE
+OUTPUT_JPEG_QUALITY = int(os.getenv("FLUXRT_OUTPUT_JPEG_QUALITY", "82"))
+# Sent to the app in "ready" so it captures at the model's size and a rate
+# FluxRT can keep up with (it renders ~5-12 base frames/s on a 5090; extra
+# frames are dropped). The upscaler magnifies JPEG blocks, so ask for 0.8.
+# Optional garment LoRA (training/fluxrt_lora). Off unless a path is set. A LoRA
+# whose selection.json says it is not cleared for commercial use (e.g. trained
+# with ViViD) loads only with FLUXRT_ALLOW_RESEARCH_MODEL=1, like the JoyAI gate.
+LORA_PATH = os.getenv("FLUXRT_LORA_PATH", "").strip()
+ALLOW_RESEARCH_MODEL = os.getenv("FLUXRT_ALLOW_RESEARCH_MODEL", "").strip() in ("1", "true", "yes")
+CLIENT_HINTS = os.getenv("FLUXRT_CLIENT_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
+INPUT_FPS = float(os.getenv("FLUXRT_INPUT_FPS", "10"))
+INPUT_JPEG_QUALITY = float(os.getenv("FLUXRT_INPUT_JPEG_QUALITY", "0.8"))
 DEFAULT_STEPS = int(os.getenv("FLUXRT_STEPS", "2"))
 DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
@@ -112,7 +148,40 @@ def b64_to_bgr(b64_str: str) -> np.ndarray:
     return arr[:, :, ::-1].copy()
 
 
-def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = 85) -> str:
+def b64_to_reference_rgb(b64_str: str) -> np.ndarray:
+    """Garment image for FluxRT's set_reference_image.
+
+    FluxRT wants RGB here (camera frames are BGR). The image is padded with
+    white to the reference aspect ratio first, because FluxRT stretches it
+    to REF_WIDTH x REF_HEIGHT and a stretched garment loses its shape.
+    """
+    raw = base64.b64decode(_strip_data_url(b64_str))
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    scale = min(REF_WIDTH / img.width, REF_HEIGHT / img.height)
+    w = max(1, round(img.width * scale))
+    h = max(1, round(img.height * scale))
+    img = img.resize((w, h), Image.LANCZOS)
+    canvas = Image.new("RGB", (REF_WIDTH, REF_HEIGHT), (255, 255, 255))
+    canvas.paste(img, ((REF_WIDTH - w) // 2, (REF_HEIGHT - h) // 2))
+    return np.asarray(canvas).copy()
+
+
+def ready_message(deadline: float) -> Dict[str, Any]:
+    msg: Dict[str, Any] = {"type": "ready", "session_deadline": int(deadline)}
+    if CLIENT_HINTS:
+        msg.update({
+            "engine": "fluxrt",
+            "input_width": WIDTH,
+            "input_height": HEIGHT,
+            "output_width": OUT_WIDTH,
+            "output_height": OUT_HEIGHT,
+            "input_fps": INPUT_FPS,
+            "input_jpeg_quality": INPUT_JPEG_QUALITY,
+        })
+    return msg
+
+
+def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = OUTPUT_JPEG_QUALITY) -> str:
     rgb = bgr[:, :, ::-1]
     img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
     buf = io.BytesIO()
@@ -120,7 +189,7 @@ def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
+def _download_model(repo_id: str, local_dir: Path, min_files: int, revision: Optional[str] = None) -> None:
     from huggingface_hub import snapshot_download
 
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -159,6 +228,7 @@ def _download_model(repo_id: str, local_dir: Path, min_files: int) -> None:
         repo_id=repo_id,
         local_dir=str(local_dir),
         local_dir_use_symlinks=False,
+        revision=revision,
         token=token,
         max_workers=8,
     )
@@ -172,6 +242,30 @@ def ensure_models() -> None:
 
     if ENABLE_INT8:
         _download_model(INT8_REPO_ID, FLUXRT_ROOT / "FLUX.2-klein-4B-int8", min_files=3)
+
+    # FluxRT loads these from fixed relative paths: taef2/taef2.safetensors
+    # and FlowUpscaler/flow_upscaler.safetensors.
+    if ENABLE_TINY_VAE:
+        _download_model(TAEF2_REPO_ID, FLUXRT_ROOT / "taef2", min_files=1, revision=TAEF2_REVISION)
+    if ENABLE_FLOW_UPSCALER:
+        _download_model(FLOW_UPSCALER_REPO_ID, FLUXRT_ROOT / "FlowUpscaler", min_files=1, revision=FLOW_UPSCALER_REVISION)
+        if not ENABLE_TINY_VAE:
+            log.warning("Flow Upscaler without TAEF2: the full VAE decodes 2x frames, expect lower fps")
+
+
+def check_lora(path: str) -> str:
+    """Fail closed: the file must exist and its provenance must allow serving."""
+    p = Path(path)
+    if not p.is_file():
+        raise RuntimeError(f"FLUXRT_LORA_PATH not found: {path}")
+    sel = p.parent / "selection.json"
+    if not sel.is_file():
+        raise RuntimeError(f"no selection.json next to {path}; provenance is required")
+    info = json.loads(sel.read_text())
+    if info.get("commercial_use_cleared") is not True and not ALLOW_RESEARCH_MODEL:
+        raise RuntimeError(f"LoRA {path} is not cleared for commercial use ({info.get('notice', '')}); "
+                           "set FLUXRT_ALLOW_RESEARCH_MODEL=1 for internal testing only")
+    return str(p)
 
 
 def write_runtime_config() -> Path:
@@ -188,15 +282,20 @@ def write_runtime_config() -> Path:
         "compile_models": False,
         "enable_spatial_cache": True,
         "enable_int8_quantization": ENABLE_INT8,
+        "enable_tiny_vae": ENABLE_TINY_VAE,
+        "enable_flow_upscaler": ENABLE_FLOW_UPSCALER,
         "target_fps": None,
         "interpolation_exp": 2,
         "use_reference_image": ENABLE_REFERENCE_IMAGE,
         "reference_image_resolution": {
-            "height": HEIGHT,
-            "width": WIDTH,
+            "height": REF_HEIGHT,
+            "width": REF_WIDTH,
         },
         "logging": True,
     }
+    if LORA_PATH:
+        config["use_lora"] = True
+        config["lora_weights_path"] = check_lora(LORA_PATH)
 
     path = FLUXRT_ROOT / "config.server.runtime.json"
     path.write_text(json.dumps(config, indent=2))
@@ -286,6 +385,11 @@ def public_state() -> Dict[str, Any]:
             "enable_int8": ENABLE_INT8,
             "enable_reference_image": ENABLE_REFERENCE_IMAGE,
             "resolution": {"width": WIDTH, "height": HEIGHT},
+            "output_resolution": {"width": OUT_WIDTH, "height": OUT_HEIGHT},
+            "reference_resolution": {"width": REF_WIDTH, "height": REF_HEIGHT},
+            "enable_tiny_vae": ENABLE_TINY_VAE,
+            "enable_flow_upscaler": ENABLE_FLOW_UPSCALER,
+            "lora": Path(LORA_PATH).parent.name if LORA_PATH else None,
         }
 
 
@@ -449,7 +553,7 @@ async def api_predict(
 
         if isinstance(ref_b64, str) and ref_b64:
             try:
-                ref = b64_to_bgr(ref_b64)
+                ref = b64_to_reference_rgb(ref_b64)
                 proc.set_reference_image(ref)
             except Exception as e:
                 log.warning("set_reference_image failed: %s", e)
@@ -503,7 +607,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
         return
 
-    await websocket.send_json({"type": "ready", "session_deadline": int(deadline)})
+    await websocket.send_json(ready_message(deadline))
 
     with STATE_LOCK:
         proc = STATE["processor"]
@@ -575,7 +679,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
                 elif msg_type == "set_reference_image":
                     try:
-                        ref = b64_to_bgr(data["image_b64"])
+                        ref = b64_to_reference_rgb(data["image_b64"])
                         proc.set_reference_image(ref)
                         await websocket.send_json({"type": "ack", "name": "set_reference_image"})
                     except Exception as e:
