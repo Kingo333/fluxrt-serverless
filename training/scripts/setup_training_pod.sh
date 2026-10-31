@@ -31,6 +31,13 @@ VENV="$AZ_ROOT/venv"
 "$VENV/bin/pip" install -q datasets decord torchdata ftfy peft pyarrow regex safetensors tensorboard "huggingface_hub[cli]>=0.34"
 # flash-attn is optional: training falls back to PyTorch SDPA when it is missing.
 
+echo "== Azyah training patches (Stage 1 LoRA)"
+git -C "$AZ_UPSTREAM" checkout -q -- training
+for p in stage1-lora.patch; do
+  curl -fsSL "${SCRIPTS_URL%/scripts}/patches/$p" -o "$AZ_ROOT/$p"
+  git -C "$AZ_UPSTREAM" apply "$AZ_ROOT/$p" && echo "applied $p"
+done
+
 echo "== smoke config"
 curl -fsSL "$SCRIPTS_URL/make_smoke_config.py" -o "$AZ_ROOT/make_smoke_config.py"
 "$VENV/bin/python" "$AZ_ROOT/make_smoke_config.py" "$AZ_UPSTREAM/training"

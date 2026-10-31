@@ -5,9 +5,13 @@ measurements: the Phase B smoke test logs real peak memory; feed it back here.
   python3 estimate.py stage1 --steps 2000 --step-seconds 40
   python3 estimate.py stage2 --steps 1000 --step-seconds 60
 
-Model: 16.26B-parameter DiT (bf16 weights). Stage 1 trains all of it with AdamW,
-sharded across GPUs (HSDP). Stage 2 trains LoRA adapters on frozen copies
-(generator + fake score share one backbone, real score is a second frozen copy).
+Model: 16.26B-parameter DiT (bf16 weights).
+  stage1       upstream full fine-tune: all 16B with AdamW, sharded across GPUs (HSDP)
+  stage1-lora  Azyah patch: frozen bf16 backbone + LoRA adapters (~0.5B params at r64)
+  stage2       upstream LoRA mode (dmd_use_lora, the default): ONE shared frozen backbone
+               with two adapters (generator, fake score); the real score is that base with
+               adapters off (train_t2v_dmd.load_lora_base_dit). Activations are higher:
+               generator rollout + fake-score + real-score passes.
 """
 import argparse
 import math
@@ -35,8 +39,11 @@ def stage1_state_gb(low: bool) -> float:
     return PARAMS * per_param / GB
 
 
+LORA_PARAMS = 0.5e9  # rank 64 on attention + MLP linears of 40 double blocks (rough)
+
+
 def stage2_frozen_gb() -> float:
-    return 2 * PARAMS * 2 / GB  # two bf16 backbones (shared generator/fake-score + real score)
+    return PARAMS * 2 / GB  # one shared bf16 backbone
 
 
 def per_gpu_gb(stage: str, gpus: int, low: bool, offload_text_encoder: bool = False) -> float:
@@ -44,9 +51,13 @@ def per_gpu_gb(stage: str, gpus: int, low: bool, offload_text_encoder: bool = Fa
     te = 0.0 if offload_text_encoder else TEXT_ENCODER_GB
     if stage == "stage1":
         sharded = stage1_state_gb(low) / gpus
+    elif stage == "stage1-lora":
+        lora = LORA_PARAMS * (2 + 2 + 8) / GB  # adapter weights, grads, AdamW states
+        sharded = (PARAMS * 2 / GB + lora) / gpus
     else:
-        lora = 2 * 0.3e9 * (2 + 2 + 8) / GB  # two rank-64 adapters, rough
+        lora = 2 * LORA_PARAMS * (2 + 2 + 8) / GB  # generator + fake-score adapters
         sharded = (stage2_frozen_gb() + lora) / gpus
+        act *= 1.5  # three passes per step
     return sharded + act + te + VAE_GB + OVERHEAD_GB
 
 
@@ -65,7 +76,7 @@ def options(stage: str, steps: int, step_seconds: float, load_hours: float = 0.3
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["stage1", "stage2"])
+    ap.add_argument("stage", choices=["stage1", "stage1-lora", "stage2"])
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--step-seconds", type=float, default=45.0, help="guess until the smoke test measures it")
     a = ap.parse_args()

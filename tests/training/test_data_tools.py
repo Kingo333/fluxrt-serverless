@@ -281,3 +281,34 @@ def test_identity_pairs_use_the_real_target_as_clean_input(tmp_path):
         _, problems = validate.validate_shard(s)
         assert problems == []
     assert found == out["identity_pairs"]
+
+
+def test_vivid_zip_inspect_and_sampled_extract_across_groups(tmp_path):
+    import zipfile as zf
+    from data_tools import convert_vivid, vivid_zip
+    zp = tmp_path / "ViViD.zip"
+    with zf.ZipFile(zp, "w") as z:
+        for group in ("upper_body", "dresses"):
+            for i in range(6):
+                z.writestr(f"ViViD/{group}/videos/{i:05d}.mp4", b"\x00" * 2048 + bytes([i]))
+                z.writestr(f"ViViD/{group}/cloth/{i:05d}.jpg", png((i * 30, 5, 5)))
+        z.writestr("ViViD/upper_body/videos/orphan.mp4", b"\x00" * 2048)
+    rep = vivid_zip.inspect(str(zp))
+    assert rep["videos"] == 13 and rep["pairs_by_stem"] == 12
+    out = vivid_zip.extract(str(zp), str(tmp_path / "sub"), sample=5, seed=1)
+    assert out == {"pairs_available": 12, "extracted": 5}
+    res = convert_vivid.convert(str(tmp_path / "sub"), str(tmp_path / "st"), "stem")
+    assert res["staged"] == 5
+    cats = {json.loads((d / "meta.json").read_text())["category"] for d in (tmp_path / "st").iterdir()}
+    assert cats <= {"upper", "dress"}
+
+
+def test_glance_per_config_subset_is_balanced(tmp_path):
+    src = fake_glance(tmp_path, rows=6)
+    n = convert_glance.convert(str(src), str(tmp_path / "st"), ["mens-upperwear", "mens-lowerwear"], per_config=2)
+    metas = [json.loads((d / "meta.json").read_text()) for d in (tmp_path / "st").iterdir()]
+    by = {}
+    for m in metas:
+        by[(m["config"], m["split"])] = by.get((m["config"], m["split"]), 0) + 1
+    assert by == {("mens-upperwear", "train"): 2, ("mens-upperwear", "test"): 1, ("mens-lowerwear", "train"): 2}
+    assert n == 5

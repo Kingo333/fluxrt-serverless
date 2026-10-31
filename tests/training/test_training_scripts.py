@@ -73,6 +73,10 @@ def test_estimator_matches_the_audit():
     assert rows[("h100-80", 4)]["fits"] == "maybe"
     s2 = {(r["gpu"], r["count"]): r for r in est.options("stage2", 10, 60)}
     assert s2[("b200", 1)]["fits"] == "yes"
+    lora = {(r["gpu"], r["count"]): r for r in est.options("stage1-lora", 10, 60)}
+    assert lora[("b200", 1)]["fits"] == "yes"            # one GPU is enough with LoRA
+    assert lora[("rtxpro6000", 1)]["fits"] in ("yes", "maybe")
+    assert lora[("rtx5090", 1)]["fits"] == "no"
 
 
 def test_lora_merge_math_and_layout_check(tmp_path):

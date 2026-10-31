@@ -44,6 +44,18 @@ PARAM_MAP = {
 }
 
 FRAME_META_KEEP = 512
+KEEP_SENTENCE_START = "Keep the person's"
+
+
+def short_instruction(instruction: str) -> str:
+    """App instruction -> its short form (first sentence + keep sentence), the caption
+    style a short-caption model was trained on (training/STAGE1_PLAN.md, cut C5)."""
+    first, sep, _rest = instruction.partition(". ")
+    head = first + "." if sep else instruction
+    keep = instruction.rfind(KEEP_SENTENCE_START)
+    if keep > len(head):
+        return f"{head} {instruction[keep:].strip()}"
+    return head
 
 
 def _num_or_none(v: Any) -> Any:
@@ -82,6 +94,8 @@ class Bridge:
     # ---- start payload -------------------------------------------------
     def start_payload(self) -> dict[str, Any]:
         text = self.instruction or self.prompt or ""
+        if self.instruction and self.s.instruction_style == "short":
+            text = short_instruction(self.instruction)
         prompt = self.s.prompt_template.replace("{prompt}", text)
         payload: dict[str, Any] = {
             "type": "start",

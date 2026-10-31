@@ -80,7 +80,9 @@ Each clip is a person wearing **the real garment**, plus a flat photo of that ga
 | Data prep (Glance + ViViD + own clips) | 400 GB | about $28 |
 | Stage 1 real runs, **keep-last-2 + 1 marked best** (`scripts/prune_checkpoints.py`, runs automatically in `run_fashion.sh`) | **500 GB** (3 × up to 160 GB + data) | about $35 |
 
-**Recommendation:** start at **200 GB** and grow when each phase starts (200 → 400 for data prep → 500 before Stage 1). Without pruning, upstream keeps every save: about 8 saves at 100–160 GB each over 2000 steps ≈ 0.8–1.3 TB (review R1).
+**Cost-cut revision:** with Stage 1 LoRA (about 1 GB checkpoints), data subsets and ViViD read straight from the zip (`vivid_zip extract --sample`), **200 GB is enough for exp1**: about 50 GB weights + 32.5 GB `0811` + 32 GB zip (deleted after sampling) + about 25 GB staged, sources and shards + a few GB of checkpoints. The larger sizes below apply only to the full fine-tune fallback.
+
+**Recommendation (full fine-tune only):** start at **200 GB** and grow when each phase starts (200 → 400 for data prep → 500 before Stage 1). Without pruning, upstream keeps every save: about 8 saves at 100–160 GB each over 2000 steps ≈ 0.8–1.3 TB (review R1).
 - Hugging Face private storage: back up final model weights and small reports only. Stage 1 optimizer checkpoints stay on the volume.
 - Free-tier private storage on Hugging Face is limited, so check `kingo333`'s quota before large uploads.
 

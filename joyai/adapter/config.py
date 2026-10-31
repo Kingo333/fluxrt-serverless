@@ -61,6 +61,9 @@ class Settings:
     input_jpeg_quality: float = field(default_factory=lambda: _int("JOYAI_INPUT_JPEG_QUALITY", 85) / 100.0)
     # Per-chunk JoyAI stage timings passed to the app with each frame (benchmarking only).
     profile_timings: bool = field(default_factory=lambda: _bool("JOYAI_PROFILE_TIMINGS", False))
+    # "full" (default) passes the app's instruction as is; "short" keeps only its first
+    # sentence + the keep-the-person sentence, matching a model trained on short captions.
+    instruction_style: str = field(default_factory=lambda: os.getenv("JOYAI_INSTRUCTION_STYLE", "full").strip().lower() or "full")
     # Send the app JoyAI's frame size/fps/quality in "ready" (#18). False reproduces the
     # pre-#18 behaviour (app keeps its tier settings) for before/after benchmarks (review R3).
     client_hints: bool = field(default_factory=lambda: _bool("JOYAI_CLIENT_HINTS", True))

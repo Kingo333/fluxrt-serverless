@@ -9,7 +9,7 @@ Text-to-image/video tasks are switched off (no such data); probabilities and oth
 knobs come from env vars so one generated file serves every run:
 
   AZ_MANIFEST_DIR (required)   AZ_I2I_PROB (1.0)   AZ_V2V_PROB (1.0)
-  AZ_EXP (fashion)  AZ_MAX_STEPS (2000)  AZ_CKPT_INTERVAL (250)  AZ_LR (2e-5)
+  AZ_EXP (fashion)  AZ_MAX_STEPS (2000)  AZ_CKPT_INTERVAL (50; LoRA saves are ~1 GB, safe on spot Pods)  AZ_LR (2e-5)
   AZ_WARMUP (100)  AZ_GRAD_ACCUM (1)  AZ_MAX_FRAMES (49)  AZ_AUTO_RESUME (1)
   AZ_HSDP_SHARD (1)  AZ_SP_SIZE (1)  AZ_DETAILED_CAPTION_PROB (0.7)
 
@@ -43,11 +43,13 @@ REPLACEMENTS = [
     ("    max_train_steps: int = 10000000000", f'    max_train_steps: int = {E}int(os.getenv("AZ_MAX_STEPS", "2000")))'),
     ("    gradient_accumulation_steps: int = 1",
      f'    gradient_accumulation_steps: int = {E}int(os.getenv("AZ_GRAD_ACCUM", "1")))'),
-    ("    checkpoint_interval: int = 500", f'    checkpoint_interval: int = {E}int(os.getenv("AZ_CKPT_INTERVAL", "250")))'),
+    ("    checkpoint_interval: int = 500", f'    checkpoint_interval: int = {E}int(os.getenv("AZ_CKPT_INTERVAL", "50")))'),
     ("    learning_rate: float = 5e-5", f'    learning_rate: float = {E}float(os.getenv("AZ_LR", "2e-5")))'),
     ("    lr_warmup_steps: int = 0", f'    lr_warmup_steps: int = {E}int(os.getenv("AZ_WARMUP", "100")))'),
     ("    sp_size: int = 1", f'    sp_size: int = {E}int(os.getenv("AZ_SP_SIZE", "1")))'),
-    ("    hsdp_shard_dim: int = 1", f'    hsdp_shard_dim: int = {E}int(os.getenv("AZ_HSDP_SHARD", "1")))'),
+    ("    hsdp_shard_dim: int = 1", '    hsdp_shard_dim: int = field(default_factory=lambda: int(os.getenv("AZ_HSDP_SHARD", "1")))\n    # Azyah: Stage 1 LoRA (patches/stage1-lora.patch). AZ_STAGE1_LORA=0 = upstream full fine-tune.\n    stage1_lora: bool = field(default_factory=lambda: os.getenv("AZ_STAGE1_LORA", "1") == "1")\n    lora_rank: int = field(default_factory=lambda: int(os.getenv("AZ_LORA_RANK", "64")))\n    lora_alpha: int = field(default_factory=lambda: int(os.getenv("AZ_LORA_ALPHA", os.getenv("AZ_LORA_RANK", "64"))))'),
+    ("    resume_optimizer: bool = False", "    resume_optimizer: bool = True  # Azyah: auto-resume restores the optimizer too"),
+    ("    resume_dataloader: bool = False", "    resume_dataloader: bool = True"),
 ('    train_multiple_images_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption"]\n    )',
      '    train_multiple_images_caption_keys: list[str] = field(\n        default_factory=lambda: ["caption", "caption_detailed"]\n    )'),
     ('    train_multiple_images_caption_sampling_prob: list[float] = field(\n        default_factory=lambda: [1.0]\n    )',
