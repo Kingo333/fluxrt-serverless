@@ -3,7 +3,7 @@
 Client (app)                       JoyAI upstream (127.0.0.1:8080/ws)
 --------------------------------   -----------------------------------------------
 set_reference_image {image_b64} -> stored; sent as start.ref_image
-set_prompt {prompt}             -> start {prompt, ref_image, 480x840, mjpeg, ...}
+set_prompt {prompt, face_gate?}  -> start {prompt, ref_image, 480x840, mjpeg, gate_enabled, ...}
                                    (sent again if prompt/reference/params change)
 frame {frame_b64}               -> binary JPEG (dropped until upstream "started")
 set_param {name, value}         -> stored; applied with a fresh start
@@ -93,6 +93,9 @@ class Bridge:
         # Garment swap: when the reference image changed (so a prompt usually follows),
         # and the newest camera frame held while the session restarts.
         self._ref_changed_at: Optional[float] = None
+        # The app turns JoyAI's face check off when no face is expected in view
+        # (shoes, bottoms, back camera). Default on.
+        self.face_gate = True
         self._held_frame: Optional[tuple[str, Any, Any, float]] = None
 
     # ---- start payload -------------------------------------------------
@@ -113,7 +116,7 @@ class Bridge:
             "input_codec": "mjpeg",
             "output_codec": "mjpeg",
             "use_pe": False,  # D3: prompt enhancement off
-            "gate_enabled": self.s.gate_enabled,
+            "gate_enabled": self.s.gate_enabled and self.face_gate,
             "max_temporal_ids": self.s.max_temporal_ids,
             "source": "camera",
         }
@@ -146,6 +149,8 @@ class Bridge:
             self.prompt = str(data.get("prompt") or "")
             instruction = data.get("instruction")
             self.instruction = str(instruction).strip() if isinstance(instruction, str) and instruction.strip() else None
+            if isinstance(data.get("face_gate"), bool):
+                self.face_gate = data["face_gate"]
             await self.send_client({"type": "ack", "name": "set_prompt"})
             if self.upstream is None:
                 await self._ensure_upstream_and_start()
