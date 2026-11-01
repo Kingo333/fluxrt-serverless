@@ -271,3 +271,48 @@ def test_short_instruction_style():
     assert short_instruction("Substitute the current top with the garment in the reference image. "
                              "Keep the person's face, body, pose and the background unchanged.").count("Keep") == 1
     assert short_instruction("Just one sentence") == "Just one sentence"
+
+
+def test_swap_restarts_at_once_with_a_short_gate_and_holds_the_newest_frame():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            m, out = send_frame_until_echo(ws, fake)
+            assert out == b"OUT:JPEG1"
+            assert "fg_stable_frames" not in fake.starts[0]  # first start: upstream's full face gate
+
+            # Swap: image then prompt. The restart follows the prompt at once (no second
+            # 0.25 s wait) and asks JoyAI for a short gate streak.
+            t0 = time.monotonic()
+            ws.send_json({"type": "set_reference_image", "image_b64": base64.b64encode(b"TOP2").decode()})
+            assert ws.receive_json()["name"] == "set_reference_image"
+            ws.send_json({"type": "set_prompt", "prompt": "next"})
+            assert ws.receive_json()["name"] == "set_prompt"
+            assert wait_for(lambda: len(fake.starts) == 2)
+            assert time.monotonic() - t0 < 0.25 + 0.2
+            assert fake.starts[1]["fg_stable_frames"] == 6
+            assert fake.starts[1]["ref_image"] == base64.b64encode(b"TOP2").decode()
+
+
+def test_frame_sent_during_restart_is_forwarded_after_started():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            # Sent immediately, before JoyAI has answered "started": held, then forwarded.
+            ws.send_json({"type": "frame", "frame_b64": base64.b64encode(b"EARLY").decode(), "seq": 7})
+            m = ws.receive_json()
+            while m["type"] != "frame":
+                m = ws.receive_json()
+            assert base64.b64decode(m["frame_b64"]) == b"OUT:EARLY"
+            assert m["seq"] == 7
+
+
+def test_swap_gate_can_use_upstream_default():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port, swap_stable_frames=0))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            handshake(ws)
+            send_frame_until_echo(ws, fake)
+            ws.send_json({"type": "set_prompt", "prompt": "only the prompt changes"})
+            assert ws.receive_json()["name"] == "set_prompt"
+            assert wait_for(lambda: len(fake.starts) == 2)
+            assert "fg_stable_frames" not in fake.starts[1]

@@ -87,3 +87,15 @@ def test_model_version_from_registry(tmp_path):
 def test_unknown_model_version_stops_the_worker(tmp_path):
     with pytest.raises(RuntimeError, match="no registry|not in"):
         run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_MODEL_VERSION="azyah-vton-candidate")
+
+
+def test_warmup_portrait_only_by_default(tmp_path):
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31")
+    assert env["JOYOMNI_WARMUP_ORIENTATION"] == "portrait"
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYOMNI_WARMUP_ORIENTATION="both")
+    assert env["JOYOMNI_WARMUP_ORIENTATION"] == "both"
+
+
+def test_orientation_patch_ships_with_the_image():
+    patch = (Path(__file__).resolve().parents[2] / "joyai" / "patches" / "joyai-warmup-orientation.patch").read_text()
+    assert "JOYOMNI_WARMUP_ORIENTATION" in patch and "_orientations" in patch

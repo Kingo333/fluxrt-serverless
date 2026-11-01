@@ -90,9 +90,13 @@ class Bridge:
         # Set when the upstream can't be recovered; the WS handler then closes.
         self.failed = False
         self._send_lock = asyncio.Lock()
+        # Garment swap: when the reference image changed (so a prompt usually follows),
+        # and the newest camera frame held while the session restarts.
+        self._ref_changed_at: Optional[float] = None
+        self._held_frame: Optional[tuple[str, Any, Any, float]] = None
 
     # ---- start payload -------------------------------------------------
-    def start_payload(self) -> dict[str, Any]:
+    def start_payload(self, swap: bool = False) -> dict[str, Any]:
         text = self.instruction or self.prompt or ""
         if self.instruction and self.s.instruction_style == "short":
             text = short_instruction(self.instruction)
@@ -119,6 +123,8 @@ class Bridge:
             payload["ref_image"] = self.ref_b64
         for name, value in self.params.items():
             payload[PARAM_MAP[name]] = value
+        if swap and self.s.swap_stable_frames > 0:
+            payload["fg_stable_frames"] = self.s.swap_stable_frames
         return payload
 
     # ---- client -> upstream ----------------------------------------------
@@ -134,6 +140,7 @@ class Bridge:
             self.ref_b64 = b64
             await self.send_client({"type": "ack", "name": "set_reference_image"})
             if self.upstream is not None:
+                self._ref_changed_at = time.monotonic()
                 self._schedule_restart()  # garment swap: one restart for image + prompt
         elif t == "set_prompt":
             self.prompt = str(data.get("prompt") or "")
@@ -143,7 +150,11 @@ class Bridge:
             if self.upstream is None:
                 await self._ensure_upstream_and_start()
             else:
-                self._schedule_restart()
+                # The prompt is the second half of a swap: restart now instead of
+                # waiting out the coalescing delay a second time.
+                recent_ref = self._ref_changed_at is not None and time.monotonic() - self._ref_changed_at < 2.0
+                self._ref_changed_at = None
+                self._schedule_restart(0.0 if recent_ref else 0.25)
         elif t == "set_param":
             name = str(data.get("name") or "")
             if name not in PARAM_MAP:
@@ -192,7 +203,11 @@ class Bridge:
 
     async def _forward_frame(self, frame_b64: str, client_seq: Any = None, t_client_ms: Any = None) -> None:
         if self.upstream is None or not self.upstream_started:
-            return  # not editing yet; drop
+            # Restarting (garment swap) or not started yet: keep only the newest frame and
+            # send it as soon as JoyAI answers "started", so the new session starts on it.
+            if self.upstream is not None:
+                self._held_frame = (frame_b64, client_seq, t_client_ms, time.monotonic())
+            return
         try:
             jpeg = base64.b64decode(_strip_data_url(frame_b64))
         except (binascii.Error, ValueError):
@@ -215,8 +230,9 @@ class Bridge:
             self._restart_task.cancel()
 
         async def _later() -> None:
-            await asyncio.sleep(delay_s)
-            await self._send_start()
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            await self._send_start(swap=self.frames_out > 0)
 
         self._restart_task = asyncio.create_task(_later(), name="joyai-restart")
 
@@ -230,9 +246,10 @@ class Bridge:
         self.upstream_started = False
         self.reader_task = asyncio.create_task(self._read_upstream(), name="joyai-upstream-reader")
 
-    async def _send_start(self) -> None:
+    async def _send_start(self, swap: bool = False) -> None:
         self.upstream_started = False
-        await self._upstream_send_json(self.start_payload())
+        self._held_frame = None
+        await self._upstream_send_json(self.start_payload(swap=swap))
 
     async def _upstream_send_json(self, payload: dict[str, Any]) -> None:
         if self.upstream is None:
@@ -264,6 +281,10 @@ class Bridge:
                     pending_header = data
                 elif t == "started":
                     self.upstream_started = True
+                    held, self._held_frame = self._held_frame, None
+                    if held is not None and time.monotonic() - held[3] < 1.0:
+                        asyncio.create_task(self._forward_frame(held[0], held[1], held[2]),
+                                            name="joyai-held-frame")
                 elif t in STATUS_PASSTHROUGH:
                     status = {"type": "status", "status": t}
                     if data.get("reason") is not None:

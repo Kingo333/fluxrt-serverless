@@ -1,0 +1,16 @@
+diff --git a/deploy/xvideo/serving/joyomni_streaming.py b/deploy/xvideo/serving/joyomni_streaming.py
+index bc3af7c..46cc835 100644
+--- a/deploy/xvideo/serving/joyomni_streaming.py
++++ b/deploy/xvideo/serving/joyomni_streaming.py
+@@ -307,6 +307,11 @@ class JoyOmniRuntime:
+         _orientations = [(warmup_height, warmup_width)]
+         if (warmup_width, warmup_height) != (warmup_height, warmup_width):
+             _orientations.append((warmup_width, warmup_height))
++        # Azyah patch: compile and warm only the orientation the app uses (both by default).
++        _wo = os.environ.get("JOYOMNI_WARMUP_ORIENTATION", "both").strip().lower()
++        if _wo in {"portrait", "landscape"}:
++            _orientations = [o for o in _orientations if (o[0] > o[1]) == (_wo == "portrait")] or _orientations
++        print(f"#####[STREAM] warmup orientations (h, w): {_orientations}", flush=True)
+         _stem_mod = pipeline.vae.stem
+ 
+         try:
