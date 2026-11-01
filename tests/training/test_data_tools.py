@@ -312,3 +312,36 @@ def test_glance_per_config_subset_is_balanced(tmp_path):
         by[(m["config"], m["split"])] = by.get((m["config"], m["split"]), 0) + 1
     assert by == {("mens-upperwear", "train"): 2, ("mens-upperwear", "test"): 1, ("mens-lowerwear", "train"): 2}
     assert n == 5
+
+
+def test_vivid_zip_real_layout_pairs_by_product_id(tmp_path):
+    """ViViD.zip as released: <cat>/videos/N_detail.mp4 + <cat>/images/N_in_xl.jpg (+ masks we ignore)."""
+    import zipfile
+    from data_tools import convert_vivid, vivid_zip
+    zpath = tmp_path / "ViViD.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        for cat, ids in (("upper_body", ["1221886", "1221887"]), ("dresses", ["2000001"]), ("lower_body", ["3000001"])):
+            for i in ids:
+                z.writestr(f"ViViD/{cat}/videos/{i}_detail.mp4", b"MP4" + i.encode())
+                z.writestr(f"ViViD/{cat}/images/{i}_in_xl.jpg", png((10, 20, 30)))
+                z.writestr(f"ViViD/{cat}/cloth_mask/{i}_in_xl.jpg", b"mask")
+                z.writestr(f"ViViD/{cat}/agnostic_mask/{i}_detail.mp4", b"mask")
+        z.writestr("ViViD/upper_body/videos/9999999_detail.mp4", b"no garment photo")
+    report = vivid_zip.inspect(str(zpath))
+    assert report["videos"] == 5 and report["cloth_images"] == 4 and report["pairs_by_stem"] == 4
+    out = vivid_zip.extract(str(zpath), str(tmp_path / "sample"), sample=10)
+    assert out == {"pairs_available": 4, "extracted": 4}
+    assert (tmp_path / "sample" / "upper_body" / "cloth" / "1221886_in_xl.jpg").exists()
+    res = convert_vivid.convert(str(tmp_path / "sample"), str(tmp_path / "staging"), "stem")
+    assert res == {"pairs_found": 4, "staged": 4}
+    cats = sorted(json.loads(p.read_text())["category"] for p in (tmp_path / "staging").rglob("meta.json"))
+    assert cats == ["dress", "lower", "upper", "upper"]
+    # Also straight from an images/ layout on disk (no extract step).
+    import shutil
+    raw = tmp_path / "raw" / "upper_body"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "images").mkdir()
+    (raw / "videos" / "5_detail.mp4").write_bytes(b"v")
+    (raw / "images" / "5_in_xl.jpg").write_bytes(png((1, 2, 3)))
+    assert convert_vivid.inspect(str(tmp_path / "raw"))["videos_with_same_stem_cloth"] == 1
+    shutil.rmtree(tmp_path / "raw")
