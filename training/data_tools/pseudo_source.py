@@ -118,7 +118,11 @@ def _write_video(path: Path, frames, fps: float) -> None:
             c.mux(pkt)
 
 
-def process(staging_dir: str, editor: Editor, limit: int | None = None, still_frames: int = 9) -> dict:
+def process(staging_dir: str, editor: Editor, limit: int | None = None, still_frames: int = 9,
+            max_frames: int | None = None) -> dict:
+    """max_frames: edit only the first N frames of a clip (cost cap). Training samples a
+    short window per step (49 frames in the configs), so the rest of a long catwalk clip
+    is GPU time for nothing. pack.py trims the target to the source's length."""
     from PIL import Image
     stats = {"done": 0, "rejected": 0, "skipped_has_source": 0, "reasons": {}}
     for d, meta in iter_pairs(Path(staging_dir)):
@@ -134,6 +138,8 @@ def process(staging_dir: str, editor: Editor, limit: int | None = None, still_fr
         t0 = time.time()
         if tgt.suffix == ".mp4":
             frames, fps = _read_video(tgt)
+            if max_frames:
+                frames = frames[:max_frames]
             size = frames[0].size
             out = editor.edit(frames, prompt, _session_size(*size))
             out = [im.resize(size) for im in out]
@@ -152,7 +158,8 @@ def process(staging_dir: str, editor: Editor, limit: int | None = None, still_fr
         meta["pseudo_source"] = {"model": editor.name, "prompt": prompt, "ok": check.ok,
                                  "inside_change": round(check.inside_change, 4),
                                  "outside_change": round(check.outside_change, 4),
-                                 "reason": check.reason, "seconds": round(time.time() - t0, 2)}
+                                 "reason": check.reason, "seconds": round(time.time() - t0, 2),
+                                 "frames": len(out) if tgt.suffix == ".mp4" else 1}
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
         if check.ok:
             stats["done"] += 1
@@ -227,9 +234,10 @@ def main() -> None:
     ap.add_argument("--vae", required=True)
     ap.add_argument("--text-encoder", required=True)
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--max-frames", type=int, help="clips: edit only the first N frames (e.g. 97 = 1 + 12 chunks)")
     a = ap.parse_args()
     editor = JoyAIEditor(a.dit, a.vae, a.text_encoder)
-    print(json.dumps(process(a.staging_dir, editor, a.limit), indent=2))
+    print(json.dumps(process(a.staging_dir, editor, a.limit, max_frames=a.max_frames), indent=2))
 
 
 if __name__ == "__main__":

@@ -366,3 +366,43 @@ def test_joyai_editor_gives_each_vae_role_its_own_device(monkeypatch):
     pseudo_source.JoyAIEditor("d.pth", "vae", "te", device="cuda:0")
     for k in ("vae_encode_device", "vae_decode_device", "vae_pseudo_device", "postprocess_device"):
         assert seen[k] == "cuda:0"
+
+
+def _mp4(path, n, color="red"):
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=96x160:r=24",
+                    "-frames:v", str(n), "-pix_fmt", "yuv420p", str(path)], check=True)
+    return path.read_bytes()
+
+
+def test_max_frames_caps_clip_edit_and_pack_matches_target(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    from data_tools import pack as pack_mod
+    from data_tools import pseudo_source
+    from data_tools.staging import stage_pair
+    stage = tmp_path / "staging"
+    stage_pair(stage, "vivid_train_000000", {"ref.jpg": png((200, 0, 0)), "target.mp4": _mp4(tmp_path / "t.mp4", 60)},
+               {"source": "vivid", "split": "train", "category": "dress", "task": "iv2v"})
+
+    class Editor:
+        name = "fake"
+        def edit(self, frames, prompt, size):
+            from PIL import Image
+            out = []
+            for f in frames:  # partial, visible edit (a stripe), so the quality filter passes
+                im = f.convert("RGB").copy()
+                im.paste((0, 0, 255), (0, 0, im.width, im.height // 5))
+                out.append(im)
+            return out
+
+    stats = pseudo_source.process(str(stage), Editor(), max_frames=25)
+    assert stats["done"] == 1
+    d = stage / "vivid_train_000000"
+    assert pack_mod._frame_count((d / "source.mp4").read_bytes()) == 25
+    assert json.loads((d / "meta.json").read_text())["pseudo_source"]["frames"] == 25
+    s = pack_mod._sample(d, json.loads((d / "meta.json").read_text()))
+    assert pack_mod._frame_count(s.files["0.mp4"]) == pack_mod._frame_count(s.files["1.mp4"]) == 25
+    assert pack_mod._frame_count((d / "target.mp4").read_bytes()) == 60  # staged original untouched
