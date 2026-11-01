@@ -175,7 +175,14 @@ class JoyAIEditor:
         from xvideo.serving.joyomni_streaming import JoyOmniRuntime, StreamingSettings  # noqa: E402
         self._settings_cls = StreamingSettings
         self.steps = steps
+        # Give each VAE role its own instance (shared weights), like the server does
+        # (start_upstream.sh passes --vae-encode/decode/pseudo-device). Without these the
+        # encode worker and the decode/pseudo-encode worker share ONE VAE object and its
+        # causal feature cache across threads; on moving video one thread clears the cache
+        # mid-encode -> "Input temporal dimension is expected to be 1 when cache_x is None".
         self.rt = JoyOmniRuntime.load(dit, vae_ckpt=vae, text_encoder_ckpt=text_encoder, device=device,
+                                      vae_encode_device=device, vae_decode_device=device,
+                                      vae_pseudo_device=device, postprocess_device=device,
                                       warmup_height=840, warmup_width=624)
 
     def edit(self, frames, prompt, size):

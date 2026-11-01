@@ -345,3 +345,24 @@ def test_vivid_zip_real_layout_pairs_by_product_id(tmp_path):
     (raw / "images" / "5_in_xl.jpg").write_bytes(png((1, 2, 3)))
     assert convert_vivid.inspect(str(tmp_path / "raw"))["videos_with_same_stem_cloth"] == 1
     shutil.rmtree(tmp_path / "raw")
+def test_joyai_editor_gives_each_vae_role_its_own_device(monkeypatch):
+    """Regression (P8 trial): without per-role VAE devices the workers share one VAE cache."""
+    import sys
+    import types
+    from data_tools import pseudo_source
+    seen = {}
+
+    class FakeRuntime:
+        @classmethod
+        def load(cls, dit, **kw):
+            seen.update(kw, dit=dit)
+            return cls()
+
+    mod = types.ModuleType("xvideo.serving.joyomni_streaming")
+    mod.JoyOmniRuntime, mod.StreamingSettings = FakeRuntime, object
+    for name in ("xvideo", "xvideo.serving"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "xvideo.serving.joyomni_streaming", mod)
+    pseudo_source.JoyAIEditor("d.pth", "vae", "te", device="cuda:0")
+    for k in ("vae_encode_device", "vae_decode_device", "vae_pseudo_device", "postprocess_device"):
+        assert seen[k] == "cuda:0"
