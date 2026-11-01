@@ -316,3 +316,24 @@ def test_swap_gate_can_use_upstream_default():
             assert ws.receive_json()["name"] == "set_prompt"
             assert wait_for(lambda: len(fake.starts) == 2)
             assert "fg_stable_frames" not in fake.starts[1]
+
+
+def test_face_gate_follows_the_app():
+    with FakeJoyAI() as fake, TestClient(create_app(settings(fake.port))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            while ws.receive_json()["type"] != "ready":
+                pass
+            ws.send_json({"type": "set_reference_image", "image_b64": base64.b64encode(b"SHOE").decode()})
+            ws.receive_json()
+            ws.send_json({"type": "set_prompt", "prompt": "shoes", "face_gate": False})
+            ws.receive_json()
+            assert wait_for(lambda: len(fake.starts) == 1)
+            assert fake.starts[0]["gate_enabled"] is False  # shoes: no face needed
+            ws.send_json({"type": "set_prompt", "prompt": "top", "face_gate": True})
+            ws.receive_json()
+            assert wait_for(lambda: len(fake.starts) == 2)
+            assert fake.starts[1]["gate_enabled"] is True
+            ws.send_json({"type": "set_prompt", "prompt": "older app, no field"})
+            ws.receive_json()
+            assert wait_for(lambda: len(fake.starts) == 3)
+            assert fake.starts[2]["gate_enabled"] is True  # unchanged when the field is missing
