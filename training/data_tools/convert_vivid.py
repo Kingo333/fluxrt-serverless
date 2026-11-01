@@ -30,12 +30,30 @@ from pathlib import Path
 from .staging import stage_pair
 
 
+# Garment photo folder names: our extract writes cloth/; the released ViViD.zip
+# uses images/ (e.g. upper_body/images/1221886_in_xl.jpg next to videos/1221886_detail.mp4).
+CLOTH_DIRS = ("cloth", "images")
+
+
+def pair_id(stem: str) -> str:
+    """Pairing key: the leading product number (1221886_detail -> 1221886), else the stem."""
+    m = re.match(r"(\d+)", stem)
+    return m.group(1) if m else stem
+
+
+def _cloth_dir(root: Path) -> Path | None:
+    for name in CLOTH_DIRS:
+        if (root / name).is_dir():
+            return root / name
+    return None
+
+
 def _find_roots(d: Path) -> list[Path]:
-    """Every folder that holds videos/ and cloth/ (e.g. upper_body/, lower_body/, dresses/)."""
+    """Every folder that holds videos/ and cloth/ or images/ (e.g. upper_body/, lower_body/, dresses/)."""
     roots = [c for c in [d, *sorted(p for p in d.rglob("*") if p.is_dir())]
-             if (c / "videos").is_dir() and (c / "cloth").is_dir()]
+             if (c / "videos").is_dir() and _cloth_dir(c) is not None]
     if not roots:
-        raise SystemExit(f"no folder with videos/ and cloth/ under {d}")
+        raise SystemExit(f"no folder with videos/ and cloth/ (or images/) under {d}")
     return roots
 
 
@@ -50,8 +68,8 @@ def _pattern(name: str) -> str:
 def inspect(extracted: str) -> dict:
     root = _find_root(Path(extracted))
     videos = sorted((root / "videos").rglob("*.mp4"))
-    cloths = sorted(p for p in (root / "cloth").rglob("*") if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
-    cloth_stems = {p.stem for p in cloths}
+    cloths = sorted(p for p in _cloth_dir(root).rglob("*") if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    cloth_stems = {pair_id(p.stem) for p in cloths}
     report = {
         "root": str(root),
         "videos": len(videos),
@@ -59,7 +77,7 @@ def inspect(extracted: str) -> dict:
         "video_name_patterns": Counter(_pattern(p.name) for p in videos).most_common(5),
         "cloth_name_patterns": Counter(_pattern(p.name) for p in cloths).most_common(5),
         "video_subfolders": Counter(p.parent.relative_to(root / "videos").as_posix() for p in videos).most_common(10),
-        "videos_with_same_stem_cloth": sum(p.stem in cloth_stems for p in videos),
+        "videos_with_same_stem_cloth": sum(pair_id(p.stem) in cloth_stems for p in videos),
         "other_files": sorted(str(p.relative_to(root)) for p in root.iterdir() if p.is_file())[:20],
         "examples": {"videos": [str(p.relative_to(root)) for p in videos[:5]],
                      "cloth": [str(p.relative_to(root)) for p in cloths[:5]]},
@@ -87,10 +105,10 @@ def convert(extracted: str, staging: str, pairing: str, pairs_csv: str | None = 
     pairs: list[tuple[Path, Path, str]] = []
     if pairing == "stem":
         for r in roots:
-            cloth_by_stem = {p.stem: p for p in (r / "cloth").rglob("*")
+            cloth_by_stem = {pair_id(p.stem): p for p in _cloth_dir(r).rglob("*")
                              if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
             for v in sorted((r / "videos").rglob("*.mp4")):
-                c = cloth_by_stem.get(v.stem)
+                c = cloth_by_stem.get(pair_id(v.stem))
                 if c is not None:
                     pairs.append((v, c, _category(v)))
     elif pairing == "csv":
