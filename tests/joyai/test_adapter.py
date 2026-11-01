@@ -316,3 +316,19 @@ def test_swap_gate_can_use_upstream_default():
             assert ws.receive_json()["name"] == "set_prompt"
             assert wait_for(lambda: len(fake.starts) == 2)
             assert "fg_stable_frames" not in fake.starts[1]
+
+
+def test_warming_messages_carry_progress():
+    with FakeJoyAI(load_delay=3.5) as fake, TestClient(create_app(settings(fake.port, expected_warmup_s=200))) as c:
+        with c.websocket_connect(f"/ws?token={tok()}") as ws:
+            warming = []
+            while True:
+                m = ws.receive_json()
+                if m["type"] == "ready":
+                    break
+                if m["type"] == "warming":
+                    warming.append(m)
+            assert len(warming) >= 2  # repeated while loading, not just once
+            assert all(w["engine"] == "joyai" and w["expected_s"] == 200 for w in warming)
+            assert warming[-1]["elapsed_s"] >= warming[0]["elapsed_s"]
+            assert {w["phase"] for w in warming} <= {"booting", "loading", "idle"}
