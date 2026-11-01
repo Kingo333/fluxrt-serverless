@@ -104,3 +104,12 @@ def test_no_lora_by_default(monkeypatch, tmp_path):
     s = load(monkeypatch)
     monkeypatch.setattr(s, "FLUXRT_ROOT", tmp_path)
     assert "use_lora" not in json.loads(s.write_runtime_config().read_text())
+
+
+def test_warming_message(monkeypatch):
+    import time as _t
+    s = load(monkeypatch)
+    m = s.warming_message({"status": "loading", "warmup_started_at": _t.time() - 30})
+    assert m["type"] == "warming" and m["engine"] == "fluxrt" and m["phase"] == "loading"
+    assert 29 <= m["elapsed_s"] <= 32 and m["expected_s"] == 120
+    assert s.warming_message({"status": "idle", "warmup_started_at": None})["elapsed_s"] == 0.0

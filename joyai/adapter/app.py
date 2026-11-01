@@ -31,6 +31,13 @@ from .upstream import Upstream
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("joyai-adapter")
 
+def warming_message(upstream: "Upstream", s: Settings) -> dict[str, Any]:
+    started = upstream.started_at
+    elapsed = max(0.0, time.time() - started) if started else 0.0
+    return {"type": "warming", "state": upstream.public_state(), "engine": "joyai",
+            "phase": upstream.status, "elapsed_s": round(elapsed, 1), "expected_s": s.expected_warmup_s}
+
+
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     s = settings or Settings()
     # Fail closed: refuse to start without the signing secret.
@@ -149,10 +156,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         # Wait for the model; keep the socket open like FluxRT does.
         if upstream.status != "ready":
-            await send_client({"type": "warming", "state": upstream.public_state()})
             await upstream.ensure_started()
+            # Progress for the app's wait screen, every few seconds: phase
+            # (booting = starting JoyAI, loading = reading weights and warming up),
+            # time since this worker began loading, and the typical total.
+            last_sent = 0.0
             while upstream.status not in ("ready", "error"):
-                await asyncio.sleep(1.0)
+                if time.monotonic() - last_sent >= 3.0:
+                    await send_client(warming_message(upstream, s))
+                    last_sent = time.monotonic()
+                await asyncio.sleep(0.5)
             if upstream.status == "error":
                 await send_client({"type": "error", "message": upstream.error or "upstream_error"})
                 await websocket.close(code=status.WS_1011_INTERNAL_ERROR)

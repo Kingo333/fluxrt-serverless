@@ -76,6 +76,8 @@ ALLOW_RESEARCH_MODEL = os.getenv("FLUXRT_ALLOW_RESEARCH_MODEL", "").strip() in (
 CLIENT_HINTS = os.getenv("FLUXRT_CLIENT_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
 INPUT_FPS = float(os.getenv("FLUXRT_INPUT_FPS", "10"))
 INPUT_JPEG_QUALITY = float(os.getenv("FLUXRT_INPUT_JPEG_QUALITY", "0.8"))
+# Typical FluxRT warm-up, shown on the app's wait screen (weights download into the container).
+EXPECTED_WARMUP_S = int(os.getenv("FLUXRT_EXPECTED_WARMUP_S", "120"))
 DEFAULT_STEPS = int(os.getenv("FLUXRT_STEPS", "2"))
 DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
@@ -164,6 +166,14 @@ def b64_to_reference_rgb(b64_str: str) -> np.ndarray:
     canvas = Image.new("RGB", (REF_WIDTH, REF_HEIGHT), (255, 255, 255))
     canvas.paste(img, ((REF_WIDTH - w) // 2, (REF_HEIGHT - h) // 2))
     return np.asarray(canvas).copy()
+
+
+def warming_message(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Progress for the app's wait screen (phase, seconds since warm-up began, typical total)."""
+    started = state.get("warmup_started_at")
+    elapsed = max(0.0, time.time() - started) if started else 0.0
+    return {"type": "warming", "state": state, "engine": "fluxrt", "phase": state.get("status"),
+            "elapsed_s": round(elapsed, 1), "expected_s": EXPECTED_WARMUP_S}
 
 
 def ready_message(deadline: float) -> Dict[str, Any]:
@@ -588,9 +598,8 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
     state = public_state()
     if state["status"] != "ready":
-        await websocket.send_json({"type": "warming", "state": state})
         start_warmup_background()
-
+        last_sent = 0.0
         while True:
             state = public_state()
             if state["status"] == "ready":
@@ -599,6 +608,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 await websocket.send_json({"type": "error", "message": state["error"]})
                 await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
                 return
+            if time.monotonic() - last_sent >= 3.0:
+                await websocket.send_json(warming_message(state))
+                last_sent = time.monotonic()
             await asyncio.sleep(1)
 
     deadline = SESSION_CLOCK.deadline(session_tok, MAX_SESSION_SECONDS)

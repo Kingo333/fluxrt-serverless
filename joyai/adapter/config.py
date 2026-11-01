@@ -71,6 +71,9 @@ class Settings:
     # 24 still, centred frames (1 s at 24 fps, 2 s at 12) before editing resumes. The
     # person was already verified, so swaps ask for a shorter streak. 0 = upstream default.
     swap_stable_frames: int = field(default_factory=lambda: _int("JOYAI_SWAP_STABLE_FRAMES", 6))
+    # Typical cold start (measured 2026-11-01 on a 5090: 180 s), sent with "warming"
+    # so the app's progress bar matches JoyAI instead of a generic estimate.
+    expected_warmup_s: int = field(default_factory=lambda: _int("JOYAI_EXPECTED_WARMUP_S", 180))
     # Which trained model this worker serves (start_upstream.sh resolves it); reported to the app.
     model_version: str = field(default_factory=lambda: os.getenv("JOYAI_MODEL_VERSION", "joyai-baseline") or "joyai-baseline")
     gate_enabled: bool = field(default_factory=lambda: _bool("JOYAI_GATE_ENABLED", True))
