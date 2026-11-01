@@ -29,6 +29,39 @@ def _as_jpeg(data: bytes) -> bytes:
         return out.getvalue()
 
 
+def _frame_count(data: bytes) -> int:
+    import av
+    with av.open(io.BytesIO(data)) as c:
+        return sum(1 for _ in c.decode(video=0))
+
+
+def _trim_video(data: bytes, n: int) -> bytes:
+    """First n frames, re-encoded at the same size and rate (crf 18)."""
+    import av
+    out = io.BytesIO()
+    with av.open(io.BytesIO(data)) as src, av.open(out, "w", format="mp4") as dst:
+        st = src.streams.video[0]
+        enc = dst.add_stream("libx264", rate=round(float(st.average_rate or 24)))
+        enc.width, enc.height, enc.pix_fmt = st.codec_context.width, st.codec_context.height, "yuv420p"
+        enc.options = {"crf": "18"}
+        for i, frame in enumerate(src.decode(video=0)):
+            if i >= n:
+                break
+            for pkt in enc.encode(frame.reformat(format="yuv420p")):
+                dst.mux(pkt)
+        for pkt in enc.encode():
+            dst.mux(pkt)
+    return out.getvalue()
+
+
+def _matched_target(src: bytes, tgt: bytes) -> bytes:
+    """The loader picks the same relative window in source and target, so they must be
+    the same length. A capped pseudo-source (--max-frames) gets a trimmed target copy;
+    the staged original is never changed."""
+    ns, nt = _frame_count(src), _frame_count(tgt)
+    return _trim_video(tgt, ns) if ns < nt else tgt
+
+
 def _sample(d: Path, meta: dict) -> Sample | None:
     ref, src, tgt = find(d, "ref"), find(d, "source"), find(d, "target")
     if not (ref and src and tgt):
@@ -42,8 +75,9 @@ def _sample(d: Path, meta: dict) -> Sample | None:
                   person_id=meta.get("person_id"), consent_id=meta.get("consent_id"),
                   extra={k: meta[k] for k in ("config", "category", "pseudo_source") if k in meta})
     if tgt.suffix == ".mp4":
-        return Sample(task="iv2v", files={"0.jpg": _as_jpeg(ref.read_bytes()), "0.mp4": src.read_bytes(),
-                                          "1.mp4": tgt.read_bytes()}, **common)
+        src_bytes = src.read_bytes()
+        return Sample(task="iv2v", files={"0.jpg": _as_jpeg(ref.read_bytes()), "0.mp4": src_bytes,
+                                          "1.mp4": _matched_target(src_bytes, tgt.read_bytes())}, **common)
     files = {"0.png": ref.read_bytes(), "1.png": src.read_bytes(), "2.png": tgt.read_bytes()}
     if any(p.suffix != ".png" for p in (ref, src, tgt)):
         files = {"0.jpg": _as_jpeg(ref.read_bytes()), "1.jpg": _as_jpeg(src.read_bytes()), "2.jpg": _as_jpeg(tgt.read_bytes())}
