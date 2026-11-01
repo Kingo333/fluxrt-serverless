@@ -67,6 +67,10 @@ class Settings:
     # Send the app JoyAI's frame size/fps/quality in "ready" (#18). False reproduces the
     # pre-#18 behaviour (app keeps its tier settings) for before/after benchmarks (review R3).
     client_hints: bool = field(default_factory=lambda: _bool("JOYAI_CLIENT_HINTS", True))
+    # Garment swaps restart the JoyAI session, which re-arms its face gate: by default
+    # 24 still, centred frames (1 s at 24 fps, 2 s at 12) before editing resumes. The
+    # person was already verified, so swaps ask for a shorter streak. 0 = upstream default.
+    swap_stable_frames: int = field(default_factory=lambda: _int("JOYAI_SWAP_STABLE_FRAMES", 6))
     # Which trained model this worker serves (start_upstream.sh resolves it); reported to the app.
     model_version: str = field(default_factory=lambda: os.getenv("JOYAI_MODEL_VERSION", "joyai-baseline") or "joyai-baseline")
     gate_enabled: bool = field(default_factory=lambda: _bool("JOYAI_GATE_ENABLED", True))

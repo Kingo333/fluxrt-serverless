@@ -44,7 +44,10 @@ export JOYOMNI_CUDA_GRAPH="${JOYOMNI_CUDA_GRAPH:-1}"
 export JOYOMNI_SAGE_ATTN="${JOYOMNI_SAGE_ATTN:-$PROFILE_SAGE}"
 export JOYOMNI_FP8_FAST_ACCUM="${JOYOMNI_FP8_FAST_ACCUM:-$PROFILE_FAST_ACCUM}"
 export JOYOMNI_LOW_VRAM="${JOYOMNI_LOW_VRAM:-$PROFILE_LOW_VRAM}"
-echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_FAST_ACCUM LOW_VRAM=$JOYOMNI_LOW_VRAM cache=$CACHE_ROOT"
+# The app always sends portrait 480x840, so skip compiling/warming landscape (cold start).
+# Set "both" on the endpoint if a landscape client is ever added.
+export JOYOMNI_WARMUP_ORIENTATION="${JOYOMNI_WARMUP_ORIENTATION:-portrait}"
+echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_FAST_ACCUM LOW_VRAM=$JOYOMNI_LOW_VRAM warmup=$JOYOMNI_WARMUP_ORIENTATION cache=$CACHE_ROOT"
 # D3: no prompt enhancement. Make sure no key leaks in from the environment.
 unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
 
