@@ -33,7 +33,14 @@ VENV="$AZ_ROOT/venv"
 # transformers 4.57 and diffusers 0.36 (both need <1.0 / <2.0) (P5, 2026-10-31).
 "$VENV/bin/pip" install -q --extra-index-url https://download.pytorch.org/whl/cu128 \
   "torch==2.9.1+cu128" "torchvision==0.24.1+cu128" "transformers>=4.57.1,<4.58" "diffusers==0.36.0" "accelerate==1.10.1" \
-  "huggingface_hub>=0.34,<1.0" datasets decord torchdata ftfy peft pyarrow regex safetensors tensorboard
+  "huggingface_hub>=0.34,<1.0" "datasets==5.0.1" "torchdata==0.11.0" "peft==0.21.2" "numpy==2.2.6" \
+  eva-decord ftfy pyarrow regex safetensors tensorboard
+# datasets 5.1+ needs huggingface_hub>=1.31; 5.0.1 accepts 0.36 and has the private
+# datasets.data_files APIs upstream's loader imports (checked 2026-10-31).
+# eva-decord (Apache-2.0) is a maintained decord fork with the same `import decord`.
+# decord 0.6.0's wheel is mislabelled cp36, so pip check flags it on Python 3.10.
+"$VENV/bin/pip" uninstall -q -y decord 2>/dev/null || true
+"$VENV/bin/pip" install -q --force-reinstall --no-deps eva-decord
 "$VENV/bin/pip" check || echo "WARNING: pip check reported conflicts (see above)"
 # flash-attn is optional: training falls back to PyTorch SDPA when it is missing.
 
@@ -51,6 +58,10 @@ curl -fsSL "$SCRIPTS_URL/make_smoke_config.py" -o "$AZ_ROOT/make_smoke_config.py
 echo "== checks"
 "$VENV/bin/python" - <<'PY'
 import torch, datasets, peft, decord, torchdata, transformers, diffusers, huggingface_hub
+from datasets.data_files import _get_origin_metadata, SingleOriginMetadata  # upstream loader needs these
+from datasets.packaged_modules.webdataset.webdataset import WebDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
+print("decord", decord.__version__, "VideoReader", hasattr(decord, "VideoReader"))
 print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
 print("transformers", transformers.__version__, "diffusers", diffusers.__version__,
       "huggingface_hub", huggingface_hub.__version__, "peft", peft.__version__, "datasets", datasets.__version__)
