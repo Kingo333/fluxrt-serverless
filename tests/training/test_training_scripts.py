@@ -151,3 +151,13 @@ def test_setup_applies_text_encoder_sdpa_patch():
     assert "text-encoder-sdpa.patch" in sh
     patch = (root / "patches" / "text-encoder-sdpa.patch").read_text()
     assert 'AZ_TEXT_ENCODER_ATTN", "sdpa"' in patch and "-            attn_implementation=\"flash_attention_2\"," in patch
+
+
+def test_setup_applies_dataset_video_bytes_patch():
+    """P9 smoke #2: datasets 5.x decodes Video() columns with torchcodec, which isn't installed."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "training"
+    assert "dataset-video-bytes.patch" in (root / "scripts" / "setup_training_pod.sh").read_text()
+    patch = (root / "patches" / "dataset-video-bytes.patch").read_text()
+    assert patch.count("+                \"0.mp4\": datasets.Video(decode=False),") == 1
+    assert "datasets.Video(decode=False)" in patch and "__init__.py" in patch

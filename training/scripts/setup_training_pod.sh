@@ -46,7 +46,7 @@ VENV="$AZ_ROOT/venv"
 
 echo "== Azyah training patches (Stage 1 LoRA)"
 git -C "$AZ_UPSTREAM" checkout -q -- training
-for p in stage1-lora.patch text-encoder-sdpa.patch; do
+for p in stage1-lora.patch text-encoder-sdpa.patch dataset-video-bytes.patch; do
   curl -fsSL "${SCRIPTS_URL%/scripts}/patches/$p" -o "$AZ_ROOT/$p"
   git -C "$AZ_UPSTREAM" apply "$AZ_ROOT/$p" && echo "applied $p"
 done
