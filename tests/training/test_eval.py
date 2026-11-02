@@ -78,3 +78,21 @@ def test_run_eval_and_ab_sheet(tmp_path):
         w.writerows(rows)
     s = ab_sheet.score(str(tmp_path / "ab" / "review.csv"), str(tmp_path / "ab" / "key.json"))
     assert s["win_rate"] == {"azyah-exp1": 1.0}
+
+
+def test_generate_vivid_picks_held_out_pairs_with_sources(tmp_path):
+    import json as _json
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parents[2] / "training"))
+    from eval.generate_vivid import test_items
+    for i, (split, src, ok) in enumerate([("test", True, True), ("train", True, True), ("test", False, True),
+                                          ("test", True, False), ("test", True, True)]):
+        d = tmp_path / f"vivid_{split}_{i:06d}"
+        d.mkdir()
+        (d / "meta.json").write_text(_json.dumps({"split": split, "pseudo_source": {"ok": ok}}))
+        if src:
+            (d / "source.mp4").write_bytes(b"x")
+    picked = [p.name for p in test_items(tmp_path, 10)]
+    assert picked == ["vivid_test_000000", "vivid_test_000004"]
+    assert [p.name for p in test_items(tmp_path, 1)] == ["vivid_test_000000"]
