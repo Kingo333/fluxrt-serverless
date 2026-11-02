@@ -44,7 +44,7 @@ index 7605c36..597b676 100644
      model = maybe_load_fsdp_model(
          model=model,
 diff --git a/training/src/train_t2v.py b/training/src/train_t2v.py
-index 23bf36c..c8dbb66 100644
+index 23bf36c..b9df677 100644
 --- a/training/src/train_t2v.py
 +++ b/training/src/train_t2v.py
 @@ -586,7 +586,13 @@ def setup_distributed_training(cfg: ExpConfig) -> tuple[int, int, int, torch.dev
@@ -76,10 +76,10 @@ index 23bf36c..c8dbb66 100644
  
      lr_scheduler = get_scheduler(
 diff --git a/training/src/utils/checkpoint.py b/training/src/utils/checkpoint.py
-index 7b319c3..234c97b 100644
+index 7b319c3..a77e91b 100644
 --- a/training/src/utils/checkpoint.py
 +++ b/training/src/utils/checkpoint.py
-@@ -15,6 +15,12 @@ from src.utils.logging import get_logger
+@@ -15,6 +15,49 @@ from src.utils.logging import get_logger
  _SAVE_OPTIONS = StateDictOptions(full_state_dict=True, cpu_offload=True)
  _LOAD_OPTIONS = StateDictOptions(
      full_state_dict=True, broadcast_from_rank0=True)
@@ -87,12 +87,49 @@ index 7b319c3..234c97b 100644
 +    full_state_dict=True, broadcast_from_rank0=True, strict=False)
 +
 +
++_WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_fsdp_wrapped_module.", "_orig_mod.")
++
++
++def _fill_missing_optim_state(model, optim_state: dict) -> int:
++    """Azyah patch: AdamW only creates state for parameters that received a gradient.
++    Some LoRA adapters never do (e.g. the last double block's text branch: its output
++    is discarded after the block loop), so the saved optimizer state has no entry for
++    them and set_optimizer_state_dict raises KeyError on resume. Give them the empty
++    state AdamW would have (zero moments; their grads stay None, so steps skip them)."""
++    state = optim_state.get("state") or {}
++    if not state:
++        return 0
++    ref = next(iter(state.values()))
++    params = {}
++    for name, p in model.named_parameters():
++        for seg in _WRAPPER_SEGMENTS:
++            name = name.replace(seg, "")
++        params[name] = p
++    added = 0
++    for group in optim_state.get("param_groups", []):
++        for fqn in group.get("params", []):
++            if fqn in state or fqn not in params:
++                continue
++            shape = tuple(params[fqn].shape)
++            entry = {}
++            for k, v in ref.items():
++                if torch.is_tensor(v) and v.dim() == 0:
++                    entry[k] = v.clone()
++                elif torch.is_tensor(v):
++                    entry[k] = torch.zeros(shape, dtype=v.dtype)
++                else:
++                    entry[k] = v
++            state[fqn] = entry
++            added += 1
++    return added
++
++
 +def _is_stage1_lora(model) -> bool:
 +    return bool(getattr(model, "_azyah_stage1_lora", False))
  
  
  def save_checkpoint(
-@@ -32,11 +38,34 @@ def save_checkpoint(
+@@ -32,11 +75,34 @@ def save_checkpoint(
      save_path = Path(save_dir / f"global_step{step}")
      save_path.mkdir(parents=True, exist_ok=True)
  
@@ -132,7 +169,7 @@ index 7b319c3..234c97b 100644
  
      if optimizer is not None:
          state_dict["optimizer"] = get_optimizer_state_dict(
-@@ -87,7 +116,17 @@ def load_checkpoint(
+@@ -87,9 +153,24 @@ def load_checkpoint(
      logger.info(f"Loading checkpoint from {checkpoint_path}")
      state_dict = torch.load(checkpoint_path, map_location="cpu")
  
@@ -150,4 +187,11 @@ index 7b319c3..234c97b 100644
 +        set_model_state_dict(model, state_dict["model"], options=_LOAD_OPTIONS)
  
      if optimizer is not None and "optimizer" in state_dict:
++        if "generator_lora" in state_dict:
++            added = _fill_missing_optim_state(model, state_dict["optimizer"])
++            if added:
++                logger.info(f"Stage 1 LoRA resume: {added} adapter params had no optimizer state (never got a "
++                            "gradient); restored them with empty AdamW state")
          set_optimizer_state_dict(
+             model, optimizer, state_dict["optimizer"], options=_LOAD_OPTIONS)
+ 

@@ -171,3 +171,11 @@ def test_stage1_lora_patch_keeps_base_frozen_and_asserts_size():
     assert "+    if getattr(cfg, \"stage1_lora\", False):" in patch
     assert "+        dit.requires_grad_(True)" in patch  # only in the non-LoRA branch
     assert "0 < trainable < 1_000_000_000" in patch
+
+
+def test_stage1_lora_resume_fills_missing_optimizer_state():
+    """P9 smoke #4: resume KeyError on a LoRA param with no AdamW state (last block's unused text branch)."""
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "+def _fill_missing_optim_state(model, optim_state: dict) -> int:" in patch
+    assert "added = _fill_missing_optim_state(model, state_dict[\"optimizer\"])" in patch
