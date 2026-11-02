@@ -141,3 +141,13 @@ def test_model_card_states_vivid_and_blocks_commercial_use():
     assert not com["trained_with_vivid"] and com["commercial_use_cleared"] and com["notice"] == ""
     card2, entry2 = mod.build(com, "dit.pth", "azyah-vton-candidate", "x", "n", "abc")
     assert "Not cleared" not in card2 and entry2["commercial_use_cleared"] is True
+
+
+def test_setup_applies_text_encoder_sdpa_patch():
+    """P9 smoke failed: upstream hard-codes flash_attention_2 for the text encoder and flash_attn isn't installed."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "training"
+    sh = (root / "scripts" / "setup_training_pod.sh").read_text()
+    assert "text-encoder-sdpa.patch" in sh
+    patch = (root / "patches" / "text-encoder-sdpa.patch").read_text()
+    assert 'AZ_TEXT_ENCODER_ATTN", "sdpa"' in patch and "-            attn_implementation=\"flash_attention_2\"," in patch

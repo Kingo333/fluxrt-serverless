@@ -1,0 +1,16 @@
+diff --git a/training/src/models/mmdit/text_encoder/__init__.py b/training/src/models/mmdit/text_encoder/__init__.py
+index f3d7800..099ba81 100644
+--- a/training/src/models/mmdit/text_encoder/__init__.py
++++ b/training/src/models/mmdit/text_encoder/__init__.py
+@@ -29,7 +29,10 @@ def load_text_encoder(
+             text_encoder_ckpt,
+             torch_dtype=torch_dtype,
+             local_files_only=True,
+-            attn_implementation="flash_attention_2",
++            # Azyah patch: flash_attn isn't installed in our training venv (no prebuilt
++            # wheel for this torch/Blackwell); the text encoder is frozen, so SDPA gives the
++            # same embeddings. AZ_TEXT_ENCODER_ATTN=flash_attention_2 restores upstream.
++            attn_implementation=__import__("os").environ.get("AZ_TEXT_ENCODER_ATTN", "sdpa"),
+         ).to(device).eval().requires_grad_(False)
+         tokenizer = Qwen2Tokenizer.from_pretrained(
+             text_encoder_ckpt,
