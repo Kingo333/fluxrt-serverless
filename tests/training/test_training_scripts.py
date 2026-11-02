@@ -161,3 +161,13 @@ def test_setup_applies_dataset_video_bytes_patch():
     patch = (root / "patches" / "dataset-video-bytes.patch").read_text()
     assert patch.count("+                \"0.mp4\": datasets.Video(decode=False),") == 1
     assert "datasets.Video(decode=False)" in patch and "__init__.py" in patch
+
+
+def test_stage1_lora_patch_keeps_base_frozen_and_asserts_size():
+    """P9 smoke #3: upstream setup_model_and_optimizer re-enabled grads on all 16.6B params -> AdamW OOM."""
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "training/src/train_t2v.py" in patch
+    assert "+    if getattr(cfg, \"stage1_lora\", False):" in patch
+    assert "+        dit.requires_grad_(True)" in patch  # only in the non-LoRA branch
+    assert "0 < trainable < 1_000_000_000" in patch

@@ -43,6 +43,38 @@ index 7605c36..597b676 100644
  
      model = maybe_load_fsdp_model(
          model=model,
+diff --git a/training/src/train_t2v.py b/training/src/train_t2v.py
+index 23bf36c..c8dbb66 100644
+--- a/training/src/train_t2v.py
++++ b/training/src/train_t2v.py
+@@ -586,7 +586,13 @@ def setup_distributed_training(cfg: ExpConfig) -> tuple[int, int, int, torch.dev
+ 
+ def setup_model_and_optimizer(cfg: ExpConfig, device: torch.device) -> tuple[torch.nn.Module, torch.optim.Optimizer, Any]:
+     dit = load_dit(cfg, device=device)
+-    dit.requires_grad_(True)
++    if getattr(cfg, "stage1_lora", False):
++        # Azyah patch: load_dit froze the base and left only the LoRA adapter trainable
++        # (_add_stage1_lora). Upstream's requires_grad_(True) here unfroze all 16.6B
++        # parameters again, so AdamW states OOMed a 96 GB card (P9 smoke #3).
++        pass
++    else:
++        dit.requires_grad_(True)
+     dit.train()
+     if cfg.enable_activation_checkpointing:
+         dit = apply_activation_checkpointing(
+@@ -594,6 +600,12 @@ def setup_model_and_optimizer(cfg: ExpConfig, device: torch.device) -> tuple[tor
+             skip_interval=cfg.activation_checkpointing_skip_interval,
+         )
+ 
++    if getattr(cfg, "stage1_lora", False):
++        trainable = sum(p.numel() for p in dit.parameters() if p.requires_grad)
++        print(f"Stage 1 LoRA: {trainable / 1e6:.1f}M trainable parameters go to the optimizer", flush=True)
++        if not 0 < trainable < 1_000_000_000:
++            raise RuntimeError(f"Stage 1 LoRA expects 0 < trainable < 1B parameters, got {trainable / 1e9:.2f}B; "
++                               "the base model is not frozen")
+     optimizer = load_optimizer(cfg.optimizer_name, dit, cfg)
+ 
+     lr_scheduler = get_scheduler(
 diff --git a/training/src/utils/checkpoint.py b/training/src/utils/checkpoint.py
 index 7b319c3..234c97b 100644
 --- a/training/src/utils/checkpoint.py
