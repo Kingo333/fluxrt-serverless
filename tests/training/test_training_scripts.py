@@ -179,3 +179,28 @@ def test_stage1_lora_resume_fills_missing_optimizer_state():
     patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
     assert "+def _fill_missing_optim_state(model, optim_state: dict) -> int:" in patch
     assert "added = _fill_missing_optim_state(model, state_dict[\"optimizer\"])" in patch
+
+
+def test_lora_merge_accepts_adapter_names_and_wrappers():
+    """P9e: merge found no layers in step_2000.pth; accept every PEFT/wrapper key form."""
+    np = pytest.importorskip("numpy")
+    mod = load("merge_lora")
+    rng = np.random.default_rng(1)
+    w = rng.standard_normal((6, 4)).astype("float32")
+    a = rng.standard_normal((2, 4)).astype("float32")
+    b = rng.standard_normal((6, 2)).astype("float32")
+    base = {"double_blocks.0.img_attn_qkv.weight": w}
+    for ka, kb in [
+        ("double_blocks.0.img_attn_qkv.lora_A.weight", "double_blocks.0.img_attn_qkv.lora_B.weight"),
+        ("double_blocks.0.img_attn_qkv.lora_A.generator.weight", "double_blocks.0.img_attn_qkv.lora_B.generator.weight"),
+        ("double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_A.generator.default.weight",
+         "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_B.generator.default.weight"),
+    ]:
+        merged, n = mod.merge(base, {ka: a, kb: b}, r=2, alpha=2)
+        assert n == 1 and np.allclose(merged["double_blocks.0.img_attn_qkv.weight"], w + b @ a)
+    nested = {"step": 2000, "model": {"double_blocks.0.img_attn_qkv.lora_A.weight": a,
+                                       "double_blocks.0.img_attn_qkv.lora_B.weight": b}}
+    assert len(mod.find_lora(nested)) == 2
+    assert len(mod.find_lora({"generator_lora": {"x.lora_A.weight": a}})) == 1
+    assert mod.find_lora({"step": 1, "optimizer": {"state": {}}}) == {}
+    assert "top-level keys" in mod.describe({"step": 1, "model": {"k": a}})
