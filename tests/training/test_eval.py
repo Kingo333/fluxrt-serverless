@@ -96,3 +96,14 @@ def test_generate_vivid_picks_held_out_pairs_with_sources(tmp_path):
     picked = [p.name for p in test_items(tmp_path, 10)]
     assert picked == ["vivid_test_000000", "vivid_test_000004"]
     assert [p.name for p in test_items(tmp_path, 1)] == ["vivid_test_000000"]
+
+
+def test_fluxrt_eval_speed_summary():
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parents[2] / "training"))
+    from eval.generate_fluxrt import summarize
+    s = summarize([0.05, 0.05, 0.10, 0.10], 12.3)
+    assert s["fps"] == 13.33 and s["latency_ms_p50"] == 75.0 and s["latency_ms_p95"] == 100.0
+    assert s["gpu_mem_gb"] == 12.3 and s["frames"] == 4
+    assert summarize([], None)["fps"] is None
