@@ -16,18 +16,21 @@ from pathlib import Path
 LABEL_H = 28
 
 
-def _read(path: Path, max_frames: int):
+def _fps(path: Path) -> float:
     import av
-    frames, fps = [], 16
     with av.open(str(path)) as c:
-        st = c.streams.video[0]
-        if st.average_rate:
-            fps = float(st.average_rate)
-        for f in c.decode(st):
-            frames.append(f.to_image().convert("RGB"))
-            if len(frames) >= max_frames:
+        r = c.streams.video[0].average_rate
+        return float(r) if r else 16.0
+
+
+def _read(path: Path, max_frames: int):
+    """Yields frames one at a time (CPU Pods have 512 MB)."""
+    import av
+    with av.open(str(path)) as c:
+        for k, f in enumerate(c.decode(c.streams.video[0])):
+            if k >= max_frames:
                 break
-    return frames, fps
+            yield f.to_image().convert("RGB")
 
 
 def _fit(im, h):
@@ -44,42 +47,38 @@ def _panel(im, label, h):
     return out
 
 
-def compose(panels_per_frame: list[list[tuple]], h: int):
-    """panels_per_frame: per frame, a list of (PIL image, label). Returns stacked frames."""
+def compose(panels, h: int):
+    """panels: one frame's list of (PIL image, label) -> the stacked frame."""
     from PIL import Image
-    frames = []
-    for panels in panels_per_frame:
-        parts = [_panel(im, label, h) for im, label in panels]
-        w = sum(p.width for p in parts)
-        canvas = Image.new("RGB", (w + w % 2, h + LABEL_H), (255, 255, 255))
-        x = 0
-        for p in parts:
-            canvas.paste(p, (x, 0))
-            x += p.width
-        frames.append(canvas)
-    return frames
+    parts = [_panel(im, label, h) for im, label in panels]
+    w = sum(p.width for p in parts)
+    canvas = Image.new("RGB", (w + w % 2, h + LABEL_H), (255, 255, 255))
+    x = 0
+    for p in parts:
+        canvas.paste(p, (x, 0))
+        x += p.width
+    return canvas
 
 
 def clip_frames(d: Path, models: list[str], h: int, max_frames: int):
+    """Yields the grid frames of one clip; stops at the shortest video."""
     from PIL import Image
-    inp, fps = _read(d / "input.mp4", max_frames)
     ref_p = next((d / n for n in ("ref.jpg", "ref.png") if (d / n).exists()), None)
-    ref = Image.open(ref_p).convert("RGB") if ref_p else None
-    outs = [(m, _read(d / f"out_{m}.mp4", max_frames)[0]) for m in models if (d / f"out_{m}.mp4").exists()]
-    tgt = _read(d / "target.mp4", max_frames)[0] if (d / "target.mp4").exists() else []
-    if not outs:
-        return [], fps
-    n = min([len(inp)] + [len(f) for _, f in outs] + ([len(tgt)] if tgt else []))
-    per_frame = []
-    for k in range(n):
-        p = [(inp[k], f"{d.name}  input")]
+    ref = _fit(Image.open(ref_p).convert("RGB"), h) if ref_p else None
+    names = [m for m in models if (d / f"out_{m}.mp4").exists()]
+    if not names:
+        return
+    streams = [_read(d / "input.mp4", max_frames)] + [_read(d / f"out_{m}.mp4", max_frames) for m in names]
+    labels = [f"{d.name}  input"] + names
+    if (d / "target.mp4").exists():
+        streams.append(_read(d / "target.mp4", max_frames))
+        labels.append("real (target)")
+    for frames in zip(*streams):
+        panels = [(frames[0], labels[0])]
         if ref is not None:
-            p.append((ref, "garment"))
-        p += [(f[k], m) for m, f in outs]
-        if tgt:
-            p.append((tgt[k], "real (target)"))
-        per_frame.append(p)
-    return compose(per_frame, h), fps
+            panels.append((ref, "garment"))
+        panels += list(zip(frames[1:], labels[1:]))
+        yield compose(panels, h)
 
 
 class Writer:
@@ -90,7 +89,9 @@ class Writer:
         self.c = av.open(str(path), "w")
         self.st = self.c.add_stream("libx264", rate=max(1, round(fps)))
         self.st.width, self.st.height, self.st.pix_fmt = size[0], size[1], "yuv420p"
-        self.st.options = {"crf": "23"}
+        # Small look-ahead and few threads: two encoders must fit a 512 MB CPU Pod.
+        self.st.options = {"crf": "23", "preset": "veryfast", "x264-params": "rc-lookahead=4:threads=2:sync-lookahead=0"}
+        self.st.codec_context.thread_count = 2
         self.size = size
 
     def add(self, im) -> None:
@@ -118,17 +119,22 @@ def main(argv=None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     every, n_all = None, 0
     for d in sorted(p for p in Path(a.results_dir).iterdir() if p.is_dir()):
-        frames, fps = clip_frames(d, a.models, a.height, a.max_frames)
-        if not frames:
+        if not (d / "input.mp4").exists():
             continue
-        w = Writer(out / f"{d.name}.mp4", fps, frames[0].size)
-        every = every or Writer(out / "all.mp4", fps, frames[0].size)
-        for f in frames:
+        w, n = None, 0
+        for f in clip_frames(d, a.models, a.height, a.max_frames):
+            if w is None:
+                fps = _fps(d / "input.mp4")
+                w = Writer(out / f"{d.name}.mp4", fps, f.size)
+                every = every or Writer(out / "all.mp4", fps, f.size)
             w.add(f)
             every.add(f)
+            n += 1
+        if w is None:
+            continue
         w.close()
-        n_all += len(frames)
-        print(f"{d.name}: {len(frames)} frames -> {out / (d.name + '.mp4')}", flush=True)
+        n_all += n
+        print(f"{d.name}: {n} frames -> {out / (d.name + '.mp4')}", flush=True)
     if every:
         every.close()
         print(f"all clips: {n_all} frames -> {out / 'all.mp4'}")

@@ -133,17 +133,67 @@ def change(input_frames, output_frames) -> float:
     return float(np.mean([np.abs(_arr(i, size) - _arr(o, size)).mean() for i, o in zip(input_frames, output_frames)]))
 
 
+class ClipScorer:
+    """The same metrics as the functions above, added up one frame at a time, so a clip never has
+    to be in memory (the CPU Pod has a 512 MB limit). Call add() per frame, then result()."""
+
+    def __init__(self, ref, mask):
+        self.ref_h = _hist(_garment_pixels_of_photo(ref))
+        ref_a = _arr(ref)
+        ref_m = ref_a.min(axis=2) < 0.92
+        self.ref_e = _edge_energy(ref_a, ref_m if ref_m.sum() > 100 else None)
+        self.mask_img, self.size, self.m = mask, None, None
+        self.n = self.n_t = 0
+        self.colour = self.edge = self.change = self.pres = self.flick = 0.0
+        self.psnr = self.col_t = 0.0
+        self.prev = None
+
+    def add(self, inp, out, tgt=None) -> None:
+        if self.size is None:
+            self.size = out.size
+            self.m = _mask(self.mask_img, self.size)
+        i, o = _arr(inp, self.size), _arr(out, self.size)
+        m = self.m
+        self.colour += 1.0 - 0.5 * float(np.abs(_hist(o[m]) - self.ref_h).sum())
+        self.edge += _edge_energy(o, m)
+        self.change += float(np.abs(i - o).mean())
+        outside = ~m
+        if self.mask_img is not None and outside.any():
+            self.pres += float(np.abs(i - o).mean(axis=2)[outside].mean())
+        if self.prev is not None:
+            pi, po = self.prev
+            self.flick += float(np.abs(o - po).mean(axis=2)[m].mean() - np.abs(i - pi).mean(axis=2)[m].mean())
+        self.prev = (i, o)
+        if tgt is not None:
+            t = _arr(tgt, self.size)
+            self.psnr += 10.0 * np.log10(1.0 / max(float(np.mean((o - t) ** 2)), 1e-10))
+            self.col_t += 1.0 - 0.5 * float(np.abs(_hist(o.reshape(-1, 3)) - _hist(t.reshape(-1, 3))).sum())
+            self.n_t += 1
+        self.n += 1
+
+    def result(self) -> dict:
+        if not self.n:
+            return {}
+        n = self.n
+        detail = 1.0 if self.ref_e <= 1e-6 else min((self.edge / n) / self.ref_e, 2.0)
+        out = {
+            "garment_colour": round(self.colour / n, 4),
+            "garment_detail": round(float(detail), 4),
+            "flicker": round(max(0.0, self.flick / (n - 1)) if n > 1 else 0.0, 4),
+            "change": round(self.change / n, 4),
+        }
+        if self.mask_img is not None:
+            out["preservation"] = round(1.0 - self.pres / n, 4)
+        if self.n_t:
+            out["psnr_target"] = round(float(self.psnr / self.n_t), 3)
+            out["colour_target"] = round(self.col_t / self.n_t, 4)
+        return out
+
+
 def score_clip(input_frames, output_frames, ref, mask, target_frames=None) -> dict:
-    out = {
-        "garment_colour": round(garment_colour(output_frames, ref, mask), 4),
-        "garment_detail": round(garment_detail(output_frames, ref, mask), 4),
-        "flicker": round(flicker(input_frames, output_frames, mask), 4),
-        "change": round(change(input_frames, output_frames), 4),
-    }
-    if mask is not None:
-        out["preservation"] = round(preservation(input_frames, output_frames, mask), 4)
-    if target_frames:
-        n = min(len(output_frames), len(target_frames))
-        out["psnr_target"] = round(psnr_target(output_frames[:n], target_frames[:n]), 3)
-        out["colour_target"] = round(colour_target(output_frames[:n], target_frames[:n]), 4)
-    return out
+    """Frames can be lists or iterators; the clip length is the shorter of input and output."""
+    sc = ClipScorer(ref, mask)
+    tg = iter(target_frames or [])
+    for i, o in zip(input_frames, output_frames):
+        sc.add(i, o, next(tg, None))
+    return sc.result()

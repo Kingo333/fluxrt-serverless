@@ -25,17 +25,17 @@ MAX_FRAMES = 96
 
 
 def _frames(path: Path):
+    """Yields frames one at a time (a CPU Pod has 512 MB; whole clips do not fit)."""
     from PIL import Image
     if path.suffix in (".png", ".jpg", ".jpeg"):
-        return [Image.open(path).convert("RGB")]
+        yield Image.open(path).convert("RGB")
+        return
     import av
-    out = []
     with av.open(str(path)) as c:
-        for f in c.decode(c.streams.video[0]):
-            out.append(f.to_image())
-            if len(out) >= MAX_FRAMES:
+        for k, f in enumerate(c.decode(c.streams.video[0])):
+            if k >= MAX_FRAMES:
                 break
-    return out
+            yield f.to_image()
 
 
 def _one(d: Path, stem: str) -> Path | None:
@@ -57,16 +57,14 @@ def evaluate(results_dir: str) -> dict:
             continue
         mask_p = d / "mask.png"
         mask = Image.open(mask_p) if mask_p.exists() else None
-        in_frames, ref_im = _frames(inp), Image.open(ref)
+        ref_im = Image.open(ref).convert("RGB")
         tgt = _one(d, "target")
-        tgt_frames = _frames(tgt) if tgt else None
         masked.append(mask is not None)
         per_clip[d.name] = {}
         for out in sorted(d.glob("out_*")):
             model = out.stem[len("out_"):]
-            out_frames = _frames(out)
-            n = min(len(in_frames), len(out_frames))
-            s = score_clip(in_frames[:n], out_frames[:n], ref_im, mask, tgt_frames)
+            s = score_clip(_frames(inp), _frames(out), ref_im, mask, _frames(tgt) if tgt else None)
+            print(f"{d.name} {model}: {s}", flush=True)
             perf = d / f"perf_{model}.json"
             if perf.exists():
                 s.update(json.loads(perf.read_text()))
