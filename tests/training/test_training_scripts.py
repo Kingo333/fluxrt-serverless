@@ -293,3 +293,23 @@ def test_merge_lora_main_end_to_end_bf16(tmp_path, monkeypatch):
     want = (w.float() + 2.0 * (b @ a)).to(torch.bfloat16)
     assert torch.allclose(out["double_blocks.0.img_attn_qkv.weight"].float(), want.float(), atol=1e-2)
     assert torch.equal(out["double_blocks.0.norm.weight"], norm)
+
+
+def test_generate_vivid_fills_model_paths(tmp_path):
+    """P9e: generate_vivid ran without the JOYAI_* exports and tried checkpoints/vae on the Hub."""
+    import importlib.util as u
+    spec = u.spec_from_file_location("generate_vivid", SCRIPTS.parent / "eval" / "generate_vivid.py")
+    mod = u.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ck = tmp_path / "checkpoints"
+    (ck / "dit").mkdir(parents=True)
+    (ck / "dit" / "pretrain_editing_bid_version.pth").write_bytes(b"x")
+    (ck / "vae").mkdir()
+    env = {"AZ_ROOT": str(tmp_path)}
+    with pytest.raises(SystemExit, match="JOYAI_TEXT_ENCODER"):
+        mod.default_model_env(env)
+    (ck / "MiMo-VL-7B-RL-2508").mkdir()
+    got = mod.default_model_env(env)
+    assert got["JOYAI_VAE"] == str(ck / "vae")
+    env2 = {"AZ_ROOT": str(tmp_path), "JOYAI_VAE": str(ck / "dit")}
+    assert mod.default_model_env(env2)["JOYAI_VAE"] == str(ck / "dit")

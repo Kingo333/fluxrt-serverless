@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,27 @@ def test_items(staging: Path, max_items: int) -> list[Path]:
         if len(out) >= max_items:
             break
     return out
+
+
+# Same defaults as training/scripts/common.sh. The config reads these; unset, it falls back to
+# relative "checkpoints/..." paths and transformers tries them as Hub repos (P9e: HF 401 for
+# checkpoints/vae).
+MODEL_ENV = {
+    "JOYAI_BASE_MODEL": "dit/pretrain_editing_bid_version.pth",
+    "JOYAI_VAE": "vae",
+    "JOYAI_TEXT_ENCODER": "MiMo-VL-7B-RL-2508",
+}
+
+
+def default_model_env(env=os.environ) -> dict:
+    """Fill unset JOYAI_* paths from $AZ_ROOT/checkpoints; fail early if one is missing."""
+    ckpt = Path(env.get("AZ_ROOT", "/workspace/azyah-vton")) / "checkpoints"
+    for k, sub in MODEL_ENV.items():
+        env.setdefault(k, str(ckpt / sub))
+    missing = [f"{k}={env[k]}" for k in MODEL_ENV if not Path(env[k]).exists()]
+    if missing:
+        raise SystemExit("model files not found: " + ", ".join(missing))
+    return {k: env[k] for k in MODEL_ENV}
 
 
 def _ref_latent(pipeline, cfg, ref_path: Path, height: int, width: int, device, dtype):
@@ -67,6 +89,8 @@ def main(argv=None) -> None:
     ap.add_argument("--num-frames", type=int, default=49)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args(argv)
+    print("model paths:", default_model_env())
+    Path(a.out).mkdir(parents=True, exist_ok=True)
 
     import shutil
     import torch
