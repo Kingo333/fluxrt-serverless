@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Evaluate every 0811 LoRA save against the untouched 0811 clone, with the live settings
+# (2 steps, no CFG, garment basesize 768, the app's full instruction) on steady REAL clips
+# (--cross: a real ViViD test clip + another item's garment photo of the same category).
+# Same Pod type as training (1x RTX PRO 6000) and the same volume. Paid: owner's "yes" first.
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/joyai_0811_lora/eval_saves.sh | \
+#     AZ_REF=<SHA> AZ_EXP=joyai0811-exp1 bash
+# Each save is fused onto 0811 at load (generate_vivid --base), so no 32 GB merged files are written.
+# Writes $AZ_ROOT/eval/joyai0811_<exp>/ (clips, report.md, grid videos). Re-running skips finished clips.
+set -euo pipefail
+AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
+export AZ_REF
+RAW="${RAW_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training}"
+export SCRIPTS_URL="$RAW/scripts"
+source <(curl -fsSL "$RAW/scripts/common.sh")
+: "${AZ_EXP:?set AZ_EXP to the trained experiment}"
+export AZ_MANIFEST_DIR="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/research-train}"
+ITEMS="${AZ_EVAL_ITEMS:-4}"
+EXP_DIR="$AZ_OUT/joyai0811_lora/${AZ_EXP}_sp1_world1"
+OUT="$AZ_ROOT/eval/joyai0811_${AZ_EXP}"
+PY="$AZ_ROOT/venv/bin/python"
+
+BASE="${AZ_BASE_0811:-$(find "$AZ_CKPT" -name joyai_video_edit_dit_0811.pth 2>/dev/null | head -1)}"
+BASE="$(readlink -f "$BASE")"
+case "$BASE" in "$AZ_ROOT"/*) ;; *) echo "REFUSING: base $BASE is not the clone on the training volume"; exit 1 ;; esac
+
+curl -fsSL "$SCRIPTS_URL/setup_training_pod.sh" | bash
+git -C "$AZ_ROOT/azyah-code" fetch -q origin "$AZ_REF" && git -C "$AZ_ROOT/azyah-code" checkout -q "$AZ_REF"
+A="$AZ_ROOT/azyah-code/training"
+cd "$AZ_UPSTREAM/training"
+"$PY" "$A/scripts/make_fashion_config.py" "$PWD"
+export PYTHONPATH="$PWD:$A" PATH="$AZ_ROOT/venv/bin:$PATH"
+G=(torchrun --nproc_per_node 1 -m eval.generate_vivid --config configs/azyah_fashion_stage1.py
+   --staging "$AZ_DATA/staging/vivid" --out "$OUT" --max-items "$ITEMS" --live --cross)
+
+MODELS=(live0811)
+"${G[@]}" --ckpt "$BASE" --name live0811
+for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
+  step="$(basename "$ck" .pth)"; step="${step#step_}"
+  "${G[@]}" --ckpt "$ck" --base "$BASE" --name "lora$step"
+  MODELS+=("lora$step")
+done
+echo "GEN_DONE models: ${MODELS[*]}"
+cd "$A"
+"$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md"; cat "$OUT/report.md"
+"$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all
+echo "grid videos: ${OUT}_grid (all.mp4 = every clip; panels: input | garment | ${MODELS[*]})"

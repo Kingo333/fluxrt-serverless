@@ -132,8 +132,11 @@ def main(argv=None) -> None:
                     help="input = the REAL clip (target.mp4) with another item's garment photo; no ground "
                          "truth, but steady real input like the app (the P8 pseudo-source videos flicker)")
     ap.add_argument("--live", action="store_true",
-                    help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768 "
+                    help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768, and the "
+                         "app's full instruction (garment name + description) "
                          "(use with --ckpt the serving joyai_video_edit_dit_0811.pth)")
+    ap.add_argument("--base", help="--ckpt is a LoRA save (generator_lora, e.g. a joyai_0811_lora step_N.pth): "
+                                   "fuse it onto this full checkpoint at load (upstream load_dit), no merged file")
     a = ap.parse_args(argv)
     if a.live:
         a.steps = a.steps or 2
@@ -154,6 +157,10 @@ def main(argv=None) -> None:
 
     cfg = load_config_class_from_pyfile(a.config)()
     cfg.dit_ckpt = a.ckpt
+    if a.base:
+        cfg.dmd_base_ckpt = a.base  # load_dit fuses the save's generator_lora onto it
+        cfg.dmd_base_ckpt_type = "pt"
+    cfg.stage1_lora = False  # inference: no fresh training adapter (patches/stage1-lora.patch)
     cfg.hsdp_shard_dim = 1
     device = torch.device("cuda", 0)
     torch.cuda.set_device(0)
@@ -184,7 +191,11 @@ def main(argv=None) -> None:
                 continue
             dest.mkdir(parents=True, exist_ok=True)
             src = d / ("target.mp4" if a.cross else "source.mp4")
-            item = BenchmarkItem(meta.get("category", "upper"), instruction(meta.get("category", "upper")), src)
+            cat = meta.get("category", "upper")
+            gmeta = json.loads((gd / "meta.json").read_text()) if gd != d else meta
+            text = (instruction(cat, gmeta.get("garment_name"), gmeta.get("garment_description")) if a.live
+                    else instruction(cat))  # --live: the full instruction the app sends for this garment
+            item = BenchmarkItem(cat, text, src)
             generator = torch.Generator(device=device).manual_seed(a.seed)
             kwargs, source_pixels = build_pipeline_kwargs(item, args, cfg, generator)
             ref = next(p for p in gd.iterdir() if p.stem == "ref")
