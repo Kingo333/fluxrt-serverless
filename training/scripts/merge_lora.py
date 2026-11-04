@@ -72,9 +72,13 @@ def describe(ckpt: dict, n: int = 20) -> str:
     return "\n".join(lines)
 
 
-def merge(base: dict, lora: dict, r: int, alpha: float) -> tuple[dict, int]:
+def merge(base: dict, lora: dict, r: int, alpha: float, fold=None) -> tuple[dict, int]:
     """base: {name: W}; lora: PEFT keys '<path>.lora_A[.<adapter>...].weight' and the matching
-    '<path>.lora_B[...]'. W_merged = W + (alpha / r) * B @ A. Returns merged copy and count."""
+    '<path>.lora_B[...]'. W_merged = W + (alpha / r) * B @ A. Returns merged copy and count.
+
+    fold(w, b, a, scale) -> merged W. main() passes a torch fold that works one layer at a time
+    and returns bf16 right away, so the merge never holds fp32 copies of the 16.6B backbone
+    (the fp32 version ran a 94 GB Pod out of RAM). Without it (tests) it is plain numpy."""
     scale = alpha / r
     norm = {_strip(k): _dense(v) for k, v in lora.items()}
     out = dict(base)
@@ -89,15 +93,26 @@ def merge(base: dict, lora: dict, r: int, alpha: float) -> tuple[dict, int]:
         w_key = f"{mod}.weight"
         if w_key not in out:
             raise SystemExit(f"LoRA targets {w_key}, which is not in the Stage 1 backbone")
-        w = out[w_key]
-        delta = (norm[b_key] @ a) * scale
-        if tuple(delta.shape) != tuple(w.shape):
-            raise SystemExit(f"shape mismatch for {w_key}: {tuple(w.shape)} vs delta {tuple(delta.shape)}")
-        out[w_key] = (w.astype("float32") if hasattr(w, "astype") else w.float()) + delta
+        w, b = out[w_key], norm[b_key]
+        delta_shape = (int(b.shape[0]), int(a.shape[1]))
+        if delta_shape != tuple(int(x) for x in w.shape):
+            raise SystemExit(f"shape mismatch for {w_key}: {tuple(w.shape)} vs delta {delta_shape}")
+        out[w_key] = fold(w, b, a, scale) if fold else w.astype("float32") + (b @ a) * scale
         merged += 1
     if merged == 0:
         raise SystemExit("no LoRA layers found to merge; first keys: " + ", ".join(list(norm)[:20]))
     return out, merged
+
+
+def torch_fold(device: str, dtype):
+    """One layer at a time: W (fp32 on `device`) += scale * B @ A, back to CPU in `dtype`."""
+    import torch
+
+    def fold(w, b, a, scale):
+        acc = w.to(device=device, dtype=torch.float32)
+        acc.addmm_(b.to(device=device, dtype=torch.float32), a.to(device=device, dtype=torch.float32), alpha=scale)
+        return acc.to(device="cpu", dtype=dtype)
+    return fold
 
 
 def check_keys(state: dict, serving_keys_json: str) -> list[str]:
@@ -120,10 +135,12 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--check-keys")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--device", help="where to fold each layer (default: cuda if available, else cpu)")
     a = ap.parse_args()
     import torch
     base = unwrap_backbone(torch.load(a.stage1, map_location="cpu", mmap=True, weights_only=True))
-    s2 = torch.load(a.stage2, map_location="cpu", weights_only=False)
+    # mmap: the training save also holds ~2 GB of optimizer state we never need in RAM.
+    s2 = torch.load(a.stage2, map_location="cpu", weights_only=False, mmap=True)
     lora = find_lora(s2)
     if not lora:
         print(describe(s2))
@@ -135,20 +152,26 @@ def main() -> None:
         raise SystemExit(f"cannot tell the LoRA rank (config missing, ranks {sorted(ranks)})")
     alpha = float(cfg.get("lora_alpha") or r)
     print(f"LoRA tensors: {len(lora)}, r={r}, alpha={alpha}; first keys: {list(lora)[:3]}")
+    dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
+    device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtypes = sorted({str(v.dtype) for v in base.values()})
+    print(f"backbone: {len(base)} tensors, dtypes {dtypes}; merging on {device}, saving {a.dtype}")
     try:
-        merged, n = merge(base, lora, r, alpha)
+        merged, n = merge(base, lora, r, alpha, fold=torch_fold(device, dt))
     except SystemExit:
         print(describe(s2))
         raise
-    dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
-    merged = {k: v.to(dt) if v.is_floating_point() else v for k, v in merged.items()}
+    # Untouched tensors stay mmap-backed (no copy) when they are already in the target dtype.
+    merged = {k: v.to(dt) if v.is_floating_point() and v.dtype != dt else v for k, v in merged.items()}
     if a.check_keys:
         problems = check_keys(merged, a.check_keys)
         if problems:
             print("\n".join(problems))
             raise SystemExit(f"{len(problems)} layout problem(s): not saving")
     torch.save(merged, a.out)
-    print(f"merged {n} LoRA layers (r={r}, alpha={alpha}) -> {a.out}")
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    print(f"merged {n} LoRA layers (r={r}, alpha={alpha}) -> {a.out}; peak RAM {peak:.1f} GB")
 
 
 if __name__ == "__main__":

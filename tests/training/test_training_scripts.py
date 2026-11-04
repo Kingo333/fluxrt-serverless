@@ -267,3 +267,29 @@ def test_stage1_lora_save_and_resume_refuse_empty_adapters():
     assert "get_peft_model_state_dict(model, state_dict=full_state" not in patch
     sh = (Path(__file__).resolve().parents[2] / "training" / "scripts" / "run_first_session.sh").read_text()
     assert "generator_lora" in sh  # smoke pass also checks the saved adapter tensors
+
+
+def test_merge_lora_main_end_to_end_bf16(tmp_path, monkeypatch):
+    """P9e OOM: the merge must fold layer by layer and save bf16, reading a real training save
+    (generator_lora + config + optimizer state) with mmap."""
+    torch = pytest.importorskip("torch")
+    import sys
+    mod = load("merge_lora")
+    g = torch.Generator().manual_seed(0)
+    w = torch.randn(6, 4, generator=g).to(torch.bfloat16)
+    norm = torch.ones(4, dtype=torch.bfloat16)
+    a = torch.randn(2, 4, generator=g)
+    b = torch.randn(6, 2, generator=g)
+    torch.save({"double_blocks.0.img_attn_qkv.weight": w, "double_blocks.0.norm.weight": norm}, tmp_path / "base.pth")
+    torch.save({"step": 2000, "optimizer": {"state": {0: {"exp_avg": torch.zeros(3)}}},
+                "generator_lora": {"double_blocks.0.img_attn_qkv.lora_A.weight": a,
+                                   "double_blocks.0.img_attn_qkv.lora_B.weight": b},
+                "generator_lora_config": {"r": 2, "lora_alpha": 4}}, tmp_path / "step_2000.pth")
+    monkeypatch.setattr(sys, "argv", ["merge_lora", str(tmp_path / "base.pth"), str(tmp_path / "step_2000.pth"),
+                                      str(tmp_path / "out.pth"), "--device", "cpu"])
+    mod.main()
+    out = torch.load(tmp_path / "out.pth", weights_only=True)
+    assert out["double_blocks.0.img_attn_qkv.weight"].dtype == torch.bfloat16
+    want = (w.float() + 2.0 * (b @ a)).to(torch.bfloat16)
+    assert torch.allclose(out["double_blocks.0.img_attn_qkv.weight"].float(), want.float(), atol=1e-2)
+    assert torch.equal(out["double_blocks.0.norm.weight"], norm)
