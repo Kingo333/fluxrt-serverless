@@ -23,7 +23,7 @@ KLEIN_REPO="${KLEIN_REPO:-black-forest-labs/FLUX.2-klein-4B}"   # Apache-2.0; th
 AZ_EXP="${AZ_EXP:-fluxlora}"
 MAX_STEPS="${AZ_MAX_STEPS:-1500}"
 SAMPLES="${AZ_SAMPLES:-3000}"
-VIDEO_FRAMES="${AZ_VIDEO_FRAMES:-2}"   # stills per ViViD/own clip pair (research-flagged via selection.json)
+VIDEO_FRAMES="${AZ_VIDEO_FRAMES:-0}"   # stills per ViViD/own clip pair; 0 = Glance stills only (ViViD pseudo-source videos flicker, owner check 2026-11-04)
 BATCH="${AZ_BATCH:-4}"
 RANK="${AZ_LORA_RANK:-32}"
 SIZE="${AZ_SIZE:-288x512}"        # = endpoint FLUXRT_WIDTH x FLUXRT_HEIGHT

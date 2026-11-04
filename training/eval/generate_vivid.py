@@ -42,6 +42,21 @@ def test_items(staging: Path, max_items: int) -> list[Path]:
     return out
 
 
+def cross_pairs(items: list[Path]) -> list[tuple[Path, Path]]:
+    """--cross: each real clip (target.mp4, the person in their own garment) gets the garment photo
+    of the next test item of the same category, so the input is a steady real video, like the app's
+    camera, and the garment is a different one. Items with no same-category partner are skipped."""
+    cats = [json.loads((d / "meta.json").read_text()).get("category", "upper") for d in items]
+    out = []
+    for i, d in enumerate(items):
+        for k in range(1, len(items)):
+            j = (i + k) % len(items)
+            if cats[j] == cats[i]:
+                out.append((d, items[j]))
+                break
+    return out
+
+
 # Same defaults as training/scripts/common.sh. The config reads these; unset, it falls back to
 # relative "checkpoints/..." paths and transformers tries them as Hub repos (P9e: HF 401 for
 # checkpoints/vae).
@@ -113,6 +128,9 @@ def main(argv=None) -> None:
     ap.add_argument("--ref-basesize", type=int, default=0,
                     help="garment resize like training/serving (bucket, aspect kept); 0 = the config's "
                          "ref_image_basesize, -1 = stretch to the video size (the first P9e runs)")
+    ap.add_argument("--cross", action="store_true",
+                    help="input = the REAL clip (target.mp4) with another item's garment photo; no ground "
+                         "truth, but steady real input like the app (the P8 pseudo-source videos flicker)")
     ap.add_argument("--live", action="store_true",
                     help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768 "
                          "(use with --ckpt the serving joyai_video_edit_dit_0811.pth)")
@@ -156,17 +174,20 @@ def main(argv=None) -> None:
                                use_relative_rope=True, max_temporal_ids=8, store_clean_only_self=True)
         out_root = Path(a.out)
         done = 0
-        for d in test_items(Path(a.staging), a.max_items):
+        items = test_items(Path(a.staging), a.max_items if not a.cross else max(a.max_items * 4, 16))
+        pairs = cross_pairs(items)[:a.max_items] if a.cross else [(d, d) for d in items]
+        for d, gd in pairs:
             meta = json.loads((d / "meta.json").read_text())
             dest = out_root / d.name
             result_path = dest / f"out_{a.name}.mp4"
             if result_path.exists():
                 continue
             dest.mkdir(parents=True, exist_ok=True)
-            item = BenchmarkItem(meta.get("category", "upper"), instruction(meta.get("category", "upper")), d / "source.mp4")
+            src = d / ("target.mp4" if a.cross else "source.mp4")
+            item = BenchmarkItem(meta.get("category", "upper"), instruction(meta.get("category", "upper")), src)
             generator = torch.Generator(device=device).manual_seed(a.seed)
             kwargs, source_pixels = build_pipeline_kwargs(item, args, cfg, generator)
-            ref = next(p for p in d.iterdir() if p.stem == "ref")
+            ref = next(p for p in gd.iterdir() if p.stem == "ref")
             kwargs["ref_image_latent"] = _ref_latent(pipeline, cfg, ref, kwargs["height"], kwargs["width"],
                                                      device, next(model.parameters()).dtype, ref_basesize)
             with torch.inference_mode():
@@ -175,7 +196,10 @@ def main(argv=None) -> None:
             if not (dest / "input.mp4").exists():
                 save_video(extract_video_tensor(source_pixels), str(dest / "input.mp4"), fps=cfg.fps)
                 shutil.copy(ref, dest / f"ref{ref.suffix}")
-                shutil.copy(d / "target.mp4", dest / "target.mp4")
+                if a.cross:
+                    (dest / "cross.json").write_text(json.dumps({"person": d.name, "garment": gd.name}))
+                else:
+                    shutil.copy(d / "target.mp4", dest / "target.mp4")
             done += 1
             print(json.dumps({"key": d.name, "model": a.name, "done": done}), flush=True)
     finally:

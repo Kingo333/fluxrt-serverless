@@ -313,3 +313,19 @@ def test_generate_vivid_fills_model_paths(tmp_path):
     assert got["JOYAI_VAE"] == str(ck / "vae")
     env2 = {"AZ_ROOT": str(tmp_path), "JOYAI_VAE": str(ck / "dit")}
     assert mod.default_model_env(env2)["JOYAI_VAE"] == str(ck / "dit")
+
+
+def test_generate_vivid_cross_pairs_same_category(tmp_path):
+    """--cross: real clip + another item's garment of the same category; lone categories skipped."""
+    import importlib.util as u
+    spec = u.spec_from_file_location("generate_vivid", SCRIPTS.parent / "eval" / "generate_vivid.py")
+    mod = u.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    items = []
+    for name, cat in [("a", "upper"), ("b", "lower"), ("c", "upper"), ("d", "dress")]:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "meta.json").write_text(json.dumps({"category": cat}))
+        items.append(d)
+    pairs = [(p.name, g.name) for p, g in mod.cross_pairs(items)]
+    assert pairs == [("a", "c"), ("c", "a")]
