@@ -27,7 +27,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eval.generate_vivid import test_items  # noqa: E402
+from eval.generate_vivid import cross_pairs, test_items  # noqa: E402
+
+
+def still_items(staging: Path, max_items: int) -> list[Path]:
+    """--stills: held-out still pairs (Glance) with a steady pseudo-source photo and a real target
+    photo. FluxRT edits one frame at a time, so a still with ground truth is its fairest test."""
+    out = []
+    for d in sorted(p for p in staging.iterdir() if p.is_dir()):
+        mp = d / "meta.json"
+        if not mp.exists() or not (d / "source.png").exists():
+            continue
+        if not any((d / f"target.{e}").exists() for e in ("png", "jpg", "jpeg")):
+            continue
+        meta = json.loads(mp.read_text())
+        if meta.get("split") == "test" and (meta.get("pseudo_source") or {}).get("ok", True):
+            out.append(d)
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def summarize(latencies_s: list[float], gpu_mem_gb: float | None) -> dict:
@@ -94,6 +112,10 @@ def main(argv=None) -> None:
     ap.add_argument("--ref-size", default="384x512")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--seed", type=int, default=52)
+    ap.add_argument("--cross", action="store_true",
+                    help="clips: input = the real clip (target.mp4) with another item's garment (steady input)")
+    ap.add_argument("--stills", action="store_true",
+                    help="still pairs (e.g. staging/glance_upper): pseudo-source photo in, real photo as target")
     a = ap.parse_args(argv)
 
     import shutil
@@ -111,15 +133,25 @@ def main(argv=None) -> None:
     torch.cuda.reset_peak_memory_stats()
     out_root = Path(a.out)
     latencies: list[float] = []
-    for d in test_items(Path(a.staging), a.max_items):
+    if a.stills:
+        pairs = [(d, d) for d in still_items(Path(a.staging), a.max_items)]
+    elif a.cross:
+        pairs = cross_pairs(test_items(Path(a.staging), max(a.max_items * 4, 16)))[:a.max_items]
+    else:
+        pairs = [(d, d) for d in test_items(Path(a.staging), a.max_items)]
+    ext = "png" if a.stills else "mp4"
+    for d, gd in pairs:
         meta = json.loads((d / "meta.json").read_text())
         dest = out_root / d.name
-        result = dest / f"out_{a.name}.mp4"
+        result = dest / f"out_{a.name}.{ext}"
         if result.exists():
             continue
         dest.mkdir(parents=True, exist_ok=True)
-        frames = [_cover(f, w, h) for f in _read_frames(d / "source.mp4", a.frames)]
-        ref_path = next(p for p in d.iterdir() if p.stem == "ref")
+        if a.stills:
+            frames = [_cover(Image.open(d / "source.png").convert("RGB"), w, h)] * 4  # 3 warm-up + 1 kept
+        else:
+            frames = [_cover(f, w, h) for f in _read_frames(d / ("target.mp4" if a.cross else "source.mp4"), a.frames)]
+        ref_path = next(p for p in gd.iterdir() if p.stem == "ref")
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
         prompt = fluxrt_prompt(meta.get("category"))
         outs = []
@@ -133,15 +165,25 @@ def main(argv=None) -> None:
             if i >= 3:
                 latencies.append(time.perf_counter() - t0)
             outs.append(img.convert("RGB").resize((w, h)))
-        _write_mp4(result, outs)
-        if not (dest / "input.mp4").exists():
-            _write_mp4(dest / "input.mp4", frames)
+        if a.stills:
+            outs[-1].save(result)
+        else:
+            _write_mp4(result, outs)
+        if not (dest / f"input.{ext}").exists():
+            if a.stills:
+                frames[0].save(dest / "input.png")
+                tgt = next(d / f"target.{e}" for e in ("png", "jpg", "jpeg") if (d / f"target.{e}").exists())
+                _cover(Image.open(tgt).convert("RGB"), w, h).save(dest / "target.png")
+            else:
+                _write_mp4(dest / "input.mp4", frames)
+                if a.cross:
+                    (dest / "cross.json").write_text(json.dumps({"person": d.name, "garment": gd.name}))
+                else:
+                    shutil.copy(d / "target.mp4", dest / "target.mp4")
             shutil.copy(ref_path, dest / f"ref{ref_path.suffix}")
-            shutil.copy(d / "target.mp4", dest / "target.mp4")
         perf = summarize(latencies, round(torch.cuda.max_memory_reserved() / 1e9, 2))
         (dest / f"perf_{a.name}.json").write_text(json.dumps(perf))
         print(json.dumps({"key": d.name, "model": a.name, **perf}), flush=True)
-
 
 if __name__ == "__main__":
     main()

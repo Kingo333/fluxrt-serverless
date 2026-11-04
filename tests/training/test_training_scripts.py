@@ -329,3 +329,19 @@ def test_generate_vivid_cross_pairs_same_category(tmp_path):
         items.append(d)
     pairs = [(p.name, g.name) for p, g in mod.cross_pairs(items)]
     assert pairs == [("a", "c"), ("c", "a")]
+
+
+def test_generate_fluxrt_still_items(tmp_path):
+    """--stills: only test-split pairs with a source.png and a real target photo."""
+    import sys as _s
+    _s.path.insert(0, str(SCRIPTS.parent))
+    from eval import generate_fluxrt as gf
+    for name, split, files in [("a", "test", ["source.png", "target.jpg"]), ("b", "train", ["source.png", "target.png"]),
+                               ("c", "test", ["target.png"]), ("d", "test", ["source.png", "target.png"])]:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "meta.json").write_text(json.dumps({"split": split, "category": "upper"}))
+        for f in files:
+            (d / f).write_bytes(b"x")
+    assert [p.name for p in gf.still_items(tmp_path, 10)] == ["a", "d"]
+    assert [p.name for p in gf.still_items(tmp_path, 1)] == ["a"]
