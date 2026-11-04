@@ -114,12 +114,15 @@ def main(argv=None) -> None:
     ap.add_argument("--models", nargs="+", default=["base", "exp2"])
     ap.add_argument("--height", type=int, default=320)
     ap.add_argument("--max-frames", type=int, default=96)
+    ap.add_argument("--require-all", action="store_true", help="skip clips missing any of --models")
     a = ap.parse_args(argv)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     every, n_all = None, 0
     for d in sorted(p for p in Path(a.results_dir).iterdir() if p.is_dir()):
         if not (d / "input.mp4").exists():
+            continue
+        if a.require_all and not all((d / f"out_{m}.mp4").exists() for m in a.models):
             continue
         w, n = None, 0
         for f in clip_frames(d, a.models, a.height, a.max_frames):

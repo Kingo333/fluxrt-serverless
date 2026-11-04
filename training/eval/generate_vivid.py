@@ -63,11 +63,29 @@ def default_model_env(env=os.environ) -> dict:
     return {k: env[k] for k in MODEL_ENV}
 
 
-def _ref_latent(pipeline, cfg, ref_path: Path, height: int, width: int, device, dtype):
+def _ref_pixels(ref_path: Path, basesize: int | None, height: int, width: int):
+    """Garment photo -> uint8 [c, h, w]. With a basesize: aspect-kept bucket resize + centre crop,
+    as training (webdataset ref_image_basesize) and the live server (basesize 768) do. Without:
+    stretched to the video size (what P9e did first)."""
+    import numpy as np
     import torch
     from PIL import Image
-    im = Image.open(ref_path).convert("RGB").resize((width, height), Image.BICUBIC)
-    x = torch.from_numpy(__import__("numpy").asarray(im).copy()).permute(2, 0, 1).float().div(127.5).sub(1.0)
+    im = Image.open(ref_path).convert("RGB")
+    if basesize:
+        from src.config import generate_video_image_bucket
+        from src.utils import _dynamic_resize_from_bucket
+        cfgs = generate_video_image_bucket(img_basesize=basesize, bs_img=1, bs_vid=0, bs_mimg=0, bs_mvid=0)
+        im, _ = _dynamic_resize_from_bucket(im, bucket_configs=cfgs, num_frames=1, num_items=1, return_bucket=True)
+    else:
+        im = im.resize((width, height), Image.BICUBIC)
+    if torch.is_tensor(im):
+        return im.clamp(0, 255).to(torch.uint8).reshape(-1, *im.shape[-2:])[:3]
+    return torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
+
+
+def _ref_latent(pipeline, cfg, ref_path: Path, height: int, width: int, device, dtype, basesize=None):
+    import torch
+    x = _ref_pixels(ref_path, basesize, height, width).float().div(127.5).sub(1.0)
     x = x.unsqueeze(1).unsqueeze(0).to(device=device, dtype=dtype)  # [1, c, t=1, h, w]
     with torch.inference_mode():
         if cfg.enable_denormalization:
@@ -88,7 +106,21 @@ def main(argv=None) -> None:
     ap.add_argument("--resolution", type=int, default=480)
     ap.add_argument("--num-frames", type=int, default=49)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--steps", type=int, help="denoising steps (default: the config's; live serving uses 2)")
+    ap.add_argument("--guidance", type=float, help="text guidance (default: the config's; live uses 1.0 = off)")
+    ap.add_argument("--source-guidance", type=float, default=1.0)
+    ap.add_argument("--neg-prompt", default="")
+    ap.add_argument("--ref-basesize", type=int, default=0,
+                    help="garment resize like training/serving (bucket, aspect kept); 0 = the config's "
+                         "ref_image_basesize, -1 = stretch to the video size (the first P9e runs)")
+    ap.add_argument("--live", action="store_true",
+                    help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768 "
+                         "(use with --ckpt the serving joyai_video_edit_dit_0811.pth)")
     a = ap.parse_args(argv)
+    if a.live:
+        a.steps = a.steps or 2
+        a.guidance = 1.0 if a.guidance is None else a.guidance
+        a.ref_basesize = a.ref_basesize or 768
     print("model paths:", default_model_env())
     Path(a.out).mkdir(parents=True, exist_ok=True)
 
@@ -115,8 +147,12 @@ def main(argv=None) -> None:
         model.requires_grad_(False).eval()
         pipeline = load_pipeline(cfg, model, device)
         pipeline.set_progress_bar_config(disable=True)
-        args = SimpleNamespace(resolution=a.resolution, num_frames=a.num_frames, neg_prompt="",
-                               num_inference_steps=None, guidance_scale=None, source_guidance_scale=1.0,
+        ref_basesize = None if a.ref_basesize < 0 else (a.ref_basesize or int(cfg.ref_image_basesize))
+        print(f"settings: steps={a.steps or cfg.num_inference_steps} guidance={a.guidance if a.guidance is not None else cfg.guidance_scale} "
+              f"source_guidance={a.source_guidance} ref_basesize={ref_basesize or 'stretch'} ckpt={a.ckpt}", flush=True)
+        args = SimpleNamespace(resolution=a.resolution, num_frames=a.num_frames, neg_prompt=a.neg_prompt,
+                               num_inference_steps=a.steps, guidance_scale=a.guidance,
+                               source_guidance_scale=a.source_guidance,
                                use_relative_rope=True, max_temporal_ids=8, store_clean_only_self=True)
         out_root = Path(a.out)
         done = 0
@@ -132,7 +168,7 @@ def main(argv=None) -> None:
             kwargs, source_pixels = build_pipeline_kwargs(item, args, cfg, generator)
             ref = next(p for p in d.iterdir() if p.stem == "ref")
             kwargs["ref_image_latent"] = _ref_latent(pipeline, cfg, ref, kwargs["height"], kwargs["width"],
-                                                     device, next(model.parameters()).dtype)
+                                                     device, next(model.parameters()).dtype, ref_basesize)
             with torch.inference_mode():
                 result = pipeline(**kwargs)
             save_video(extract_video_tensor(result[0, -1]), str(result_path), fps=cfg.fps)
