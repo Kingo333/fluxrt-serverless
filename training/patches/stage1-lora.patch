@@ -76,10 +76,10 @@ index 23bf36c..b9df677 100644
  
      lr_scheduler = get_scheduler(
 diff --git a/training/src/utils/checkpoint.py b/training/src/utils/checkpoint.py
-index 7b319c3..a77e91b 100644
+index 7b319c3..a27527d 100644
 --- a/training/src/utils/checkpoint.py
 +++ b/training/src/utils/checkpoint.py
-@@ -15,6 +15,49 @@ from src.utils.logging import get_logger
+@@ -15,6 +15,77 @@ from src.utils.logging import get_logger
  _SAVE_OPTIONS = StateDictOptions(full_state_dict=True, cpu_offload=True)
  _LOAD_OPTIONS = StateDictOptions(
      full_state_dict=True, broadcast_from_rank0=True)
@@ -124,12 +124,40 @@ index 7b319c3..a77e91b 100644
 +    return added
 +
 +
++def _canonical(name: str) -> str:
++    for seg in _WRAPPER_SEGMENTS:
++        name = name.replace(seg, "")
++    return name
++
++
++def _collect_lora(model, full_state: dict, adapter: str = "generator") -> dict:
++    """Azyah patch: the LoRA tensors in PEFT save format ('<module>.lora_A.weight').
++    PEFT's get_peft_model_state_dict returned an EMPTY dict on the FSDP full state dict, so
++    exp1 saved no weights at all. Take them straight from the full state dict (lora_ keys of
++    this adapter), and fall back to the trainable parameters if those keys are absent."""
++    tag = f".{adapter}."
++    out = {}
++    for k, v in full_state.items():
++        k = _canonical(k)
++        if (".lora_A" in k or ".lora_B" in k) and tag in k and hasattr(v, "shape"):
++            out[k.replace(tag, ".")] = v.detach().to("cpu").clone()
++    single = not (torch.distributed.is_available() and torch.distributed.is_initialized()
++                  and torch.distributed.get_world_size() > 1)
++    if not out and single:  # full_tensor() is collective: only safe when one process saves
++        for k, p in model.named_parameters():
++            k = _canonical(k)
++            if p.requires_grad and (".lora_A" in k or ".lora_B" in k) and tag in k:
++                t = p.full_tensor() if hasattr(p, "full_tensor") else p
++                out[k.replace(tag, ".")] = t.detach().to("cpu").clone()
++    return out
++
++
 +def _is_stage1_lora(model) -> bool:
 +    return bool(getattr(model, "_azyah_stage1_lora", False))
  
  
  def save_checkpoint(
-@@ -32,11 +75,34 @@ def save_checkpoint(
+@@ -32,11 +103,40 @@ def save_checkpoint(
      save_path = Path(save_dir / f"global_step{step}")
      save_path.mkdir(parents=True, exist_ok=True)
  
@@ -142,7 +170,6 @@ index 7b319c3..a77e91b 100644
 +    if _is_stage1_lora(model):
 +        # Azyah patch: save only the LoRA adapter (about 1 GB, not the 32.5 GB backbone),
 +        # in the Stage 2 generator_lora format.
-+        from peft.utils import get_peft_model_state_dict
 +        adapter_cfg = model.peft_config["generator"]
 +        targets = adapter_cfg.target_modules
 +        state_dict = {
@@ -151,7 +178,7 @@ index 7b319c3..a77e91b 100644
 +            "dmd_use_lora": True,
 +            "stage1_lora": True,
 +            "generator_adapter_name": "generator",
-+            "generator_lora": get_peft_model_state_dict(model, state_dict=full_state, adapter_name="generator"),
++            "generator_lora": _collect_lora(model, full_state, "generator"),
 +            "generator_lora_config": {
 +                "r": adapter_cfg.r,
 +                "lora_alpha": adapter_cfg.lora_alpha,
@@ -166,10 +193,17 @@ index 7b319c3..a77e91b 100644
 +            "model": full_state,
 +        }
 +    del full_state
++    if _is_stage1_lora(model) and global_rank <= 0:
++        n_lora = len(state_dict["generator_lora"])
++        n_a = sum(".lora_A" in k for k in state_dict["generator_lora"])
++        if n_lora == 0 or n_a == 0 or n_lora != 2 * n_a:
++            raise RuntimeError(f"Stage 1 LoRA save: {n_lora} adapter tensors ({n_a} lora_A); refusing to write a "
++                               "checkpoint without the adapter weights")
++        logger.info(f"Stage 1 LoRA save: {n_lora} adapter tensors ({n_a} layers)")
  
      if optimizer is not None:
          state_dict["optimizer"] = get_optimizer_state_dict(
-@@ -87,9 +153,24 @@ def load_checkpoint(
+@@ -87,9 +187,28 @@ def load_checkpoint(
      logger.info(f"Loading checkpoint from {checkpoint_path}")
      state_dict = torch.load(checkpoint_path, map_location="cpu")
  
@@ -177,8 +211,12 @@ index 7b319c3..a77e91b 100644
 +    if "generator_lora" in state_dict and "model" not in state_dict:
 +        # Azyah patch: resume a Stage 1 LoRA checkpoint (adapter weights only).
 +        from peft.utils.save_and_load import _insert_adapter_name_into_state_dict
++        if not state_dict["generator_lora"]:
++            raise RuntimeError(f"Stage 1 LoRA resume: {checkpoint_path} has NO adapter weights (empty generator_lora); "
++                               "it was written by the old save bug. Start a new AZ_EXP instead of resuming it.")
 +        named = _insert_adapter_name_into_state_dict(
 +            dict(state_dict["generator_lora"]), adapter_name="generator", parameter_prefix="lora_")
++        logger.info(f"Stage 1 LoRA resume: loading {len(named)} adapter tensors")
 +        result = set_model_state_dict(model, named, options=_LOAD_OPTIONS_PARTIAL)
 +        unexpected = list(getattr(result, "unexpected_keys", []) or [])
 +        if unexpected:

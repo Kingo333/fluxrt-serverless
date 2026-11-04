@@ -204,3 +204,66 @@ def test_lora_merge_accepts_adapter_names_and_wrappers():
     assert len(mod.find_lora({"generator_lora": {"x.lora_A.weight": a}})) == 1
     assert mod.find_lora({"step": 1, "optimizer": {"state": {}}}) == {}
     assert "top-level keys" in mod.describe({"step": 1, "model": {"k": a}})
+
+
+def _patched_functions():
+    """Run the patch's _canonical/_collect_lora with a stand-in torch (no GPU torch in CI)."""
+    import types
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    lines, on = [], False
+    for line in patch.splitlines():
+        if line.startswith("+_WRAPPER_SEGMENTS"):
+            on = True
+        if on and line.startswith("+def _fill_missing_optim_state"):
+            on = False  # skip this one; resume fill is tested on the GPU smoke
+            skip = True
+        if on:
+            lines.append(line[1:])
+    body = "\n".join(lines)
+    start = patch.index("+def _canonical(")
+    end = patch.index("+def _is_stage1_lora(")
+    body += "\n" + "\n".join(l[1:] for l in patch[start:end].splitlines() if l.startswith("+"))
+    dist = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: False, get_world_size=lambda: 1)
+    ns = {"torch": types.SimpleNamespace(distributed=dist)}
+    exec(body, ns)
+    return ns
+
+
+class _T:
+    def __init__(self, shape):
+        self.shape = shape
+    def detach(self):
+        return self
+    def to(self, _):
+        return self
+    def clone(self):
+        return self
+
+
+def test_stage1_lora_save_collects_adapter_tensors():
+    """P9e found exp1's generator_lora EMPTY: PEFT's helper returned {} on the FSDP state dict."""
+    ns = _patched_functions()
+    full = {
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_A.generator.weight": _T((64, 4096)),
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_B.generator.weight": _T((12288, 64)),
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.base_layer.weight": _T((12288, 4096)),
+    }
+    out = ns["_collect_lora"](None, full, "generator")
+    assert set(out) == {"double_blocks.0.img_attn_qkv.lora_A.weight", "double_blocks.0.img_attn_qkv.lora_B.weight"}
+
+    class _Model:  # full state dict without lora keys -> trainable params
+        def named_parameters(self):
+            yield "double_blocks.0.img_attn_qkv.lora_A.generator.weight", type("P", (_T,), {"requires_grad": True})((64, 4096))
+            yield "double_blocks.0.img_attn_qkv.base_layer.weight", type("P", (_T,), {"requires_grad": False})((1, 1))
+    out = ns["_collect_lora"](_Model(), {}, "generator")
+    assert set(out) == {"double_blocks.0.img_attn_qkv.lora_A.weight"}
+
+
+def test_stage1_lora_save_and_resume_refuse_empty_adapters():
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "refusing to write a" in patch and "has NO adapter weights" in patch
+    assert "get_peft_model_state_dict(model, state_dict=full_state" not in patch
+    sh = (Path(__file__).resolve().parents[2] / "training" / "scripts" / "run_first_session.sh").read_text()
+    assert "generator_lora" in sh  # smoke pass also checks the saved adapter tensors
