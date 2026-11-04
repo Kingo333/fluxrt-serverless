@@ -107,3 +107,51 @@ def test_fluxrt_eval_speed_summary():
     assert s["fps"] == 13.33 and s["latency_ms_p50"] == 75.0 and s["latency_ms_p95"] == 100.0
     assert s["gpu_mem_gb"] == 12.3 and s["frames"] == 4
     assert summarize([], None)["fps"] is None
+
+
+def test_target_metrics_and_no_mask():
+    """P9e had no mask.png: preservation must not show a fake 1.0; vs-target scores rank a copy of
+    the input below a correct try-on."""
+    inp = [person(Image.new("RGB", (W, H), (10, 160, 10)))] * 3
+    tgt = [person(REF)] * 3
+    good = metrics.score_clip(inp, tgt, REF, None, tgt)
+    lazy = metrics.score_clip(inp, inp, REF, None, tgt)
+    assert "preservation" not in good
+    assert lazy["change"] == 0.0 and good["change"] > 0.05
+    assert good["psnr_target"] > lazy["psnr_target"] and good["colour_target"] > lazy["colour_target"]
+
+
+def _mp4(path, frames):
+    import av
+    with av.open(str(path), "w") as c:
+        st = c.add_stream("libx264", rate=8)
+        st.width, st.height, st.pix_fmt = frames[0].width, frames[0].height, "yuv420p"
+        for im in frames:
+            for pkt in st.encode(av.VideoFrame.from_image(im)):
+                c.mux(pkt)
+        for pkt in st.encode():
+            c.mux(pkt)
+
+
+def test_grid_and_eval_on_p9e_layout(tmp_path):
+    import pytest
+    av = pytest.importorskip("av")
+    from eval import grid
+    for clip in ("vivid_test_000000", "vivid_test_000002"):
+        d = tmp_path / "p9e" / clip
+        d.mkdir(parents=True)
+        _mp4(d / "input.mp4", [person(Image.new("RGB", (W, H), (10, 160, 10)))] * 6)
+        _mp4(d / "target.mp4", [person(REF)] * 8)
+        _mp4(d / "out_base.mp4", [person(Image.new("RGB", (W, H), (10, 160, 10)))] * 6)
+        _mp4(d / "out_exp2.mp4", [person(REF)] * 6)
+        REF.save(d / "ref.jpg")
+    grid.main([str(tmp_path / "p9e"), str(tmp_path / "grid"), "--height", "80"])
+    with av.open(str(tmp_path / "grid" / "all.mp4")) as c:
+        n = sum(1 for _ in c.decode(c.streams.video[0]))
+        w = c.streams.video[0].width
+    assert n == 12 and w > 4 * 50
+    assert (tmp_path / "grid" / "vivid_test_000002.mp4").exists()
+    r = run_eval.evaluate(str(tmp_path / "p9e"))
+    s = r["summary"]
+    assert s["exp2"]["psnr_target"] > s["base"]["psnr_target"] and "preservation" not in s["exp2"]
+    assert "No mask.png" in run_eval.to_markdown(r)

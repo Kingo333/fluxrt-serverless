@@ -50,6 +50,7 @@ def evaluate(results_dir: str) -> dict:
     from PIL import Image
     per_clip: dict[str, dict] = {}
     per_model: dict[str, list[dict]] = defaultdict(list)
+    masked: list[bool] = []
     for d in sorted(p for p in Path(results_dir).iterdir() if p.is_dir()):
         inp, ref = _one(d, "input"), _one(d, "ref")
         if not (inp and ref):
@@ -57,12 +58,15 @@ def evaluate(results_dir: str) -> dict:
         mask_p = d / "mask.png"
         mask = Image.open(mask_p) if mask_p.exists() else None
         in_frames, ref_im = _frames(inp), Image.open(ref)
+        tgt = _one(d, "target")
+        tgt_frames = _frames(tgt) if tgt else None
+        masked.append(mask is not None)
         per_clip[d.name] = {}
         for out in sorted(d.glob("out_*")):
             model = out.stem[len("out_"):]
             out_frames = _frames(out)
             n = min(len(in_frames), len(out_frames))
-            s = score_clip(in_frames[:n], out_frames[:n], ref_im, mask)
+            s = score_clip(in_frames[:n], out_frames[:n], ref_im, mask, tgt_frames)
             perf = d / f"perf_{model}.json"
             if perf.exists():
                 s.update(json.loads(perf.read_text()))
@@ -72,20 +76,26 @@ def evaluate(results_dir: str) -> dict:
     for model, rows in per_model.items():
         keys = sorted({k for r in rows for k in r if isinstance(r[k], (int, float))})
         summary[model] = {"clips": len(rows), **{k: round(sum(r[k] for r in rows if k in r) / sum(1 for r in rows if k in r), 4) for k in keys}}
-    return {"summary": summary, "per_clip": per_clip}
+    return {"summary": summary, "per_clip": per_clip, "masked": all(masked) if masked else False}
 
 
 def to_markdown(result: dict) -> str:
     s = result["summary"]
     if not s:
         return "No results found.\n"
-    cols = ["clips", "garment_colour", "garment_detail", "preservation", "flicker", "fps", "latency_ms_p50", "gpu_mem_gb"]
+    cols = ["clips", "psnr_target", "colour_target", "change", "garment_colour", "garment_detail", "preservation",
+            "flicker", "fps", "latency_ms_p50", "gpu_mem_gb"]
     cols = [c for c in cols if any(c in v for v in s.values())]
     lines = ["| model | " + " | ".join(cols) + " |", "|---|" + "---|" * len(cols)]
     for model, v in sorted(s.items()):
         lines.append(f"| {model} | " + " | ".join(str(v.get(c, "—")) for c in cols) + " |")
     lines += ["", "Higher is better for garment_colour, preservation, fps; garment_detail best near 1.0; "
-              "lower is better for flicker, latency, memory. Metrics are proxies: confirm with the blinded review."]
+              "lower is better for flicker, latency, memory. psnr_target / colour_target compare with the real "
+              "ground truth (higher is better); change near 0 means the output is the input unchanged. "
+              "Metrics are proxies: confirm with the blinded review."]
+    if not result.get("masked", True):
+        lines += ["", "No mask.png in some clips: garment_colour / garment_detail use the whole frame there, "
+                  "and preservation is left out for them."]
     return "\n".join(lines) + "\n"
 
 

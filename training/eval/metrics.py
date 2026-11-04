@@ -10,6 +10,15 @@ Mask: white = garment area (from data_tools.masks / dataset masks).
   (1 - mean abs change outside the mask, higher is better)
 - flicker: extra frame-to-frame change in the garment area beyond what the input
   itself moved (lower is better; 0 = as steady as the input)
+
+With the real ground truth (target = the same person really wearing the garment):
+- psnr_target: whole-frame PSNR of the output vs the target, in dB (higher is better)
+- colour_target: colour-histogram match of the output vs the target (0..1, higher is better)
+- change: mean abs change of the output vs the input (0..1). Near 0 = the model did nothing.
+
+Without a mask the "garment area" is the whole frame: garment_colour and garment_detail then
+compare the full frame with the garment photo, and preservation has no outside area, so
+score_clip leaves preservation out instead of reporting a meaningless 1.0.
 """
 
 from __future__ import annotations
@@ -103,10 +112,38 @@ def flicker(input_frames, output_frames, mask) -> float:
     return float(max(0.0, (motion(output_frames) - motion(input_frames)).mean()))
 
 
-def score_clip(input_frames, output_frames, ref, mask) -> dict:
-    return {
+def psnr_target(output_frames, target_frames) -> float:
+    size = output_frames[0].size
+    vals = []
+    for o, t in zip(output_frames, target_frames):
+        mse = float(np.mean((_arr(o, size) - _arr(t, size)) ** 2))
+        vals.append(10.0 * np.log10(1.0 / max(mse, 1e-10)))
+    return float(np.mean(vals))
+
+
+def colour_target(output_frames, target_frames) -> float:
+    size = output_frames[0].size
+    scores = [1.0 - 0.5 * float(np.abs(_hist(_arr(o, size).reshape(-1, 3)) - _hist(_arr(t, size).reshape(-1, 3))).sum())
+              for o, t in zip(output_frames, target_frames)]
+    return float(np.mean(scores))
+
+
+def change(input_frames, output_frames) -> float:
+    size = output_frames[0].size
+    return float(np.mean([np.abs(_arr(i, size) - _arr(o, size)).mean() for i, o in zip(input_frames, output_frames)]))
+
+
+def score_clip(input_frames, output_frames, ref, mask, target_frames=None) -> dict:
+    out = {
         "garment_colour": round(garment_colour(output_frames, ref, mask), 4),
         "garment_detail": round(garment_detail(output_frames, ref, mask), 4),
-        "preservation": round(preservation(input_frames, output_frames, mask), 4),
         "flicker": round(flicker(input_frames, output_frames, mask), 4),
+        "change": round(change(input_frames, output_frames), 4),
     }
+    if mask is not None:
+        out["preservation"] = round(preservation(input_frames, output_frames, mask), 4)
+    if target_frames:
+        n = min(len(output_frames), len(target_frames))
+        out["psnr_target"] = round(psnr_target(output_frames[:n], target_frames[:n]), 3)
+        out["colour_target"] = round(colour_target(output_frames[:n], target_frames[:n]), 4)
+    return out
