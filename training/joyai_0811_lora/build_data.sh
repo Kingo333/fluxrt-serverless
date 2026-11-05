@@ -109,6 +109,8 @@ VIVID_SETS=()
 for v in "${VIVID_SETS[@]}"; do DIRS+=("$S/vivid_${v}_stills"); done
 LS+=(--remove-frac "$REMOVE_FRAC")
 
+SKIP_EDITS="${AZ_SKIP_EDITS:-0}"   # 1 = inputs are done: go straight to captions + packing (no editing model loads)
+if [ "$SKIP_EDITS" != "1" ]; then
 echo "== 1. live-way inputs (fixed garment photo of another item, ${REMOVE_FRAC} remove examples)"
 # One call per set so each has its own limit; the reference pool is every set (same category only).
 timeout -s INT 75m "${LS[@]}" "$S/glance_upper" --limit "$UPPER_LIMIT" || echo "UPPER_EXIT=$?"
@@ -126,6 +128,8 @@ if [ "$VIVID_CLIPS" = "1" ]; then
       --limit "$CLIPS_PER_CAT" || echo "CLIPS_${c}_EXIT=$?"
   done
 fi
+
+fi   # SKIP_EDITS
 
 echo "== 2. detail captions (MiMo-VL-7B-RL-2508, local; only pairs that have an input)"
 CAP_LIMIT="${AZ_CAPTION_LIMIT:-1500}"   # per set, ~1 s each; half the training captions use them anyway

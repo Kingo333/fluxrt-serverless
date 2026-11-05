@@ -123,10 +123,19 @@ def process(staging_dirs: list[str], editor, remove_frac: float = 0.25, limit: i
             max_frames: int | None = None) -> dict:
     from PIL import Image
     pool = build_pool(staging_dirs)
-    stats = {"done": 0, "rejected": 0, "skipped": 0, "with_extra_item": 0, "reasons": {}}
+    stats = {"done": 0, "rejected": 0, "skipped": 0, "with_extra_item": 0, "reasons": {}, "already": 0}
+    # --limit is the TOTAL per call (resume-safe): pairs that already got a live input, in a
+    # previous run, count towards it, so a re-run only finishes what is missing (3b resume,
+    # 2026-11-05, started a second round of 300 because the limit counted new items only).
     for sd in staging_dirs:
         for d, meta in iter_pairs(Path(sd)):
-            if limit is not None and stats["done"] + stats["rejected"] >= limit:
+            tgt = find(d, "target")
+            if meta.get("live_source") and tgt is not None and (videos or tgt.suffix != ".mp4") \
+                    and not (categories and meta.get("category") not in categories):
+                stats["already"] += 1
+    for sd in staging_dirs:
+        for d, meta in iter_pairs(Path(sd)):
+            if limit is not None and stats["already"] + stats["done"] + stats["rejected"] >= limit:
                 return stats
             tgt = find(d, "target")
             if meta.get("live_source") or tgt is None or (categories and meta.get("category") not in categories):

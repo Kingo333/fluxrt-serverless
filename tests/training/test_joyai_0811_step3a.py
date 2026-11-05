@@ -419,3 +419,16 @@ def test_trainpipe_engine_lengths_and_wiring():
     assert "setup_training_pod.sh" in bd and "make_fashion_config.py" in bd and "export AZ_MANIFEST_DIR=" in bd
     ls = (root / "data_tools" / "live_source.py").read_text()
     assert '"--engine", choices=["deploy", "trainpipe"]' in ls
+
+
+def test_live_source_limit_is_a_total_so_reruns_only_finish(tmp_path):
+    """3b resume started a second round: --limit must count inputs made in earlier runs."""
+    from data_tools import live_source as lsrc
+    for k in ("a", "b", "c", "d"):
+        _stage(tmp_path, k, "upper")
+    st = lsrc.process([str(tmp_path)], _FakeEditor(), remove_frac=0.0, limit=2)
+    assert st["done"] == 2
+    st2 = lsrc.process([str(tmp_path)], _FakeEditor(), remove_frac=0.0, limit=2)
+    assert st2["already"] == 2 and st2["done"] == 0
+    st3 = lsrc.process([str(tmp_path)], _FakeEditor(), remove_frac=0.0, limit=3)
+    assert st3["done"] == 1
