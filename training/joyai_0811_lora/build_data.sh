@@ -64,15 +64,34 @@ if [ "$AZ_PART" = "cpu" ]; then
 fi
 
 [ "$AZ_PART" = "gpu" ] || { echo "AZ_PART must be cpu or gpu"; exit 2; }
-PY=/opt/joyai-venv/bin/python
-[ -x "$PY" ] || { echo "no /opt/joyai-venv: start this Pod from the endpoint image (as P8 did)"; exit 1; }
 DIT="$(readlink -f "$(find "$C" -name joyai_video_edit_dit_0811.pth | head -1)")"
 case "$DIT" in "$AZ_ROOT"/*) ;; *) echo "REFUSING: 0811 clone not on the training volume ($DIT)"; exit 1 ;; esac
-export TORCHDYNAMO_DISABLE=1 JOYOMNI_LOW_VRAM=1 JOYOMNI_SAGE_ATTN=1 JOYOMNI_FP8_FAST_ACCUM=1 JOYOMNI_FP8_IMG=1 \
-  JOYOMNI_FP8_TXT=1 JOYOMNI_CUDA_GRAPH=1 JOYOMNI_WARMUP_ORIENTATION=portrait
-export TORCHINDUCTOR_CACHE_DIR="$AZ_ROOT/cache_p8/inductor" TRITON_CACHE_DIR="$AZ_ROOT/cache_p8/triton" \
-  CUDA_CACHE_PATH="$AZ_ROOT/cache_p8/nv" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export JOYAI_DEPLOY_DIR=/opt/JoyAI-Video-Edit/deploy PYTHONPATH="/opt/JoyAI-Video-Edit/deploy:$PWD"
+# AZ_ENGINE=trainpipe (recommended since 2026-11-05): JoyAI's training streaming pipeline with the
+# training venv on the volume, on the plain RunPod PyTorch template (starts in 1-2 min; the endpoint
+# image hung three Pods at "Initializing"). Same live settings as step 1 (generate_vivid --live).
+# AZ_ENGINE=deploy: the endpoint image's JoyAI runtime (/opt/joyai-venv), as P8 ran.
+ENGINE="${AZ_ENGINE:-deploy}"
+if [ "$ENGINE" = "trainpipe" ]; then
+  export SCRIPTS_URL="https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/scripts"
+  curl -fsSL "$SCRIPTS_URL/setup_training_pod.sh" | bash          # training venv + upstream patches (SDPA)
+  PY="$AZ_ROOT/venv/bin/python"
+  UP="$AZ_ROOT/JoyAI-Video-Edit/training"
+  "$PY" "$AZ_ROOT/azyah-code/training/scripts/make_fashion_config.py" "$UP"
+  export JOYAI_BASE_MODEL="$DIT" JOYAI_VAE="$C/vae" JOYAI_TEXT_ENCODER="$C/MiMo-VL-7B-RL-2508"
+  export PYTHONPATH="$UP:$AZ_ROOT/azyah-code/training" PATH="$AZ_ROOT/venv/bin:$PATH"
+  LS=("$AZ_ROOT/venv/bin/torchrun" --nproc_per_node 1 -m data_tools.live_source --dit "$DIT" --vae "$C/vae"
+      --text-encoder "$C/MiMo-VL-7B-RL-2508" --engine trainpipe --config "$UP/configs/azyah_fashion_stage1.py")
+else
+  PY=/opt/joyai-venv/bin/python
+  [ -x "$PY" ] || { echo "no /opt/joyai-venv: start this Pod from the endpoint image, or use AZ_ENGINE=trainpipe"; exit 1; }
+  export TORCHDYNAMO_DISABLE=1 JOYOMNI_LOW_VRAM=1 JOYOMNI_SAGE_ATTN=1 JOYOMNI_FP8_FAST_ACCUM=1 JOYOMNI_FP8_IMG=1 \
+    JOYOMNI_FP8_TXT=1 JOYOMNI_CUDA_GRAPH=1 JOYOMNI_WARMUP_ORIENTATION=portrait
+  export TORCHINDUCTOR_CACHE_DIR="$AZ_ROOT/cache_p8/inductor" TRITON_CACHE_DIR="$AZ_ROOT/cache_p8/triton" \
+    CUDA_CACHE_PATH="$AZ_ROOT/cache_p8/nv" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export JOYAI_DEPLOY_DIR=/opt/JoyAI-Video-Edit/deploy PYTHONPATH="/opt/JoyAI-Video-Edit/deploy:$PWD"
+  LS=("$PY" -m data_tools.live_source --dit "$DIT" --vae "$C/vae" --text-encoder "$C/MiMo-VL-7B-RL-2508")
+fi
+cd "$AZ_ROOT/azyah-code/training"
 if [ "$VIVID_STILLS" = "1" ]; then
   echo "== 0. ViViD top and bottom stills (one steady real frame per train clip; research-only)"
   "$PY" -c "import av" 2>/dev/null || "$PY" -m pip install -q av
@@ -85,22 +104,22 @@ VIVID_SETS=()
 [ "$VIVID_STILLS" = "1" ] && [ -d "$S/vivid_upper_stills" ] && VIVID_SETS+=("upper")
 [ "$VIVID_STILLS" = "1" ] && [ -d "$S/vivid_lower_stills" ] && VIVID_SETS+=("lower")
 for v in "${VIVID_SETS[@]}"; do DIRS+=("$S/vivid_${v}_stills"); done
-LS=(-m data_tools.live_source --dit "$DIT" --vae "$C/vae" --text-encoder "$C/MiMo-VL-7B-RL-2508" --remove-frac "$REMOVE_FRAC")
+LS+=(--remove-frac "$REMOVE_FRAC")
 
 echo "== 1. live-way inputs (fixed garment photo of another item, ${REMOVE_FRAC} remove examples)"
 # One call per set so each has its own limit; the reference pool is every set (same category only).
-timeout -s INT 75m "$PY" "${LS[@]}" "$S/glance_upper" --limit "$UPPER_LIMIT" || echo "UPPER_EXIT=$?"
-timeout -s INT 75m "$PY" "${LS[@]}" "$S/glance_lower" --limit "$LOWER_LIMIT" || echo "LOWER_EXIT=$?"
+timeout -s INT 75m "${LS[@]}" "$S/glance_upper" --limit "$UPPER_LIMIT" || echo "UPPER_EXIT=$?"
+timeout -s INT 75m "${LS[@]}" "$S/glance_lower" --limit "$LOWER_LIMIT" || echo "LOWER_EXIT=$?"
 for v in "${VIVID_SETS[@]}"; do
   case "$v" in dress) lim="$DRESS_LIMIT" ;; upper) lim="$VUPPER_LIMIT" ;; *) lim="$VLOWER_LIMIT" ;; esac
-  timeout -s INT 45m "$PY" "${LS[@]}" "$S/vivid_${v}_stills" --limit "$lim" || echo "VIVID_${v}_EXIT=$?"
+  timeout -s INT 45m "${LS[@]}" "$S/vivid_${v}_stills" --limit "$lim" || echo "VIVID_${v}_EXIT=$?"
 done
 
 if [ "$VIVID_CLIPS" = "1" ]; then
   echo "== 1b. real-motion clips: ViViD train clips, inputs made the live way (${CLIPS_PER_CAT} per category, 97 frames)"
   for c in dress upper lower; do
-    timeout -s INT 40m "$PY" -m data_tools.live_source "$S/vivid" --dit "$DIT" --vae "$C/vae" \
-      --text-encoder "$C/MiMo-VL-7B-RL-2508" --remove-frac 0 --videos --categories "$c" --max-frames 97 \
+    LSV=("${LS[@]}"); LSV[${#LSV[@]}-1]=0   # last arg of LS is the remove fraction: none for clips
+    timeout -s INT 40m "${LSV[@]}" "$S/vivid" --videos --categories "$c" --max-frames 97 \
       --limit "$CLIPS_PER_CAT" || echo "CLIPS_${c}_EXIT=$?"
   done
 fi

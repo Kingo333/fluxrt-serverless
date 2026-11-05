@@ -406,3 +406,16 @@ def test_scripts_wire_real_motion_clips():
     assert "--only-live-source --split train" in bd and "vivid_clips_live.catalog.json" in bd
     assert "--clip-repeat" in rt and 'CLIP_REPEAT="${AZ_CLIP_REPEAT:-3}"' in rt
     assert "--motion-first 4" in ev and "motion_keys.txt" in ev
+
+
+def test_trainpipe_engine_lengths_and_wiring():
+    """3b without the endpoint image (it hung three Pods): JoyAI's training pipeline, PyTorch template."""
+    from data_tools import train_pipe_editor as tpe
+    assert [tpe.clip_len(n) for n in (1, 9, 10, 97, 100)] == [9, 9, 9, 97, 97]
+    assert tpe.fit_frames([1, 2], 4) == [1, 2, 2, 2] and tpe.fit_frames([1, 2, 3], 2) == [1, 2]
+    root = Path(__file__).resolve().parents[2] / "training"
+    bd = (root / "joyai_0811_lora" / "build_data.sh").read_text()
+    assert 'ENGINE="${AZ_ENGINE:-deploy}"' in bd and "--engine trainpipe --config" in bd
+    assert "setup_training_pod.sh" in bd and "make_fashion_config.py" in bd
+    ls = (root / "data_tools" / "live_source.py").read_text()
+    assert '"--engine", choices=["deploy", "trainpipe"]' in ls

@@ -192,8 +192,18 @@ def main() -> None:
     ap.add_argument("--videos", action="store_true", help="also clip targets (ViViD; owner opt-in, research-only)")
     ap.add_argument("--categories", nargs="*", help="only these categories (e.g. dress)")
     ap.add_argument("--max-frames", type=int, help="clips: edit only the first N frames (97 = 1 + 12 chunks)")
+    ap.add_argument("--engine", choices=["deploy", "trainpipe"], default="deploy",
+                    help="deploy = the endpoint image's JoyAI runtime (/opt/joyai-venv); trainpipe = JoyAI's training "
+                         "streaming pipeline with the training venv (plain PyTorch template; run under torchrun)")
+    ap.add_argument("--config", help="--engine trainpipe: the fashion config (make_fashion_config.py output)")
     a = ap.parse_args()
-    editor = JoyAIEditor(a.dit, a.vae, a.text_encoder)
+    if a.engine == "trainpipe":
+        from .train_pipe_editor import TrainPipeEditor
+        if not a.config:
+            raise SystemExit("--engine trainpipe needs --config")
+        editor = TrainPipeEditor(a.dit, a.config)
+    else:
+        editor = JoyAIEditor(a.dit, a.vae, a.text_encoder)
     stats = process(a.staging_dirs, editor, a.remove_frac, a.limit, videos=a.videos,
                     categories=set(a.categories) if a.categories else None, max_frames=a.max_frames)
     print(json.dumps(stats, indent=2))
