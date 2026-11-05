@@ -197,3 +197,18 @@ def test_shoe_set_and_pairs_mode(tmp_path):
     a = np.asarray(z)
     assert a[:60].max() == 0 and a[60:].min() == 255 and gf.item_zone_mask("tops", 40, 80) is None
     assert make_shoe_set.build(str(tmp_path / "shoes"), str(s), persons=str(persons))["kept"] == 1
+
+
+def test_still_grid_review_sheet(tmp_path):
+    from eval import grid
+    for k in range(4):
+        d = tmp_path / "shoes" / f"shoe_0{k}"
+        d.mkdir(parents=True)
+        person(REF).save(d / "input.png")
+        REF.save(d / "ref.jpg")
+        person(REF).save(d / "out_base.png")
+        person(REF).save(d / "out_lora.png")
+    grid.main([str(tmp_path / "shoes"), str(tmp_path / "g"), "--models", "base", "lora", "--height", "60", "--max-items", "3"])
+    sheet = Image.open(tmp_path / "g" / "all.png")
+    assert sheet.height == 3 * (60 + grid.LABEL_H) and (tmp_path / "g" / "shoe_02.png").exists()
+    assert not (tmp_path / "g" / "shoe_03.png").exists()

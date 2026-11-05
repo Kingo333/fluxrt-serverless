@@ -56,7 +56,7 @@ echo "GEN_DONE models: ${MODELS[*]}"
 cd "$A"
 "$PY" -c "import cv2" 2>/dev/null || "$AZ_ROOT/venv/bin/pip" install -q opencv-python-headless || true   # face_keep
 "$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md" --ref live0811; cat "$OUT/report.md"
-"$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all
+"$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all --max-items 8   # owner reviews 5-10 items; all 16 are scored in report.md
 echo "grid videos: ${OUT}_grid (all.mp4 = every clip; panels: input | garment | ${MODELS[*]})"
 REG="${OUT}_regression"
 mkdir -p "$REG"
