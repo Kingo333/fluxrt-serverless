@@ -57,6 +57,38 @@ def cross_pairs(items: list[Path]) -> list[tuple[Path, Path]]:
     return out
 
 
+def fixed_pairs(staging: Path, pairs_dir: Path) -> list[tuple[Path, Path]]:
+    """--pairs-from: the (person clip, garment) pairs of an earlier --cross run, read from its
+    <clip>/cross.json files, so a regression set keeps exactly the same garments (step 1)."""
+    out = []
+    for cj in sorted(Path(pairs_dir).glob("*/cross.json")):
+        rec = json.loads(cj.read_text())
+        p, g = staging / rec.get("person", ""), staging / rec.get("garment", "")
+        if (p / "meta.json").exists() and (g / "meta.json").exists():
+            out.append((p, g))
+    return out
+
+
+def fill_pairs(fixed: list[tuple[Path, Path]], candidates: list[tuple[Path, Path]], n: int) -> list[tuple[Path, Path]]:
+    """The fixed pairs first, then more cross pairs (new person clips only), taking categories in
+    turn (upper, lower, dress, ...) so the extra clips mix garment types, up to n in total."""
+    out = list(fixed)
+    used = {p.name for p, _ in out}
+    by_cat: dict[str, list[tuple[Path, Path]]] = {}
+    for p, g in candidates:
+        if p.name not in used:
+            cat = json.loads((p / "meta.json").read_text()).get("category", "upper")
+            by_cat.setdefault(cat, []).append((p, g))
+    cats = sorted(by_cat)
+    while len(out) < n and any(by_cat[c] for c in cats):
+        for c in cats:
+            if by_cat[c] and len(out) < n:
+                pair = by_cat[c].pop(0)
+                out.append(pair)
+                used.add(pair[0].name)
+    return out
+
+
 # Same defaults as training/scripts/common.sh. The config reads these; unset, it falls back to
 # relative "checkpoints/..." paths and transformers tries them as Hub repos (P9e: HF 401 for
 # checkpoints/vae).
@@ -131,6 +163,8 @@ def main(argv=None) -> None:
     ap.add_argument("--cross", action="store_true",
                     help="input = the REAL clip (target.mp4) with another item's garment photo; no ground "
                          "truth, but steady real input like the app (the P8 pseudo-source videos flicker)")
+    ap.add_argument("--pairs-from", help="with --cross: start with the exact pairs of an earlier --cross run "
+                                         "(its <clip>/cross.json), then fill up to --max-items across categories")
     ap.add_argument("--live", action="store_true",
                     help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768, and the "
                          "app's full instruction (garment name + description) "
@@ -181,8 +215,14 @@ def main(argv=None) -> None:
                                use_relative_rope=True, max_temporal_ids=8, store_clean_only_self=True)
         out_root = Path(a.out)
         done = 0
+        if a.pairs_from:
+            a.cross = True
         items = test_items(Path(a.staging), a.max_items if not a.cross else max(a.max_items * 4, 16))
-        pairs = cross_pairs(items)[:a.max_items] if a.cross else [(d, d) for d in items]
+        if a.pairs_from:
+            pairs = fill_pairs(fixed_pairs(Path(a.staging), Path(a.pairs_from)), cross_pairs(items), a.max_items)
+            print(f"pairs: {len(pairs)} ({', '.join(p.name + '+' + g.name for p, g in pairs[:4])}, ...)", flush=True)
+        else:
+            pairs = cross_pairs(items)[:a.max_items] if a.cross else [(d, d) for d in items]
         for d, gd in pairs:
             meta = json.loads((d / "meta.json").read_text())
             dest = out_root / d.name

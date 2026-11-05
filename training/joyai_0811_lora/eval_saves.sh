@@ -7,6 +7,13 @@
 #     AZ_REF=<SHA> AZ_EXP=joyai0811-exp1 bash
 # Each save is fused onto 0811 at load (generate_vivid --base), so no 32 GB merged files are written.
 # Writes $AZ_ROOT/eval/joyai0811_<exp>/ (clips, report.md, grid videos). Re-running skips finished clips.
+#
+# Step 3a: 16 clips (AZ_EVAL_ITEMS) that always start with the owner's regression set from step 1,
+# with the SAME garments (--pairs-from the step 1 run: vivid_test_000000 belt, 000002 bow collar +
+# print + doubled bag, 000010 ruffles/rib/hem, 000029), then 12 more across categories.
+# Models: live0811 (baseline), live0811_ref1024 (same model, garment photo at basesize 1024: the
+# resolution experiment; serving stays 768 unless the owner approves a change), then every save.
+# Grids: all clips at 320 px, and the regression set at full height (832 px) for detail.
 set -euo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
 export AZ_REF
@@ -15,7 +22,9 @@ export SCRIPTS_URL="$RAW/scripts"
 source <(curl -fsSL "$RAW/scripts/common.sh")
 : "${AZ_EXP:?set AZ_EXP to the trained experiment}"
 export AZ_MANIFEST_DIR="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/research-train}"
-ITEMS="${AZ_EVAL_ITEMS:-4}"
+ITEMS="${AZ_EVAL_ITEMS:-16}"
+PAIRS_FROM="${AZ_PAIRS_FROM:-$AZ_ROOT/eval/p9e_cross}"   # step 1's --cross run (cross.json per clip)
+REGRESSION="${AZ_REGRESSION_KEYS:-vivid_test_000000 vivid_test_000002 vivid_test_000010 vivid_test_000029}"
 EXP_DIR="$AZ_OUT/joyai0811_lora/${AZ_EXP}_sp1_world1"
 OUT="$AZ_ROOT/eval/joyai0811_${AZ_EXP}"
 PY="$AZ_ROOT/venv/bin/python"
@@ -32,9 +41,11 @@ cd "$AZ_UPSTREAM/training"
 export PYTHONPATH="$PWD:$A" PATH="$AZ_ROOT/venv/bin:$PATH"
 G=(torchrun --nproc_per_node 1 -m eval.generate_vivid --config configs/azyah_fashion_stage1.py
    --staging "$AZ_DATA/staging/vivid" --out "$OUT" --max-items "$ITEMS" --live --cross)
+[ -d "$PAIRS_FROM" ] && G+=(--pairs-from "$PAIRS_FROM") || echo "WARNING: $PAIRS_FROM missing; regression pairs not fixed"
 
-MODELS=(live0811)
+MODELS=(live0811 live0811_ref1024)
 "${G[@]}" --ckpt "$BASE" --name live0811
+"${G[@]}" --ckpt "$BASE" --name live0811_ref1024 --ref-basesize 1024
 for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
   step="$(basename "$ck" .pth)"; step="${step#step_}"
   "${G[@]}" --ckpt "$ck" --base "$BASE" --name "lora$step"
@@ -45,3 +56,8 @@ cd "$A"
 "$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md"; cat "$OUT/report.md"
 "$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all
 echo "grid videos: ${OUT}_grid (all.mp4 = every clip; panels: input | garment | ${MODELS[*]})"
+REG="${OUT}_regression"
+mkdir -p "$REG"
+for k in $REGRESSION; do [ -d "$OUT/$k" ] && ln -sfn "$OUT/$k" "$REG/$k"; done
+"$PY" -m eval.grid "$REG" "${OUT}_regression_grid" --models "${MODELS[@]}" --require-all --height 832
+echo "regression grids (832 px): ${OUT}_regression_grid ($REGRESSION)"
