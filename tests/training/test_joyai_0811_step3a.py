@@ -327,7 +327,7 @@ def test_scripts_wire_the_owner_decisions():
     assert "joyai0811-commercial-train" in bd and "joyai0811-research-train" in bd and "--mode research" in bd
     assert "REFUSING" in bd and "--backend mimo" in bd and "timeout -s INT" in bd
     rt = (PKG / "run_train.sh").read_text()
-    assert 'WITH_VIVID_DRESSES="${AZ_WITH_VIVID_DRESSES:-1}"' in rt and "joyai0811-commercial-train" in rt
+    assert 'WITH_VIVID_DRESSES="${AZ_WITH_VIVID:-${AZ_WITH_VIVID_DRESSES:-1}}"' in rt and 'VIVID_STILLS="${AZ_VIVID_STILLS:-1}"' in bd and 'vivid_upper_stills' in rt and "joyai0811-commercial-train" in rt
     assert 'AZ_MASK_DIR="$DATA/masks"' in rt and "--detail-oversample" in rt and "eval/metrics.py" in rt
     assert 'AZ_DETAIL_CAPTION_FRAC:-${AZ_DETAILED_CAPTION_PROB:-0.5}' in rt and "joyai_0811_lora/losses.py" in rt
     ev = (PKG / "eval_saves.sh").read_text()

@@ -19,14 +19,17 @@ RAW="${RAW_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ
 export SCRIPTS_URL="$RAW/scripts"
 echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$RAW/scripts/common.sh")
-WITH_VIVID_DRESSES="${AZ_WITH_VIVID_DRESSES:-1}"
+# AZ_WITH_VIVID (or the older name AZ_WITH_VIVID_DRESSES): 1 = research manifest with the ViViD
+# real-frame stills (dresses, tops, bottoms); 0 = the commercial-clean Glance-only LoRA.
+WITH_VIVID_DRESSES="${AZ_WITH_VIVID:-${AZ_WITH_VIVID_DRESSES:-1}}"
 if [ "$WITH_VIVID_DRESSES" = "1" ]; then
   SRC_MANIFESTS="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/joyai0811-research-train}"; DATA_MODE="${AZ_DATA_MODE:-research}"
 else
   SRC_MANIFESTS="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/joyai0811-commercial-train}"; DATA_MODE="${AZ_DATA_MODE:-commercial}"
 fi
 [ -f "$SRC_MANIFESTS/i2i.json" ] || { echo "no $SRC_MANIFESTS/i2i.json: run build_data.sh (step 3b) first"; exit 1; }
-STAGING_DIRS=("$AZ_DATA/staging/glance_upper" "$AZ_DATA/staging/glance_lower" "$AZ_DATA/staging/vivid_dress_stills")
+STAGING_DIRS=("$AZ_DATA/staging/glance_upper" "$AZ_DATA/staging/glance_lower" "$AZ_DATA/staging/vivid_dress_stills"
+              "$AZ_DATA/staging/vivid_upper_stills" "$AZ_DATA/staging/vivid_lower_stills")
 
 export AZ_EXP="${AZ_EXP:-joyai0811-lora}"
 export AZ_MAX_STEPS="${AZ_MAX_STEPS:-1000}"

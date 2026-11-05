@@ -22,9 +22,14 @@ export AZ_ROOT="${AZ_ROOT:-/workspace/azyah-vton}"
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 C="$AZ_ROOT/checkpoints"; S="$AZ_ROOT/data/staging"; D="$AZ_ROOT/data"; M="$AZ_ROOT/manifests"
 VIVID_DRESSES="${AZ_VIVID_DRESSES:-1}"
-UPPER_LIMIT="${AZ_LIVE_UPPER:-1200}"     # live-way inputs per Glance set (~3 s each on a PRO 6000)
-LOWER_LIMIT="${AZ_LIVE_LOWER:-1200}"
+UPPER_LIMIT="${AZ_LIVE_UPPER:-800}"      # live-way inputs per Glance set (~3 s each on a PRO 6000)
+LOWER_LIMIT="${AZ_LIVE_LOWER:-800}"
 DRESS_LIMIT="${AZ_VIVID_DRESS_LIMIT:-400}"
+# Owner decision 2026-11-05: ViViD tops and bottoms too (real frames as targets, inputs made the
+# live way). Research-only like the dresses; AZ_VIVID_STILLS=0 keeps only the dresses.
+VIVID_STILLS="${AZ_VIVID_STILLS:-1}"
+VUPPER_LIMIT="${AZ_VIVID_UPPER_LIMIT:-600}"
+VLOWER_LIMIT="${AZ_VIVID_LOWER_LIMIT:-343}"
 REMOVE_FRAC="${AZ_REMOVE_FRAC:-0.25}"
 GLANCE_REV=7ae72513413932dbfdb15d02c924f3be9739b0c4
 mkdir -p "$AZ_ROOT/reports"
@@ -63,17 +68,28 @@ export TORCHDYNAMO_DISABLE=1 JOYOMNI_LOW_VRAM=1 JOYOMNI_SAGE_ATTN=1 JOYOMNI_FP8_
 export TORCHINDUCTOR_CACHE_DIR="$AZ_ROOT/cache_p8/inductor" TRITON_CACHE_DIR="$AZ_ROOT/cache_p8/triton" \
   CUDA_CACHE_PATH="$AZ_ROOT/cache_p8/nv" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export JOYAI_DEPLOY_DIR=/opt/JoyAI-Video-Edit/deploy PYTHONPATH="/opt/JoyAI-Video-Edit/deploy:$PWD"
+if [ "$VIVID_STILLS" = "1" ]; then
+  echo "== 0. ViViD top and bottom stills (one steady real frame per train clip; research-only)"
+  "$PY" -c "import av" 2>/dev/null || "$PY" -m pip install -q av
+  [ -d "$S/vivid_upper_stills" ] || "$PY" -m data_tools.vivid_stills "$S/vivid" "$S/vivid_upper_stills" --category upper --limit "$VUPPER_LIMIT"
+  [ -d "$S/vivid_lower_stills" ] || "$PY" -m data_tools.vivid_stills "$S/vivid" "$S/vivid_lower_stills" --category lower --limit "$VLOWER_LIMIT"
+fi
 DIRS=("$S/glance_upper" "$S/glance_lower")
-[ "$VIVID_DRESSES" = "1" ] && [ -d "$S/vivid_dress_stills" ] && DIRS+=("$S/vivid_dress_stills")
+VIVID_SETS=()
+[ "$VIVID_DRESSES" = "1" ] && [ -d "$S/vivid_dress_stills" ] && VIVID_SETS+=("dress")
+[ "$VIVID_STILLS" = "1" ] && [ -d "$S/vivid_upper_stills" ] && VIVID_SETS+=("upper")
+[ "$VIVID_STILLS" = "1" ] && [ -d "$S/vivid_lower_stills" ] && VIVID_SETS+=("lower")
+for v in "${VIVID_SETS[@]}"; do DIRS+=("$S/vivid_${v}_stills"); done
 LS=(-m data_tools.live_source --dit "$DIT" --vae "$C/vae" --text-encoder "$C/MiMo-VL-7B-RL-2508" --remove-frac "$REMOVE_FRAC")
 
 echo "== 1. live-way inputs (fixed garment photo of another item, ${REMOVE_FRAC} remove examples)"
 # One call per set so each has its own limit; the reference pool is every set (same category only).
 timeout -s INT 75m "$PY" "${LS[@]}" "$S/glance_upper" --limit "$UPPER_LIMIT" || echo "UPPER_EXIT=$?"
 timeout -s INT 75m "$PY" "${LS[@]}" "$S/glance_lower" --limit "$LOWER_LIMIT" || echo "LOWER_EXIT=$?"
-if [ "$VIVID_DRESSES" = "1" ] && [ -d "$S/vivid_dress_stills" ]; then
-  timeout -s INT 30m "$PY" "${LS[@]}" "$S/vivid_dress_stills" --limit "$DRESS_LIMIT" || echo "DRESS_EXIT=$?"
-fi
+for v in "${VIVID_SETS[@]}"; do
+  case "$v" in dress) lim="$DRESS_LIMIT" ;; upper) lim="$VUPPER_LIMIT" ;; *) lim="$VLOWER_LIMIT" ;; esac
+  timeout -s INT 45m "$PY" "${LS[@]}" "$S/vivid_${v}_stills" --limit "$lim" || echo "VIVID_${v}_EXIT=$?"
+done
 
 echo "== 2. detail captions (MiMo-VL-7B-RL-2508, local; only pairs that have an input)"
 CAP_LIMIT="${AZ_CAPTION_LIMIT:-1500}"   # per set, ~1 s each; half the training captions use them anyway
@@ -87,10 +103,13 @@ echo "== 3. pack (live_source preferred) + manifests"
 "$PY" -m data_tools.pack "$S/glance_lower" "$D/shards" --name glance_lower_live --prefer-live-source
 "$PY" -m data_tools.manifests "$D/shards/glance_upper_live.catalog.json" "$D/shards/glance_lower_live.catalog.json" \
   --out "$M/joyai0811-commercial-train" --mode commercial --split train
-if [ "$VIVID_DRESSES" = "1" ] && [ -d "$S/vivid_dress_stills" ]; then
-  "$PY" -m data_tools.pack "$S/vivid_dress_stills" "$D/shards" --name vivid_dress_live --prefer-live-source
-  "$PY" -m data_tools.manifests "$D/shards/glance_upper_live.catalog.json" "$D/shards/glance_lower_live.catalog.json" \
-    "$D/shards/vivid_dress_live.catalog.json" --out "$M/joyai0811-research-train" --mode research --split train
+if [ "${#VIVID_SETS[@]}" -gt 0 ]; then
+  CATS=("$D/shards/glance_upper_live.catalog.json" "$D/shards/glance_lower_live.catalog.json")
+  for v in "${VIVID_SETS[@]}"; do
+    "$PY" -m data_tools.pack "$S/vivid_${v}_stills" "$D/shards" --name "vivid_${v}_live" --prefer-live-source
+    CATS+=("$D/shards/vivid_${v}_live.catalog.json")
+  done
+  "$PY" -m data_tools.manifests "${CATS[@]}" --out "$M/joyai0811-research-train" --mode research --split train
 fi
 for m in "$M/joyai0811-commercial-train" "$M/joyai0811-research-train"; do
   [ -f "$m/selection.json" ] && { echo "== $m"; cat "$m/selection.json"; }

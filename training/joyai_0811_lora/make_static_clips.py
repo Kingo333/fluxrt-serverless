@@ -214,7 +214,8 @@ def allowed(source: str, mode: str) -> bool:
 
 def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, mode: str = "research",
           vivid_videos: bool = False, seed: int = 0, per_shard: int = 250,
-          staging_dirs: list[str] | None = None, detail_oversample: int = 2) -> dict:
+          staging_dirs: list[str] | None = None, detail_oversample: int = 2,
+          prefer_sources: tuple[str, ...] = ("vivid",)) -> dict:
     if frames < 9 or (frames - 1) % 8:
         raise SystemExit("--frames must be 8n+1 and at least 9 (the VAE's time factor is 8)")
     if mode not in ("research", "commercial"):
@@ -222,9 +223,12 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
     mdir, out_dir = Path(manifest_dir), Path(out)
     stills = [(k, f, j) for k, f, j in iter_manifest(mdir, "i2i")]
     random.Random(seed).shuffle(stills)
+    # Real-frame sources first (owner 2026-11-05: P8L showed synthetic Glance-only data pulls real
+    # people toward the synthetic look), then the rest up to max_items; order within each stays random.
+    stills.sort(key=lambda t: 0 if t[2].get("metadata", {}).get("source", "") in prefer_sources else 1)
     by_source: dict[str, list[Sample]] = defaultdict(list)
     counts = {"stills_seen": len(stills), "static_clips": 0, "skipped": 0, "dropped_by_mode": 0, "vivid_videos": 0,
-              "masks": 0, "oversampled_extra": 0}
+              "masks": 0, "oversampled_extra": 0, "by_source": {}}
     index = staging_index(staging_dirs)
     scores: dict[str, float] = {}
     built: list[Sample] = []
@@ -240,6 +244,7 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
             counts["skipped"] += 1
             continue
         built.append(s)
+        counts["by_source"][src] = counts["by_source"].get(src, 0) + 1
         scores[s.key] = detail_score(_pick(files, "0"))
         mask = staged_mask(index, key)
         if mask is not None:
@@ -299,9 +304,11 @@ def main(argv=None) -> dict:
     ap.add_argument("--per-shard", type=int, default=250)
     ap.add_argument("--staging-dirs", nargs="*", default=[], help="staged pair folders (for mask.png)")
     ap.add_argument("--detail-oversample", type=int, default=2, help="repeat the most detailed third N times (1 = off)")
+    ap.add_argument("--prefer-source", nargs="*", default=["vivid"],
+                    help="sources taken first, before the rest fills --max (real frames first; empty = random)")
     a = ap.parse_args(argv)
     summary = build(a.manifest_dir, a.out, a.frames, a.max, a.mode, a.vivid_videos, a.seed, a.per_shard,
-                    a.staging_dirs, a.detail_oversample)
+                    a.staging_dirs, a.detail_oversample, tuple(a.prefer_source))
     print(json.dumps(summary, indent=2))
     return summary
 

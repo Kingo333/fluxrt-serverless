@@ -329,3 +329,15 @@ def test_generate_vivid_can_fuse_a_save_and_sends_the_full_instruction():
     src = (ROOT / "eval" / "generate_vivid.py").read_text()
     assert 'cfg.dmd_base_ckpt = a.base' in src and "cfg.stage1_lora = False" in src
     assert 'gmeta.get("garment_name"), gmeta.get("garment_description")) if a.live' in src
+
+
+def test_real_frame_sources_are_taken_first(tmp_path):
+    """Owner 2026-11-05: ViViD real frames first, Glance fills the rest of --max."""
+    pytest.importorskip("av")
+    mod = load(PKG / "make_static_clips.py", "make_static_clips3")
+    s = mod.build(str(_manifest_dir(tmp_path)), str(tmp_path / "o"), frames=9, max_items=1, mode="research",
+                  detail_oversample=1)
+    assert s["by_source"] == {"vivid": 1} and s["trained_with_vivid"] is True
+    s2 = mod.build(str(_manifest_dir(tmp_path / "x") if (tmp_path / "x").mkdir() is None else None), str(tmp_path / "o2"),
+                   frames=9, max_items=3, mode="research", detail_oversample=1, prefer_sources=())
+    assert sum(s2["by_source"].values()) == 3
