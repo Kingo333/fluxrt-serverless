@@ -23,6 +23,11 @@ Person kept intact (owner requirement 2026-11-05: background, face, skin and bod
 - border_keep: 1 - mean abs change in the left and right 12% of the frame (outside the garment
   mask when there is one): a background check that also works without a mask
 
+Every frame, not just the average (owner 2026-11-05): for face_keep, border_keep, preservation,
+garment_colour and garment_detail the result also has <name>_min (worst frame) and
+<name>_worst_frame (its index), and <name>_drift = mean of the last chunk minus mean of the first
+chunk (CHUNK = 4 frames, JoyAI's streaming chunk; negative = gets worse over the clip).
+
 Without a mask the "garment area" is the whole frame: garment_colour and garment_detail then
 compare the full frame with the garment photo, and preservation has no outside area, so
 score_clip leaves preservation out instead of reporting a meaningless 1.0.
@@ -172,6 +177,25 @@ def border_mask(shape_hw, garment=None, frac: float = 0.12) -> np.ndarray:
     return b
 
 
+CHUNK = 4
+PER_FRAME = ("face_keep", "border_keep", "preservation", "garment_colour", "garment_detail")
+
+
+def frame_stats(values: list[float], name: str, chunk: int = CHUNK) -> dict:
+    """Worst frame and first-to-last-chunk drift of one per-frame series. garment_detail's best
+    value is 1.0, so its 'worst' is the frame farthest from 1."""
+    if not values:
+        return {}
+    if name == "garment_detail":
+        worst = max(range(len(values)), key=lambda k: abs(values[k] - 1.0))
+    else:
+        worst = min(range(len(values)), key=lambda k: values[k])
+    out = {f"{name}_min": round(values[worst], 4), f"{name}_worst_frame": worst}
+    if len(values) >= 2 * chunk:
+        out[f"{name}_drift"] = round(float(np.mean(values[-chunk:]) - np.mean(values[:chunk])), 4)
+    return out
+
+
 class ClipScorer:
     """The same metrics as the functions above, added up one frame at a time, so a clip never has
     to be in memory (the CPU Pod has a 512 MB limit). Call add() per frame, then result()."""
@@ -187,6 +211,7 @@ class ClipScorer:
         self.psnr = self.col_t = 0.0
         self.prev = None
         self.face, self.face_d, self.border_d, self.border = None, 0.0, 0.0, None
+        self.series: dict[str, list[float]] = {k: [] for k in PER_FRAME}
 
     def add(self, inp, out, tgt=None) -> None:
         if self.size is None:
@@ -200,15 +225,25 @@ class ClipScorer:
         diff = np.abs(i - o).mean(axis=2)
         if self.face:
             x, y, w, h = self.face
-            self.face_d += float(diff[y:y + h, x:x + w].mean())
+            fd = float(diff[y:y + h, x:x + w].mean())
+            self.face_d += fd
+            self.series["face_keep"].append(1.0 - fd)
         if self.border.any():
-            self.border_d += float(diff[self.border].mean())
-        self.colour += 1.0 - 0.5 * float(np.abs(_hist(o[m]) - self.ref_h).sum())
-        self.edge += _edge_energy(o, m)
+            bd = float(diff[self.border].mean())
+            self.border_d += bd
+            self.series["border_keep"].append(1.0 - bd)
+        col = 1.0 - 0.5 * float(np.abs(_hist(o[m]) - self.ref_h).sum())
+        self.colour += col
+        self.series["garment_colour"].append(col)
+        e = _edge_energy(o, m)
+        self.edge += e
+        self.series["garment_detail"].append(1.0 if self.ref_e <= 1e-6 else min(e / self.ref_e, 2.0))
         self.change += float(np.abs(i - o).mean())
         outside = ~m
         if self.mask_img is not None and outside.any():
-            self.pres += float(np.abs(i - o).mean(axis=2)[outside].mean())
+            pd = float(diff[outside].mean())
+            self.pres += pd
+            self.series["preservation"].append(1.0 - pd)
         if self.prev is not None:
             pi, po = self.prev
             self.flick += float(np.abs(o - po).mean(axis=2)[m].mean() - np.abs(i - pi).mean(axis=2)[m].mean())
@@ -237,6 +272,8 @@ class ClipScorer:
             out["face_keep"] = round(1.0 - self.face_d / n, 4)
         if self.border is not None and self.border.any():
             out["border_keep"] = round(1.0 - self.border_d / n, 4)
+        for k, vals in self.series.items():
+            out.update(frame_stats(vals, k))
         if self.n_t:
             out["psnr_target"] = round(float(self.psnr / self.n_t), 3)
             out["colour_target"] = round(self.col_t / self.n_t, 4)
