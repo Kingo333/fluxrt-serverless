@@ -42,8 +42,18 @@ echo "== 1. env (once)"
 # diffusers at the pinned commit needs Python >= 3.11; the RunPod PyTorch template has 3.10.
 # uv fetches a standalone Python 3.11 onto the volume (so the venv works on the next Pod too).
 export UV_PYTHON_INSTALL_DIR="$AZ_ROOT/uv-python"
-if [ -e "$VENV/bin/python" ] && ! "$VENV/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
-  echo "venv-fluxlora is not a working Python >= 3.11: rebuilding it"; rm -rf "$VENV"
+# A venv made on another image can point bin/python at a different system Python (Ubuntu 24.04
+# template: 3.12 without this venv's pip). Keep it only if its recorded version is >= 3.11, its
+# interpreter is >= 3.11 and pip imports; otherwise move it aside (never deleted) and rebuild.
+venv_ok() {
+  [ -x "$VENV/bin/python" ] || return 1
+  grep -qE '^version(_info)? *= *3\.(1[1-9]|[2-9][0-9])' "$VENV/pyvenv.cfg" 2>/dev/null || return 1
+  "$VENV/bin/python" -c 'import sys, pip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null
+}
+if [ -e "$VENV" ] && ! venv_ok; then
+  aside="$VENV-stale-$(date -u +%Y%m%dT%H%M%SZ)"
+  echo "venv-fluxlora is not a working Python >= 3.11 with pip: moving it to $aside and rebuilding"
+  mv "$VENV" "$aside"
 fi
 if [ ! -x "$VENV/bin/python" ]; then
   python3 -m pip install -q uv
