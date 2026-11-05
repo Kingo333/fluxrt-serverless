@@ -59,43 +59,86 @@ So the default data is the Glance still triples (person pseudo-source still → 
 ## Risks
 
 - **Blur (regression to the mean):** a plain MSE target can make a few-step model softer.
-  - Mitigations: low LR, small rank, short run, all saves kept, each one compared with 0811 by eye and with the metrics.
+  - Mitigations: the garment-weighted + edge loss (step 3a), low LR, small rank, short run, all saves kept, each one compared with 0811 by eye and with the metrics.
+- **Remove examples:** the extra item is added by the 0811 clone itself; if it looks fake, the LoRA could learn to remove only fake-looking items. The 3b counts and a spot check of `live_source.png` files show it.
+- **Edge weight:** 0.5 is a first guess; too high can sharpen into noise. The mse/edge numbers are logged per step.
   - If every save is softer or less steady than 0811, nothing ships.
 - **Speed:** the step time is not measured yet.
   - Estimate: 5–9 s per step (4 chunks × about 1.5 forwards + 4 backwards at about 4k tokens, plus VAE and text encoder).
 
+## Step 3a: what targets the owner's step 1 review
+
+The owner watched live0811 (`--live --cross`, step 1) and found the proportions right but fine detail
+simplified. Each change below maps to one item of that review.
+
+| Owner's item (clip) | What targets it |
+|---|---|
+| Exact print (000002 generic flowers) | Garment-weighted loss (`AZ_MASK_WEIGHT` 3: errors inside the Glance garment mask count 3x) + edge term (`AZ_EDGE_WEIGHT` 0.5: L1 on finite differences inside the garment) + detail oversampling (most detailed third of garment photos x2) + detail captions |
+| Trims: ruffles, bow/tie neck, collars, necklines (000010, 000002) | Edge term, oversampling, MiMo-VL captions naming neckline/collar/trims |
+| Fabric texture: knit/rib (000010) | Edge term (ribs are edges), captions naming texture |
+| Hem details, exact length (000010) | ViViD dress stills (full-length dresses; Glance has upper-body crops only), captions naming length/hem |
+| Full replacement: leftover belt (000000) | "Remove" examples: 25% of live-way inputs get an extra item (belt, bag, scarf, hat) the real target lacks |
+| Nothing added or duplicated: doubled bag (000002) | Real targets keep exactly what they have; remove examples teach "drop what isn't in the garment photo" |
+| Garment resolution | Eval baseline `live0811_ref1024` (garment photo at basesize 1024). Training and serving stay 768 unless the owner approves a serving change |
+
+Other 3a pieces:
+- **Live-way inputs** (`data_tools/live_source.py`): the 0811 clone edits each real target with a fixed garment photo of another same-category item, as the app runs it, so inputs are steady (the P8 text-only videos drifted). Written as `live_source.*`; old `source.*` never touched; `pack.py --prefer-live-source` uses the new ones.
+- **Bottoms:** Glance lowerwear (`glance_lower`, commercial-clean).
+- **Dresses (owner's Option A, on by default):** about 400 ViViD train dress clips, one steady real frame each (`data_tools/vivid_stills.py`), input made the live way. ViViD is research-only: any LoRA trained with it has `commercial_use_cleared: false`. `AZ_WITH_VIVID_DRESSES=0` retrains the commercial-clean, Glance-only LoRA (use a new `AZ_EXP`; data is cached per experiment).
+- **Captions:** `caption_garments.py --backend mimo` (MiMo-VL-7B-RL-2508, JoyAI's own text encoder, local) writes <=25-word details; half the training samples use the app's full instruction with them (`AZ_DETAIL_CAPTION_FRAC` 0.5), half the plain one, as wardrobe items without a description arrive.
+- **Eval:** 16 cross clips. The owner's regression set (vivid_test_000000, 000002, 000010, 000029) keeps step 1's exact garments (`--pairs-from` step 1's run), plus 12 across categories. Full-height (832 px) grids for the regression set.
+
+What it cannot fix:
+- Exact flower-level print at 480x840: a whole dress covers a few hundred pixels of the live frame. Expect trims, collars, texture, removal and counts to improve more than exact print copying.
+- Dress length and hems for commercial use: the only dress data is ViViD (research-only).
+- Motion: still clips; steadiness over time stays with the frozen base.
+
 ## GPU, time, cost (estimates until the first log lines)
 
-| | 1× RTX PRO 6000 96 GB ($2.49/h) |
-|---|---|
-| Setup and data (first run; data is cached for the same AZ_EXP) | about 20 min |
-| 1,000 steps at 5–9 s | 1.4–2.5 h |
-| Total | about 1.7–2.8 h, **about $4.25–7** |
-| Cap | `timeout 165m` on training, about $6.85 |
-| Eval of 4 saves + 0811 on 4 cross clips | about 40 min, about $1.70, cap `timeout 60m` |
+| Step | Pod | Expected | Cap |
+|---|---|---|---|
+| 3b CPU part: Glance lowerwear + ViViD dress stills | CPU Pod | about 30 min, about $0.10 | `timeout 60m` |
+| 3b GPU part: live-way inputs (1,200 upper + 1,200 lower + 400 dresses at ~3 s, 3 model loads), captions (~1 s each, up to 1,500 per set), pack | 1x RTX PRO 6000 from the endpoint image ($2.49/h) | about 3.5 h, **about $8.70** | timeouts 75m + 75m + 30m + 3x30m + pack: about 4.3 h, **about $10.60** |
+| 3c training: 1,000 steps at 5–9 s + setup | 1x RTX PRO 6000 | 1.7–2.8 h, **about $4.25–7** | `timeout 165m`, about $6.85 |
+| 3c eval: 16 clips x (2 baselines + 4 saves) | same Pod | about 1 h, about $2.50 | `timeout 90m`, about $3.75 |
+| **Total 3b + 3c** | | **about $15.50–18.30** | **about $21.30** |
 
-- If the cap stops training early, the saves already written stay usable.
-- Re-running the same `AZ_EXP` resumes from the newest save.
-- If the first 20 steps average more than 8 s, set `AZ_MAX_STEPS=750` on the re-run.
+- If a cap stops training early, the saves already written stay usable; re-running the same `AZ_EXP` resumes.
+- If the first 20 steps average more than 8 s, re-run with `AZ_MAX_STEPS=750`.
+- 3b is resumable: re-running skips pairs that already have a live input or a caption.
 
 ## Run (paid; owner's yes first). Plain text for the extension
 
-Training (Pod: 1× RTX PRO 6000, EU-RO-1, volume azyah-vton-train at /workspace):
+3b CPU part (CPU Pod, volume azyah-vton-train at /workspace):
 
 for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo waiting for network; sleep 10; done
 export AZ_REF=<SHA>
-timeout 165m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/run_train.sh | AZ_REF=$AZ_REF AZ_MANIFEST_DIR=/workspace/azyah-vton/manifests/research-train AZ_EXP=joyai0811-exp1 bash"; echo TRAIN_EXIT=$?
-timeout 60m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/eval_saves.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp1 bash"; echo EVAL_EXIT=$?
+timeout 60m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/build_data.sh | AZ_REF=$AZ_REF AZ_PART=cpu AZ_VIVID_DRESSES=1 bash"; echo CPU_EXIT=$?
 runpodctl stop pod $RUNPOD_POD_ID
 
-What to paste back:
-- the "self-check ok" line
-- the first 20 "Step N/1000: loss ... step_time" lines
-- each "Stage 1 LoRA save: N adapter tensors" line (N about 640 at rank 32)
-- GOOD_SAVES
-- the eval report table
+3b GPU part (1x RTX PRO 6000, EU-RO-1, Pod template = the endpoint image as for P8, volume azyah-vton-train at /workspace):
 
-Then the owner watches the grid video (`/workspace/azyah-vton/eval/joyai0811_joyai0811-exp1_grid/all.mp4`): input | garment | live0811 | lora250 | lora500 | lora750 | lora1000.
+for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo waiting for network; sleep 10; done
+export AZ_REF=<SHA>
+nvidia-smi
+timeout 260m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/build_data.sh | AZ_REF=$AZ_REF AZ_PART=gpu AZ_VIVID_DRESSES=1 bash"; echo GPU_EXIT=$?
+runpodctl stop pod $RUNPOD_POD_ID
+
+3c train + eval (1x RTX PRO 6000, EU-RO-1, RunPod PyTorch CUDA 12.8 template, volume azyah-vton-train at /workspace):
+
+for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo waiting for network; sleep 10; done
+export AZ_REF=<SHA>
+nvidia-smi
+timeout 165m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/run_train.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp2 AZ_WITH_VIVID_DRESSES=1 bash"; echo TRAIN_EXIT=$?
+timeout 90m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/eval_saves.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp2 bash"; echo EVAL_EXIT=$?
+runpodctl stop pod $RUNPOD_POD_ID
+
+Commercial-clean retrain (Glance only): the same 3c lines with AZ_EXP=joyai0811-exp2c AZ_WITH_VIVID_DRESSES=0.
+
+What to paste back:
+- 3b: the "live inputs tried / ok / remove examples / captioned" counts and both selection.json files
+- 3c: the "self-check ok" line, the loss line ("garment weight 3.0 ... masks in ..."), the first 20 "Step N/1000: loss ... (mse ... edge ... masked ...)" lines, each "Stage 1 LoRA save: N adapter tensors" line (about 640), GOOD_SAVES, the eval report table
+- the owner's look at the regression grids (`/workspace/azyah-vton/eval/joyai0811_joyai0811-exp2_regression_grid/`, 832 px): input | garment | live0811 | live0811_ref1024 | lora250 | lora500 | lora750 | lora1000
 
 ## Serving a save later (separate approval)
 
@@ -110,4 +153,8 @@ Then the owner watches the grid video (`/workspace/azyah-vton/eval/joyai0811_joy
 - `make_static_clips.py`: still triples → static iv2v clips, manifests and `selection.json`.
 - `train.py`: the trainer (copied to upstream `training/src/azyah_train_0811_lora.py`).
 - `run_train.sh`: env, patches, base guard, data, config, train, save check.
+- `losses.py`: garment-weighted MSE + edge term (pure array maths, tested).
+- `build_data.sh`: step 3b data (CPU and GPU parts).
+- `eval_saves.sh`: 0811 + ref1024 baselines and every save on 16 cross clips; regression grids.
+- `../data_tools/live_source.py`, `vivid_stills.py`, `caption_garments.py --backend mimo`: 3a data tools.
 - `eval_saves.sh`: 0811 vs every save. Saves are fused at load with `generate_vivid --base`, so no merged files are written.
