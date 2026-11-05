@@ -56,11 +56,13 @@ def count_frames(path: Path) -> int:
 def build(staging_dir: str, out_dir: str, category: str = "dress", limit: int = 400, max_frames: int = 97) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stats = {"written": 0, "kept_existing": 0, "skipped": 0}
+    stats = {"written": 0, "kept_existing": 0, "skipped": 0, "seen": {}}
     for d, meta in iter_pairs(Path(staging_dir)):
         if stats["written"] + stats["kept_existing"] >= limit:
             break
         tgt, ref = find(d, "target"), find(d, "ref")
+        seen = f"{meta.get('split')}/{meta.get('category')}/{tgt.suffix if tgt else 'no-target'}/{'ref' if ref else 'no-ref'}"
+        stats["seen"][seen] = stats["seen"].get(seen, 0) + 1
         if meta.get("split") != "train" or meta.get("category") != category or tgt is None or ref is None \
                 or tgt.suffix != ".mp4":
             stats["skipped"] += 1

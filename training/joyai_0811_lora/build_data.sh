@@ -45,6 +45,9 @@ if [ "$AZ_PART" = "cpu" ]; then
     echo "== ViViD dress stills (one steady real frame per train clip; research-only)"
     "$PY" -c "import av" 2>/dev/null || "$AZ_ROOT/venv/bin/pip" install -q av
     "$PY" -m data_tools.vivid_stills "$S/vivid" "$S/vivid_dress_stills" --category dress --limit "$DRESS_LIMIT"
+    n_dress=$(find "$S/vivid_dress_stills" -mindepth 2 -maxdepth 2 -name meta.json | wc -l)
+    echo "vivid dress stills: $n_dress"
+    [ "$n_dress" -gt 0 ] || { echo "NO_DRESS_STILLS: see the 'seen' counts above (split/category/target/ref)"; exit 1; }
   fi
   echo "CPU_PART_DONE"
   exit 0
