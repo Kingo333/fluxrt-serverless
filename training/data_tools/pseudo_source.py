@@ -192,10 +192,11 @@ class JoyAIEditor:
                                       vae_pseudo_device=device, postprocess_device=device,
                                       warmup_height=840, warmup_width=624)
 
-    def edit(self, frames, prompt, size):
+    def edit(self, frames, prompt, size, ref_image=None):
+        """ref_image (PIL, optional): a fixed garment photo, as the app sends (live_source.py)."""
         w, h = size
         settings = self._settings_cls(height=h, width=w, num_inference_steps=self.steps, max_temporal_ids=8)
-        session = self.rt.create_v2v_session(prompt=prompt, settings=settings)
+        session = self.rt.create_v2v_session(prompt=prompt, settings=settings, ref_image=ref_image)
         jpegs: dict[int, bytes] = {}
         try:
             for i, f in enumerate(frames):

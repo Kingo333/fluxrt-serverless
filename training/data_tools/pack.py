@@ -62,8 +62,20 @@ def _matched_target(src: bytes, tgt: bytes) -> bytes:
     return _trim_video(tgt, ns) if ns < nt else tgt
 
 
-def _sample(d: Path, meta: dict) -> Sample | None:
-    ref, src, tgt = find(d, "ref"), find(d, "source"), find(d, "target")
+def _source(d: Path, meta: dict, prefer_live: bool) -> tuple[Path | None, dict]:
+    """The input of a pair: live_source.* (live_source.py: fixed garment photo, steady) when
+    asked for and present, else the P8 source.*. Returns (path, extra metadata)."""
+    if prefer_live and (meta.get("live_source") or {}).get("ok"):
+        live = find(d, "live_source")
+        if live is not None:
+            ls = meta["live_source"]
+            return live, {"input": "live_source", "extra_item": ls.get("extra_item"), "ref_key": ls.get("ref_key")}
+    return find(d, "source"), {}
+
+
+def _sample(d: Path, meta: dict, prefer_live: bool = False) -> Sample | None:
+    src, src_extra = _source(d, meta, prefer_live)
+    ref, tgt = find(d, "ref"), find(d, "target")
     if not (ref and src and tgt):
         return None
     detailed = None
@@ -73,7 +85,7 @@ def _sample(d: Path, meta: dict) -> Sample | None:
                   captions={"caption_detailed": detailed},
                   source=meta["source"], split=meta["split"], garment_id=meta.get("garment_id"),
                   person_id=meta.get("person_id"), consent_id=meta.get("consent_id"),
-                  extra={k: meta[k] for k in ("config", "category", "pseudo_source") if k in meta})
+                  extra={**{k: meta[k] for k in ("config", "category", "pseudo_source") if k in meta}, **src_extra})
     if tgt.suffix == ".mp4":
         src_bytes = src.read_bytes()
         return Sample(task="iv2v", files={"0.jpg": _as_jpeg(ref.read_bytes()), "0.mp4": src_bytes,
@@ -104,12 +116,13 @@ def _identity(s: Sample) -> Sample:
                   extra={**s.extra, "identity_pair": True}, captions=dict(s.captions))
 
 
-def pack(staging_dir: str, out_dir: str, name: str, per_shard: int = 500, identity_frac: float = 0.1) -> dict:
+def pack(staging_dir: str, out_dir: str, name: str, per_shard: int = 500, identity_frac: float = 0.1,
+         prefer_live_source: bool = False) -> dict:
     buckets: dict[tuple, list[Sample]] = defaultdict(list)
     missing = 0
     identity = 0
     for d, meta in iter_pairs(Path(staging_dir)):
-        s = _sample(d, meta)
+        s = _sample(d, meta, prefer_live_source)
         if s is None:
             missing += 1
             continue
@@ -134,8 +147,10 @@ def main() -> None:
     ap.add_argument("--per-shard", type=int, default=500)
     ap.add_argument("--identity-frac", type=float, default=0.1,
                     help="share of training pairs also added as clean-input 'no change' pairs (review R5)")
+    ap.add_argument("--prefer-live-source", action="store_true",
+                    help="use live_source.* (live_source.py, fixed garment photo) instead of source.* when present")
     a = ap.parse_args()
-    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac), indent=2))
+    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac, a.prefer_live_source), indent=2))
 
 
 if __name__ == "__main__":
