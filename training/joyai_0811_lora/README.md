@@ -100,7 +100,7 @@ What it cannot fix:
 | 3b CPU part: Glance lowerwear + ViViD dress stills | CPU Pod | about 30 min, about $0.10 | `timeout 60m` |
 | 3b GPU part: ViViD top/bottom stills, live-way inputs (800 Glance upper + 800 Glance lower + 400 ViViD dresses + 600 ViViD tops + 343 ViViD bottoms at ~3 s, 5 model loads), captions (~1 s each), pack | 1x RTX PRO 6000 from the endpoint image ($2.49/h) | about 4.3 h, **about $10.70** | outer `timeout 280m`: **about $11.60** (resumable) |
 | 3c training: 1,000 steps at 5–9 s + setup | 1x RTX PRO 6000 | 1.7–2.8 h, **about $4.25–7** | `timeout 165m`, about $6.85 |
-| 3c eval: 16 clips x (2 baselines + 4 saves) | same Pod | about 1 h, about $2.50 | `timeout 90m`, about $3.75 |
+| 3c eval: 16 clips x (2 baselines + 4 saves) at 49 frames, plus the 4 regression clips at 97 frames x (live0811 + 4 saves), frame strips | same Pod | about 1.7 h, about $4.20 | `timeout 150m`, about $6.20 |
 | **Total 3b + 3c** | | **about $15.50–18.30** | **about $21.30** |
 
 - If a cap stops training early, the saves already written stay usable; re-running the same `AZ_EXP` resumes.
@@ -130,7 +130,7 @@ for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/nu
 export AZ_REF=<SHA>
 nvidia-smi
 timeout 165m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/run_train.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp2 AZ_WITH_VIVID_DRESSES=1 bash"; echo TRAIN_EXIT=$?
-timeout 90m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/eval_saves.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp2 bash"; echo EVAL_EXIT=$?
+timeout 150m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/eval_saves.sh | AZ_REF=$AZ_REF AZ_EXP=joyai0811-exp2 bash"; echo EVAL_EXIT=$?
 runpodctl stop pod $RUNPOD_POD_ID
 
 Commercial-clean retrain (Glance only): the same 3c lines with AZ_EXP=joyai0811-exp2c AZ_WITH_VIVID_DRESSES=0.

@@ -72,7 +72,7 @@ def evaluate(results_dir: str) -> dict:
             per_model[model].append(s)
     summary = {}
     for model, rows in per_model.items():
-        keys = sorted({k for r in rows for k in r if isinstance(r[k], (int, float))})
+        keys = sorted({k for r in rows for k in r if isinstance(r[k], (int, float)) and not k.endswith("_worst_frame")})
         summary[model] = {"clips": len(rows), **{k: round(sum(r[k] for r in rows if k in r) / sum(1 for r in rows if k in r), 4) for k in keys}}
     return {"summary": summary, "per_clip": per_clip, "masked": all(masked) if masked else False}
 
@@ -91,6 +91,15 @@ def to_markdown(result: dict) -> str:
               "lower is better for flicker, latency, memory. psnr_target / colour_target compare with the real "
               "ground truth (higher is better); change near 0 means the output is the input unchanged. "
               "Metrics are proxies: confirm with the blinded review."]
+    fcols = [c for c in ("face_keep_min", "border_keep_min", "preservation_min", "garment_colour_min",
+                         "garment_detail_min", "face_keep_drift", "border_keep_drift", "garment_colour_drift")
+             if any(c in v for v in s.values())]
+    if fcols:
+        lines += ["", "Every frame (mean over clips of each clip's worst frame; drift = last chunk minus first "
+                  "chunk of 4 frames, negative = worse over time):", "",
+                  "| model | " + " | ".join(fcols) + " |", "|---|" + "---|" * len(fcols)]
+        for model, v in sorted(s.items()):
+            lines.append(f"| {model} | " + " | ".join(str(v.get(c, "—")) for c in fcols) + " |")
     if not result.get("masked", True):
         lines += ["", "No mask.png in some clips: garment_colour / garment_detail use the whole frame there, "
                   "and preservation is left out for them."]
@@ -102,6 +111,8 @@ def to_markdown(result: dict) -> str:
 KEEP_DROP = {"preservation": 0.01, "face_keep": 0.01, "border_keep": 0.01}
 QUALITY_DROP = {"garment_colour": 0.02, "psnr_target": 0.5, "colour_target": 0.02}
 FLICKER_RISE = 0.005
+WORST_FRAME_DROP = 0.03   # a single frame worse than the reference's worst frame by this much
+DRIFT_DROP = 0.03         # last chunk vs first chunk gets worse by this much more than the reference
 
 
 def flags(result: dict, ref: str) -> list[str]:
@@ -125,6 +136,15 @@ def flags(result: dict, ref: str) -> list[str]:
             for k in KEEP_DROP:
                 if k in a and k in b and b[k] - a[k] > 3 * KEEP_DROP[k]:
                     out.append(f"FLAG {model} clip {clip}: {k} {a[k]} vs {ref} {b[k]}")
+            # every frame: the worst frame, and drift over the clip (owner 2026-11-05)
+            for k in ("face_keep", "border_keep", "preservation", "garment_colour"):
+                km = f"{k}_min"
+                if km in a and km in b and b[km] - a[km] > WORST_FRAME_DROP:
+                    out.append(f"FLAG {model} clip {clip}: worst-frame {k} {a[km]} at frame "
+                               f"{a.get(k + '_worst_frame')} vs {ref} {b[km]}")
+                kd = f"{k}_drift"
+                if kd in a and kd in b and b[kd] - a[kd] > DRIFT_DROP:
+                    out.append(f"FLAG {model} clip {clip}: {k} drifts {a[kd]} over the clip vs {ref} {b[kd]}")
     return out or [f"no flags: every model is within the limits of {ref}"]
 
 

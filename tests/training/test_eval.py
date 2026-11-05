@@ -212,3 +212,39 @@ def test_still_grid_review_sheet(tmp_path):
     sheet = Image.open(tmp_path / "g" / "all.png")
     assert sheet.height == 3 * (60 + grid.LABEL_H) and (tmp_path / "g" / "shoe_02.png").exists()
     assert not (tmp_path / "g" / "shoe_03.png").exists()
+
+
+def test_worst_frame_and_drift_are_reported_and_flagged():
+    """Owner 2026-11-05: check every frame, not only the average, and drift over the chunks."""
+    inp = [person(Image.new("RGB", (W, H), (10, 160, 10)))] * 12
+    steady = [person(REF)] * 12
+    late_bg_break = [person(REF)] * 8 + [Image.new("RGB", (W, H), (0, 0, 0))] * 4
+    a = metrics.score_clip(inp, steady, REF, MASK)
+    b = metrics.score_clip(inp, late_bg_break, REF, MASK)
+    assert a["border_keep_min"] > 0.99 and a["border_keep_drift"] == 0.0
+    assert b["border_keep_min"] < 0.7 and b["border_keep_worst_frame"] >= 8 and b["border_keep_drift"] < -0.2
+    r = {"summary": {"ref": {"clips": 1, **a}, "lora": {"clips": 1, **b}}, "per_clip": {"c": {"ref": a, "lora": b}}}
+    f = run_eval.flags(r, "ref")
+    assert any("worst-frame border_keep" in x and "at frame" in x for x in f)
+    assert any("border_keep drifts" in x for x in f)
+    md = run_eval.to_markdown({"summary": r["summary"], "per_clip": {}, "masked": True})
+    assert "Every frame" in md and "border_keep_min" in md
+
+
+def test_frame_strip_marks_the_worst_frame(tmp_path):
+    import pytest as _p
+    _p.importorskip("av")
+    from eval import frame_strip
+    d = tmp_path / "r" / "clip1"
+    d.mkdir(parents=True)
+    green = person(Image.new("RGB", (W, H), (10, 160, 10)))
+    _mp4(d / "input.mp4", [green] * 8)
+    _mp4(d / "out_live0811.mp4", [green] * 8)
+    _mp4(d / "out_lora250.mp4", [green] * 5 + [Image.new("RGB", (W, H), (0, 0, 0))] + [green] * 2)
+    REF.save(d / "ref.jpg")
+    n = frame_strip.main([str(tmp_path / "r"), str(tmp_path / "s"), "--models", "live0811", "lora250",
+                          "--every", "2", "--height", "40"])
+    sheet = Image.open(tmp_path / "s" / "clip1_frames.png")
+    assert n == 1 and sheet.height == frame_strip.HEAD_H + 3 * 44
+    ch = frame_strip.person_change([green] * 8, [green] * 5 + [Image.new("RGB", (W, H), (0, 0, 0))] + [green] * 2)
+    assert int(np.argmax(ch)) == 5

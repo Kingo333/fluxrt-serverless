@@ -53,6 +53,19 @@ for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
   MODELS+=("lora$step")
 done
 echo "GEN_DONE models: ${MODELS[*]}"
+# Longer clips for drift (owner 2026-11-05): the 4 regression clips at 97 frames (24 chunks, ~4 s)
+# for live0811 and every save. The 16-clip set stays at 49 frames.
+LONG="${OUT}_long"
+GL=(torchrun --nproc_per_node 1 -m eval.generate_vivid --config configs/azyah_fashion_stage1.py
+    --staging "$AZ_DATA/staging/vivid" --out "$LONG" --max-items 4 --num-frames 97 --live --cross)
+[ -d "$PAIRS_FROM" ] && GL+=(--pairs-from "$PAIRS_FROM")
+LONG_MODELS=(live0811)
+"${GL[@]}" --ckpt "$BASE" --name live0811
+for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
+  step="$(basename "$ck" .pth)"; step="${step#step_}"
+  "${GL[@]}" --ckpt "$ck" --base "$BASE" --name "lora$step"
+  LONG_MODELS+=("lora$step")
+done
 cd "$A"
 "$PY" -c "import cv2" 2>/dev/null || "$AZ_ROOT/venv/bin/pip" install -q opencv-python-headless || true   # face_keep
 "$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md" --ref live0811; cat "$OUT/report.md"
@@ -63,3 +76,9 @@ mkdir -p "$REG"
 for k in $REGRESSION; do [ -d "$OUT/$k" ] && ln -sfn "$OUT/$k" "$REG/$k"; done
 "$PY" -m eval.grid "$REG" "${OUT}_regression_grid" --models "${MODELS[@]}" --require-all --height 832
 echo "regression grids (832 px): ${OUT}_regression_grid ($REGRESSION)"
+# Every frame, for the owner: frame strips (every 6th frame + each row's worst frame in red).
+STRIP_MODELS=(live0811 "${MODELS[@]:2}")
+"$PY" -m eval.frame_strip "$OUT" "${OUT}_frames" --models "${STRIP_MODELS[@]}" --clips $REGRESSION --every 6 --height 240
+"$PY" -m eval.run_eval "$LONG" --out "$LONG/report.md" --ref live0811; cat "$LONG/report.md"
+"$PY" -m eval.frame_strip "$LONG" "${LONG}_frames" --models "${LONG_MODELS[@]}" --every 8 --height 200
+echo "frame strips: ${OUT}_frames (49 frames) and ${LONG}_frames (97 frames)"
