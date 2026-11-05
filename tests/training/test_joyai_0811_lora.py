@@ -168,7 +168,7 @@ def test_static_clips_are_steady_live_sized_and_licence_filtered(tmp_path):
     np = pytest.importorskip("numpy")
     mod = load(PKG / "make_static_clips.py", "make_static_clips")
     out = tmp_path / "out"
-    s = mod.build(str(_manifest_dir(tmp_path)), str(out), frames=9, mode="commercial")
+    s = mod.build(str(_manifest_dir(tmp_path)), str(out), frames=9, mode="commercial", detail_oversample=1)
     assert s["static_clips"] == 2 and s["vivid_videos"] == 0 and s["dropped_by_mode"] == 1
     assert s["commercial_use_cleared"] is True and s["trained_with_vivid"] is False
     manifest = json.loads((out / "manifest" / "v2v.json").read_text())
@@ -194,7 +194,8 @@ def test_static_clips_are_steady_live_sized_and_licence_filtered(tmp_path):
 def test_vivid_videos_only_on_explicit_opt_in(tmp_path):
     pytest.importorskip("av")
     mod = load(PKG / "make_static_clips.py", "make_static_clips2")
-    s = mod.build(str(_manifest_dir(tmp_path)), str(tmp_path / "o"), frames=9, mode="research", vivid_videos=True)
+    s = mod.build(str(_manifest_dir(tmp_path)), str(tmp_path / "o"), frames=9, mode="research", vivid_videos=True,
+                  detail_oversample=1)
     assert s["vivid_videos"] == 1 and s["static_clips"] == 3
     assert s["trained_with_vivid"] is True and s["commercial_use_cleared"] is False
     with pytest.raises(SystemExit):
@@ -231,6 +232,7 @@ def trainer(monkeypatch):
     sys.modules["src"].train_t2v_dmd = sys.modules["src.train_t2v_dmd"]
     sys.modules["src.train_t2v_dmd"]._sample_exit_index = lambda n: 0
     monkeypatch.setitem(sys.modules, "live_schedule", ls)
+    monkeypatch.setitem(sys.modules, "losses", load(PKG / "losses.py", "losses"))
     monkeypatch.setenv("AZ_TOOLS_DIR", str(PKG))
     return load(PKG / "train.py", "azyah_train_0811_lora")
 
@@ -288,7 +290,7 @@ def test_trainer_uses_the_patched_lora_save_and_keeps_every_save():
     assert "from src.utils.checkpoint import load_checkpoint, save_checkpoint" in src  # patched: refuses empty saves
     assert "setup_model_and_optimizer(cfg, device)" in src  # patched: frozen base + trainable-count assert
     assert "generate_dmd_latents(" in src and "requires_grad=True" in src and "rollout_num_chunks_override=-1" in src
-    assert "F.mse_loss(pred.float(), target.float())" in src
+    assert "garment_loss(pred.float(), target.float(), mask, MASK_WEIGHT, EDGE_WEIGHT)" in src
     assert "prune_checkpoints" not in src
     patch = (ROOT / "patches" / "stage1-lora.patch").read_text()
     assert "refusing to write a \"" in patch and "checkpoint without the adapter weights" in patch

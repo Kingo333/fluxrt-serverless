@@ -3,7 +3,11 @@
 # training volume), trained through the live 2-step streaming rollout against real targets.
 # ONE GPU Pod (1x RTX PRO 6000, 96 GB), volume azyah-vton-train at /workspace. Paid: owner's "yes" first.
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/joyai_0811_lora/run_train.sh | \
-#     AZ_REF=<SHA> AZ_MANIFEST_DIR=/workspace/azyah-vton/manifests/research-train AZ_EXP=joyai0811-exp1 bash
+#     AZ_REF=<SHA> AZ_EXP=joyai0811-exp2 bash
+# Step 3a data (build_data.sh): AZ_WITH_VIVID_DRESSES=1 (default, owner's Option A) trains on
+# manifests/joyai0811-research-train (Glance upper + lower + ViViD dress stills; research-only,
+# commercial_use_cleared false); AZ_WITH_VIVID_DRESSES=0 trains the commercial-clean LoRA on
+# manifests/joyai0811-commercial-train (Glance only). AZ_MANIFEST_DIR overrides both.
 #
 # Never touches the live endpoint, the live azyah-joyai volume (/runpod-volume) or the live image:
 # the base must be a file on this volume, and the output is LoRA saves under outputs/joyai0811_lora.
@@ -15,8 +19,14 @@ RAW="${RAW_URL:-https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ
 export SCRIPTS_URL="$RAW/scripts"
 echo "[azyah] scripts ref: $AZ_REF"
 source <(curl -fsSL "$RAW/scripts/common.sh")
-: "${AZ_MANIFEST_DIR:?set AZ_MANIFEST_DIR (output of data_tools.manifests; its i2i.json holds the still triples)}"
-SRC_MANIFESTS="$AZ_MANIFEST_DIR"
+WITH_VIVID_DRESSES="${AZ_WITH_VIVID_DRESSES:-1}"
+if [ "$WITH_VIVID_DRESSES" = "1" ]; then
+  SRC_MANIFESTS="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/joyai0811-research-train}"; DATA_MODE="${AZ_DATA_MODE:-research}"
+else
+  SRC_MANIFESTS="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/joyai0811-commercial-train}"; DATA_MODE="${AZ_DATA_MODE:-commercial}"
+fi
+[ -f "$SRC_MANIFESTS/i2i.json" ] || { echo "no $SRC_MANIFESTS/i2i.json: run build_data.sh (step 3b) first"; exit 1; }
+STAGING_DIRS=("$AZ_DATA/staging/glance_upper" "$AZ_DATA/staging/glance_lower" "$AZ_DATA/staging/vivid_dress_stills")
 
 export AZ_EXP="${AZ_EXP:-joyai0811-lora}"
 export AZ_MAX_STEPS="${AZ_MAX_STEPS:-1000}"
@@ -27,10 +37,13 @@ export AZ_CKPT_INTERVAL="${AZ_CKPT_INTERVAL:-250}"
 export AZ_WARMUP="${AZ_WARMUP:-50}"
 export AZ_STATIC_FRAMES="${AZ_STATIC_FRAMES:-25}"    # 8n+1; 25 = 4 latent chunks (sink + live window)
 export AZ_EXIT="${AZ_EXIT:-random}"                  # random (upstream) | last (only the served output)
-export AZ_DETAILED_CAPTION_PROB="${AZ_DETAILED_CAPTION_PROB:-1.0}"  # the app sends the full instruction
+# Share of samples captioned with the app's full instruction + MiMo-VL garment details (when the
+# pair has them); the rest get the plain instruction, as wardrobe items without a description do.
+export AZ_DETAILED_CAPTION_PROB="${AZ_DETAIL_CAPTION_FRAC:-${AZ_DETAILED_CAPTION_PROB:-0.5}}"
+export AZ_MASK_WEIGHT="${AZ_MASK_WEIGHT:-3.0}" AZ_EDGE_WEIGHT="${AZ_EDGE_WEIGHT:-0.5}"
+DETAIL_OVERSAMPLE="${AZ_DETAIL_OVERSAMPLE:-2}"
 export AZ_STAGE1_LORA=1 AZ_GRAD_ACCUM="${AZ_GRAD_ACCUM:-1}" AZ_HSDP_SHARD=1 AZ_SP_SIZE=1 AZ_AUTO_RESUME=1
-SAMPLES="${AZ_SAMPLES:-3000}"
-DATA_MODE="${AZ_DATA_MODE:-commercial}"              # Glance stills are commercial-ok; research only with ViViD
+SAMPLES="${AZ_SAMPLES:-4000}"   # still triples before detail oversampling
 VIVID_VIDEOS="${AZ_VIVID_VIDEOS:-0}"                 # 1 = also the ViViD clip pairs (they flicker; owner opt-in)
 TOOLS="$AZ_ROOT/azyah-tools/training"
 DATA="$AZ_DATA/joyai0811_lora/$AZ_EXP"
@@ -58,8 +71,10 @@ echo "{\"joyai0811_lora\": \"$AZ_EXP\", \"base\": \"$BASE\", \"azyah_scripts_ref
 
 echo "== 3. tools"
 for f in data_tools/__init__.py data_tools/sources.py data_tools/shards.py data_tools/manifests.py \
+         eval/__init__.py eval/metrics.py \
          scripts/make_fashion_config.py joyai_0811_lora/__init__.py joyai_0811_lora/live_schedule.py \
-         joyai_0811_lora/make_config.py joyai_0811_lora/make_static_clips.py joyai_0811_lora/train.py; do
+         joyai_0811_lora/losses.py joyai_0811_lora/make_config.py joyai_0811_lora/make_static_clips.py \
+         joyai_0811_lora/train.py; do
   mkdir -p "$TOOLS/$(dirname "$f")"
   curl -fsSL "$RAW/$f" -o "$TOOLS/$f"
 done
@@ -69,11 +84,13 @@ echo "== 4. data: steady static clips from the still triples ($SAMPLES, ${AZ_STA
 if [ ! -f "$DATA/build_summary.json" ]; then
   EXTRA=(); [ "$VIVID_VIDEOS" = "1" ] && EXTRA=(--vivid-videos) && DATA_MODE=research
   "$PY" "$TOOLS/joyai_0811_lora/make_static_clips.py" --manifest-dir "$SRC_MANIFESTS" --out "$DATA" \
-    --frames "$AZ_STATIC_FRAMES" --max "$SAMPLES" --mode "$DATA_MODE" "${EXTRA[@]}"
+    --frames "$AZ_STATIC_FRAMES" --max "$SAMPLES" --mode "$DATA_MODE" "${EXTRA[@]}" \
+    --staging-dirs "${STAGING_DIRS[@]}" --detail-oversample "$DETAIL_OVERSAMPLE"
 fi
 cat "$DATA/build_summary.json"
 echo "== data selection (provenance)"; cat "$DATA/manifest/selection.json"
 export AZ_MANIFEST_DIR="$DATA/manifest"   # the config reads v2v.json from here (no i2i: live is video)
+export AZ_MASK_DIR="$DATA/masks"          # garment masks per sample key (losses.py)
 
 echo "== 5. config + trainer"
 AZ_FASHION_CONFIG_PY="$TOOLS/scripts/make_fashion_config.py" "$PY" "$TOOLS/joyai_0811_lora/make_config.py" "$AZ_UPSTREAM/training"
