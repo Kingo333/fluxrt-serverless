@@ -155,3 +155,45 @@ def test_grid_and_eval_on_p9e_layout(tmp_path):
     s = r["summary"]
     assert s["exp2"]["psnr_target"] > s["base"]["psnr_target"] and "preservation" not in s["exp2"]
     assert "No mask.png" in run_eval.to_markdown(r)
+
+
+def test_person_keep_metrics_and_flags():
+    """Owner requirement: flag any model that changes the background/person more than the reference."""
+    inp = [person(Image.new("RGB", (W, H), (10, 160, 10)))] * 3
+    good = metrics.score_clip(inp, [person(REF)] * 3, REF, MASK)
+    bg_changed = [Image.new("RGB", (W, H), (0, 0, 0))] * 3
+    bad = metrics.score_clip(inp, bg_changed, REF, MASK)
+    assert good["border_keep"] > 0.99 and bad["border_keep"] < 0.7
+    r = {"summary": {"base": {"clips": 1, **good}, "lora": {"clips": 1, **bad}},
+         "per_clip": {"c1": {"base": good, "lora": bad}}}
+    f = run_eval.flags(r, "base")
+    assert any("FLAG lora: border_keep" in x for x in f) and any("clip c1" in x for x in f)
+    r2 = {"summary": {"base": {"clips": 1, **good}, "lora": {"clips": 1, **good}}, "per_clip": {}}
+    assert run_eval.flags(r2, "base")[0].startswith("no flags")
+
+
+def test_border_mask_excludes_garment():
+    m = np.zeros((10, 20), dtype=bool)
+    m[:, :2] = True
+    b = metrics.border_mask((10, 20), m, frac=0.2)
+    assert not b[:, :2].any() and b[:, 2:4].all() and b[:, -4:].all() and not b[:, 5:15].any()
+
+
+def test_shoe_set_and_pairs_mode(tmp_path):
+    from eval import generate_fluxrt as gf, make_shoe_set
+    persons = tmp_path / "persons"
+    persons.mkdir()
+    person(REF).save(persons / "me.jpg")
+    REF.save(tmp_path / "shoe.png")
+    s = tmp_path / "set.json"
+    s.write_text(json.dumps({"items": [{"key": "shoe_01", "name": "Nike Shox TL sneakers in blue", "description": "Mesh upper",
+                                        "image_url": (tmp_path / "shoe.png").as_uri()}]}))
+    st = make_shoe_set.build(str(tmp_path / "shoes"), str(s), persons=str(persons))
+    assert st["written"] == 1 and not st["failed"]
+    items = gf.pair_items(tmp_path / "shoes", 10)
+    assert [d.name for d in items] == ["shoe_01"]
+    assert json.loads((items[0] / "meta.json").read_text())["category"] == "shoes"
+    z = gf.item_zone_mask("shoes", 40, 80)
+    a = np.asarray(z)
+    assert a[:60].max() == 0 and a[60:].min() == 255 and gf.item_zone_mask("tops", 40, 80) is None
+    assert make_shoe_set.build(str(tmp_path / "shoes"), str(s), persons=str(persons))["kept"] == 1

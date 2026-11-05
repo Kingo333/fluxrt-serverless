@@ -54,7 +54,8 @@ for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
 done
 echo "GEN_DONE models: ${MODELS[*]}"
 cd "$A"
-"$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md"; cat "$OUT/report.md"
+"$PY" -c "import cv2" 2>/dev/null || "$AZ_ROOT/venv/bin/pip" install -q opencv-python-headless || true   # face_keep
+"$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md" --ref live0811; cat "$OUT/report.md"
 "$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all
 echo "grid videos: ${OUT}_grid (all.mp4 = every clip; panels: input | garment | ${MODELS[*]})"
 REG="${OUT}_regression"

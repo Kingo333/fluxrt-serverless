@@ -16,6 +16,13 @@ With the real ground truth (target = the same person really wearing the garment)
 - colour_target: colour-histogram match of the output vs the target (0..1, higher is better)
 - change: mean abs change of the output vs the input (0..1). Near 0 = the model did nothing.
 
+Person kept intact (owner requirement 2026-11-05: background, face, skin and body must not change):
+- preservation: outside the garment mask (only when the clip has mask.png)
+- face_keep: 1 - mean abs change inside the face box found on the first input frame (OpenCV's
+  bundled frontal-face detector; left out when OpenCV is missing or no face is found)
+- border_keep: 1 - mean abs change in the left and right 12% of the frame (outside the garment
+  mask when there is one): a background check that also works without a mask
+
 Without a mask the "garment area" is the whole frame: garment_colour and garment_detail then
 compare the full frame with the garment photo, and preservation has no outside area, so
 score_clip leaves preservation out instead of reporting a meaningless 1.0.
@@ -133,6 +140,38 @@ def change(input_frames, output_frames) -> float:
     return float(np.mean([np.abs(_arr(i, size) - _arr(o, size)).mean() for i, o in zip(input_frames, output_frames)]))
 
 
+_CASCADE = None
+
+
+def face_box(rgb_float):
+    """Largest frontal face (x, y, w, h) in an HxWx3 0..1 image, or None (no OpenCV / no face)."""
+    global _CASCADE
+    try:
+        import cv2
+    except ImportError:
+        return None
+    if _CASCADE is None:
+        _CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    gray = cv2.cvtColor((rgb_float * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    side = min(gray.shape)
+    faces = _CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(max(12, side // 20),) * 2)
+    if len(faces) == 0:
+        return None
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+    return int(x), int(y), int(w), int(h)
+
+
+def border_mask(shape_hw, garment=None, frac: float = 0.12) -> np.ndarray:
+    h, w = shape_hw
+    b = np.zeros((h, w), dtype=bool)
+    k = max(1, int(round(w * frac)))
+    b[:, :k] = True
+    b[:, w - k:] = True
+    if garment is not None:
+        b &= ~garment
+    return b
+
+
 class ClipScorer:
     """The same metrics as the functions above, added up one frame at a time, so a clip never has
     to be in memory (the CPU Pod has a 512 MB limit). Call add() per frame, then result()."""
@@ -147,6 +186,7 @@ class ClipScorer:
         self.colour = self.edge = self.change = self.pres = self.flick = 0.0
         self.psnr = self.col_t = 0.0
         self.prev = None
+        self.face, self.face_d, self.border_d, self.border = None, 0.0, 0.0, None
 
     def add(self, inp, out, tgt=None) -> None:
         if self.size is None:
@@ -154,6 +194,15 @@ class ClipScorer:
             self.m = _mask(self.mask_img, self.size)
         i, o = _arr(inp, self.size), _arr(out, self.size)
         m = self.m
+        if self.border is None:
+            self.face = face_box(i) or False
+            self.border = border_mask(i.shape[:2], m if self.mask_img is not None else None)
+        diff = np.abs(i - o).mean(axis=2)
+        if self.face:
+            x, y, w, h = self.face
+            self.face_d += float(diff[y:y + h, x:x + w].mean())
+        if self.border.any():
+            self.border_d += float(diff[self.border].mean())
         self.colour += 1.0 - 0.5 * float(np.abs(_hist(o[m]) - self.ref_h).sum())
         self.edge += _edge_energy(o, m)
         self.change += float(np.abs(i - o).mean())
@@ -184,6 +233,10 @@ class ClipScorer:
         }
         if self.mask_img is not None:
             out["preservation"] = round(1.0 - self.pres / n, 4)
+        if self.face:
+            out["face_keep"] = round(1.0 - self.face_d / n, 4)
+        if self.border is not None and self.border.any():
+            out["border_keep"] = round(1.0 - self.border_d / n, 4)
         if self.n_t:
             out["psnr_target"] = round(float(self.psnr / self.n_t), 3)
             out["colour_target"] = round(self.col_t / self.n_t, 4)

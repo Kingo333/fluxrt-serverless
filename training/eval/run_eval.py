@@ -82,7 +82,7 @@ def to_markdown(result: dict) -> str:
     if not s:
         return "No results found.\n"
     cols = ["clips", "psnr_target", "colour_target", "change", "garment_colour", "garment_detail", "preservation",
-            "flicker", "fps", "latency_ms_p50", "gpu_mem_gb"]
+            "face_keep", "border_keep", "flicker", "fps", "latency_ms_p50", "gpu_mem_gb"]
     cols = [c for c in cols if any(c in v for v in s.values())]
     lines = ["| model | " + " | ".join(cols) + " |", "|---|" + "---|" * len(cols)]
     for model, v in sorted(s.items()):
@@ -97,15 +97,51 @@ def to_markdown(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# A model is flagged when it is worse than the reference model by more than these amounts
+# (owner requirement 2026-11-05: training must not change the person or the background).
+KEEP_DROP = {"preservation": 0.01, "face_keep": 0.01, "border_keep": 0.01}
+QUALITY_DROP = {"garment_colour": 0.02, "psnr_target": 0.5, "colour_target": 0.02}
+FLICKER_RISE = 0.005
+
+
+def flags(result: dict, ref: str) -> list[str]:
+    """Plain-language list of where each model is worse than `ref` (summary and per clip)."""
+    s = result["summary"]
+    if ref not in s:
+        return [f"reference model {ref!r} not in the results"]
+    out = []
+    for model, v in sorted(s.items()):
+        if model == ref:
+            continue
+        for k, lim in {**KEEP_DROP, **QUALITY_DROP}.items():
+            if k in v and k in s[ref] and s[ref][k] - v[k] > lim:
+                out.append(f"FLAG {model}: {k} {v[k]} vs {ref} {s[ref][k]} (drop > {lim})")
+        if "flicker" in v and v["flicker"] - s[ref].get("flicker", v["flicker"]) > FLICKER_RISE:
+            out.append(f"FLAG {model}: flicker {v['flicker']} vs {ref} {s[ref]['flicker']} (rise > {FLICKER_RISE})")
+        for clip, per in sorted(result["per_clip"].items()):
+            a, b = per.get(model), per.get(ref)
+            if not (a and b):
+                continue
+            for k in KEEP_DROP:
+                if k in a and k in b and b[k] - a[k] > 3 * KEEP_DROP[k]:
+                    out.append(f"FLAG {model} clip {clip}: {k} {a[k]} vs {ref} {b[k]}")
+    return out or [f"no flags: every model is within the limits of {ref}"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("results_dir")
     ap.add_argument("--out", default="eval_report.md")
+    ap.add_argument("--ref", help="reference model (e.g. base, live0811): list where others are worse")
     a = ap.parse_args()
     r = evaluate(a.results_dir)
-    Path(a.out).write_text(to_markdown(r))
+    md = to_markdown(r)
+    if a.ref:
+        r["flags"] = flags(r, a.ref)
+        md += "\n## Flags vs " + a.ref + "\n\n" + "\n".join(f"- {f}" for f in r["flags"]) + "\n"
+    Path(a.out).write_text(md)
     Path(a.out).with_suffix(".json").write_text(json.dumps(r, indent=2))
-    print(to_markdown(r))
+    print(md)
 
 
 if __name__ == "__main__":
