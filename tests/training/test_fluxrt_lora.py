@@ -95,3 +95,10 @@ def test_video_stills_from_clip_pairs(tmp_path):
     assert make_dataset.caption_for(meta) == fluxrt_prompt("dresses")
     sel = json.loads((tmp_path / "m" / "selection.json").read_text())
     assert sel["trained_with_vivid"] is True and sel["commercial_use_cleared"] is False
+
+
+def test_run_train_builds_python311_venv():
+    """P8L failed: pinned diffusers needs Python >= 3.11, the PyTorch template has 3.10."""
+    sh = (ROOT / "training" / "fluxrt_lora" / "run_train.sh").read_text()
+    assert "uv venv --seed --python 3.11" in sh and "UV_PYTHON_INSTALL_DIR" in sh
+    assert "sys.version_info < (3, 11)" in sh
