@@ -39,9 +39,16 @@ LOG="$AZ_REPORTS/fluxlora_${AZ_EXP}_$STAMP.log"
 echo "{\"fluxrt_lora\": \"$AZ_EXP\", \"diffusers_commit\": \"$DIFFUSERS_COMMIT\", \"base\": \"$KLEIN_REPO\", \"utc\": \"$(date -u +%FT%TZ)\"}" >> "$AZ_REPORTS/code_refs.jsonl"
 
 echo "== 1. env (once)"
+# diffusers at the pinned commit needs Python >= 3.11; the RunPod PyTorch template has 3.10.
+# uv fetches a standalone Python 3.11 onto the volume (so the venv works on the next Pod too).
+export UV_PYTHON_INSTALL_DIR="$AZ_ROOT/uv-python"
+if [ -e "$VENV/bin/python" ] && ! "$VENV/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+  echo "venv-fluxlora is not a working Python >= 3.11: rebuilding it"; rm -rf "$VENV"
+fi
 if [ ! -x "$VENV/bin/python" ]; then
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q --upgrade pip
+  python3 -m pip install -q uv
+  python3 -m uv venv --seed --python 3.11 "$VENV"
+  "$VENV/bin/python" -m pip install -q --upgrade pip
   "$VENV/bin/pip" install -q torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 fi
 if [ ! -d "$SRC/.git" ]; then
