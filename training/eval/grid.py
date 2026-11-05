@@ -107,6 +107,39 @@ class Writer:
         self.c.close()
 
 
+def still_grids(results_dir: Path, out: Path, models: list[str], h: int, max_items: int, require_all: bool) -> int:
+    """Still items (input.png, ref.*, out_<model>.png[, target.png]): one labelled PNG per item and
+    all.png with the items stacked, for a quick owner review."""
+    from PIL import Image
+    rows = []
+    for d in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+        if len(rows) >= max_items or not (d / "input.png").exists():
+            continue
+        names = [m for m in models if (d / f"out_{m}.png").exists()]
+        if not names or (require_all and len(names) < len(models)):
+            continue
+        ref_p = next((d / n for n in ("ref.jpg", "ref.png") if (d / n).exists()), None)
+        panels = [(Image.open(d / "input.png").convert("RGB"), f"{d.name}  input")]
+        if ref_p:
+            panels.append((Image.open(ref_p).convert("RGB"), "item"))
+        panels += [(Image.open(d / f"out_{m}.png").convert("RGB"), m) for m in names]
+        if (d / "target.png").exists():
+            panels.append((Image.open(d / "target.png").convert("RGB"), "real (target)"))
+        row = compose(panels, h)
+        row.save(out / f"{d.name}.png")
+        rows.append(row)
+    if rows:
+        w = max(r.width for r in rows)
+        sheet = Image.new("RGB", (w, sum(r.height for r in rows)), (255, 255, 255))
+        y = 0
+        for r in rows:
+            sheet.paste(r, (0, y))
+            y += r.height
+        sheet.save(out / "all.png")
+        print(f"still grid: {len(rows)} items -> {out / 'all.png'}")
+    return len(rows)
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("results_dir")
@@ -115,12 +148,14 @@ def main(argv=None) -> None:
     ap.add_argument("--height", type=int, default=320)
     ap.add_argument("--max-frames", type=int, default=96)
     ap.add_argument("--require-all", action="store_true", help="skip clips missing any of --models")
+    ap.add_argument("--max-items", type=int, default=10, help="items in the review (owner: 5-10)")
     a = ap.parse_args(argv)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    every, n_all = None, 0
+    still_grids(Path(a.results_dir), out, a.models, a.height, a.max_items, a.require_all)
+    every, n_all, n_clips = None, 0, 0
     for d in sorted(p for p in Path(a.results_dir).iterdir() if p.is_dir()):
-        if not (d / "input.mp4").exists():
+        if not (d / "input.mp4").exists() or n_clips >= a.max_items:
             continue
         if a.require_all and not all((d / f"out_{m}.mp4").exists() for m in a.models):
             continue
@@ -137,12 +172,13 @@ def main(argv=None) -> None:
             continue
         w.close()
         n_all += n
+        n_clips += 1
         print(f"{d.name}: {n} frames -> {out / (d.name + '.mp4')}", flush=True)
     if every:
         every.close()
         print(f"all clips: {n_all} frames -> {out / 'all.mp4'}")
-    else:
-        print("no clip folders with out_<model>.mp4 found")
+    elif not any(out.glob("*.png")):
+        print("no clip or still items with out_<model> found")
 
 if __name__ == "__main__":
     main()
