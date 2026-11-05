@@ -416,6 +416,6 @@ def test_trainpipe_engine_lengths_and_wiring():
     root = Path(__file__).resolve().parents[2] / "training"
     bd = (root / "joyai_0811_lora" / "build_data.sh").read_text()
     assert 'ENGINE="${AZ_ENGINE:-deploy}"' in bd and "--engine trainpipe --config" in bd
-    assert "setup_training_pod.sh" in bd and "make_fashion_config.py" in bd
+    assert "setup_training_pod.sh" in bd and "make_fashion_config.py" in bd and "export AZ_MANIFEST_DIR=" in bd
     ls = (root / "data_tools" / "live_source.py").read_text()
     assert '"--engine", choices=["deploy", "trainpipe"]' in ls

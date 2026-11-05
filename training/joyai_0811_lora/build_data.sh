@@ -78,6 +78,9 @@ if [ "$ENGINE" = "trainpipe" ]; then
   UP="$AZ_ROOT/JoyAI-Video-Edit/training"
   "$PY" "$AZ_ROOT/azyah-code/training/scripts/make_fashion_config.py" "$UP"
   export JOYAI_BASE_MODEL="$DIT" JOYAI_VAE="$C/vae" JOYAI_TEXT_ENCODER="$C/MiMo-VL-7B-RL-2508"
+  # The fashion config refuses to load without a manifest folder; the editor reads no training data,
+  # so any existing manifest will do (the same one step 1's generate_vivid used).
+  export AZ_MANIFEST_DIR="${AZ_MANIFEST_DIR:-$AZ_ROOT/manifests/research-train}"
   export PYTHONPATH="$UP:$AZ_ROOT/azyah-code/training" PATH="$AZ_ROOT/venv/bin:$PATH"
   LS=("$AZ_ROOT/venv/bin/torchrun" --nproc_per_node 1 -m data_tools.live_source --dit "$DIT" --vae "$C/vae"
       --text-encoder "$C/MiMo-VL-7B-RL-2508" --engine trainpipe --config "$UP/configs/azyah_fashion_stage1.py")
