@@ -4,7 +4,7 @@ pseudo-source still, real target still) becomes an iv2v sample whose two videos 
 same still repeated, at the live 480x840 portrait size and 24 fps.
 
   python3 make_static_clips.py --manifest-dir $AZ_MANIFEST_DIR --out DIR [--frames 25] [--max 3000]
-         [--mode research|commercial] [--vivid-videos]
+         [--mode research|commercial] [--vivid-videos] [--staging-dirs DIR ...] [--detail-oversample 2]
 
 Why stills: the owner checked the P8 ViViD pseudo-source VIDEOS (2026-11-04) and the clothes
 change within every clip, so they would teach the live model to flicker. A still pushed as a
@@ -23,8 +23,16 @@ short static clip (as data_tools/pseudo_source.py did for stills) is steady by c
 - --vivid-videos (OFF by default): also copy the ViViD iv2v clip pairs from v2v.json as they
   are. They flicker (see above); only for an explicit, owner-approved experiment.
 
+- --staging-dirs (step 3a): the staged pair folders behind the manifest (glance_upper,
+  glance_lower, ...). Each sample's mask.png (Glance agnostic mask, white = garment) gets the
+  same cover crop as the clips and is written to DIR/masks/<sample key>.png; train.py weights
+  the loss inside it (AZ_MASK_WEIGHT) and adds the edge term there (AZ_EDGE_WEIGHT).
+- --detail-oversample N (step 3a, default 2; 1 = off): every garment photo gets a detail score
+  (eval.metrics edge energy on its non-white pixels: prints, trims, ribs, ruffles); the top
+  third is repeated N times (keys <key>_d2, ...) so detailed garments get more of the training.
+
 Writes DIR/shards/*.tar, DIR/manifest/v2v.json + selection.json (provenance travels with the
-LoRA: commercial_use_cleared, trained_with_vivid) and DIR/build_summary.json.
+LoRA: commercial_use_cleared, trained_with_vivid), DIR/masks/ and DIR/build_summary.json.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data_tools import manifests, sources  # noqa: E402
+from eval import metrics  # noqa: E402
 from data_tools.shards import Sample, write_shards  # noqa: E402
 
 LIVE_SIZE = (480, 840)  # width, height: the live JOYAI_SESSION_WIDTH x JOYAI_SESSION_HEIGHT
@@ -147,6 +156,54 @@ def video_sample(key: str, files: dict[str, bytes], meta: dict) -> Sample | None
                   person_id=m.get("person_id"), consent_id=m.get("consent_id"), extra={**extra, "flicker_risk": True})
 
 
+def detail_score(garment_bytes: bytes) -> float:
+    """Edge energy of the garment photo's non-white pixels (eval.metrics): high = prints, trims,
+    ribs, ruffles; low = plain fabric."""
+    from PIL import Image
+    a = metrics._arr(Image.open(io.BytesIO(garment_bytes)))
+    m = a.min(axis=2) < 0.92
+    return metrics._edge_energy(a, m if m.sum() > 100 else None)
+
+
+def oversample_keys(scores: dict[str, float], factor: int) -> dict[str, int]:
+    """key -> how many times to use it: the top third by score `factor` times, the rest once."""
+    if factor <= 1 or not scores:
+        return {k: 1 for k in scores}
+    ranked = sorted(scores, key=lambda k: (-scores[k], k))
+    top = set(ranked[: max(1, len(ranked) // 3)])
+    return {k: (factor if k in top else 1) for k in scores}
+
+
+def staging_index(dirs: list[str] | None) -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for d in dirs or []:
+        root = Path(d)
+        if root.is_dir():
+            for p in root.iterdir():
+                if p.is_dir():
+                    out[p.name] = p
+    return out
+
+
+def staged_mask(index: dict[str, Path], key: str):
+    """The staged mask.png of a shard key (identity pairs '<key>_id' share their pair's mask)."""
+    from PIL import Image
+    for k in (key, key[:-3] if key.endswith("_id") else None):
+        if k and k in index and (index[k] / "mask.png").exists():
+            return Image.open(index[k] / "mask.png")
+    return None
+
+
+def write_mask(mask_img, target_size: tuple[int, int], path: Path, size: tuple[int, int] = LIVE_SIZE) -> None:
+    """Same cover crop as the clips: the mask is first brought to the target's size."""
+    from PIL import Image
+    m = mask_img.convert("L")
+    if m.size != target_size:
+        m = m.resize(target_size, Image.NEAREST)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cover(m, *size).save(path)
+
+
 def allowed(source: str, mode: str) -> bool:
     try:
         src = sources.get(source)
@@ -156,7 +213,8 @@ def allowed(source: str, mode: str) -> bool:
 
 
 def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, mode: str = "research",
-          vivid_videos: bool = False, seed: int = 0, per_shard: int = 250) -> dict:
+          vivid_videos: bool = False, seed: int = 0, per_shard: int = 250,
+          staging_dirs: list[str] | None = None, detail_oversample: int = 2) -> dict:
     if frames < 9 or (frames - 1) % 8:
         raise SystemExit("--frames must be 8n+1 and at least 9 (the VAE's time factor is 8)")
     if mode not in ("research", "commercial"):
@@ -165,7 +223,11 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
     stills = [(k, f, j) for k, f, j in iter_manifest(mdir, "i2i")]
     random.Random(seed).shuffle(stills)
     by_source: dict[str, list[Sample]] = defaultdict(list)
-    counts = {"stills_seen": len(stills), "static_clips": 0, "skipped": 0, "dropped_by_mode": 0, "vivid_videos": 0}
+    counts = {"stills_seen": len(stills), "static_clips": 0, "skipped": 0, "dropped_by_mode": 0, "vivid_videos": 0,
+              "masks": 0, "oversampled_extra": 0}
+    index = staging_index(staging_dirs)
+    scores: dict[str, float] = {}
+    built: list[Sample] = []
     for key, files, meta in stills:
         if counts["static_clips"] >= max_items:
             break
@@ -177,8 +239,26 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
         if s is None or not s.caption.strip():
             counts["skipped"] += 1
             continue
-        by_source[s.source].append(s)
+        built.append(s)
+        scores[s.key] = detail_score(_pick(files, "0"))
+        mask = staged_mask(index, key)
+        if mask is not None:
+            from PIL import Image
+            write_mask(mask, Image.open(io.BytesIO(_pick(files, "2"))).size, out_dir / "masks" / f"{s.key}.png")
+            counts["masks"] += 1
         counts["static_clips"] += 1
+    times = oversample_keys(scores, detail_oversample)
+    for s in built:
+        by_source[s.source].append(s)
+        for n in range(2, times[s.key] + 1):
+            dup = Sample(key=f"{s.key}_d{n}", task=s.task, files=s.files, caption=s.caption, source=s.source,
+                         split=s.split, garment_id=s.garment_id, person_id=s.person_id, consent_id=s.consent_id,
+                         extra={**s.extra, "detail_oversampled": True}, captions=dict(s.captions))
+            by_source[s.source].append(dup)
+            m = out_dir / "masks" / f"{s.key}.png"
+            if m.exists():
+                (out_dir / "masks" / f"{dup.key}.png").write_bytes(m.read_bytes())
+            counts["oversampled_extra"] += 1
     if vivid_videos:
         for key, files, meta in iter_manifest(mdir, "v2v"):
             src = meta.get("metadata", {}).get("source", "")
@@ -194,7 +274,12 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
         catalog += write_shards(items, out_dir / "shards", f"joyai0811-{source}", per_shard)
     selection = manifests.build(catalog, mode, "train")
     manifests.write(selection, out_dir / "manifest")
-    summary = {**counts, "frames": frames, "size": list(LIVE_SIZE), "mode": mode, "shards": len(catalog),
+    vals = sorted(scores.values())
+    detail = ({"n": len(vals), "min": round(vals[0], 5), "median": round(vals[len(vals) // 2], 5),
+               "max": round(vals[-1], 5), "oversample": detail_oversample,
+               "top_third_threshold": round(vals[-max(1, len(vals) // 3)], 5)} if vals else {})
+    summary = {**counts, "detail_scores": detail, "frames": frames, "size": list(LIVE_SIZE), "mode": mode,
+               "shards": len(catalog), "mask_dir": str(out_dir / "masks"),
                "manifest_dir": str(out_dir / "manifest"),
                **{k: selection[k] for k in ("used_sources", "commercial_use_cleared", "trained_with_vivid")}}
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -212,8 +297,11 @@ def main(argv=None) -> dict:
                     help="also train on the ViViD clip pairs (they flicker; owner opt-in only)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--per-shard", type=int, default=250)
+    ap.add_argument("--staging-dirs", nargs="*", default=[], help="staged pair folders (for mask.png)")
+    ap.add_argument("--detail-oversample", type=int, default=2, help="repeat the most detailed third N times (1 = off)")
     a = ap.parse_args(argv)
-    summary = build(a.manifest_dir, a.out, a.frames, a.max, a.mode, a.vivid_videos, a.seed, a.per_shard)
+    summary = build(a.manifest_dir, a.out, a.frames, a.max, a.mode, a.vivid_videos, a.seed, a.per_shard,
+                    a.staging_dirs, a.detail_oversample)
     print(json.dumps(summary, indent=2))
     return summary
 
