@@ -80,7 +80,7 @@ fi
 echo "== 3. dataset ($SAMPLES triples at $SIZE)"
 if [ ! -f "$DATA/dataset_summary.json" ]; then
   mkdir -p "$AZ_ROOT/azyah-tools"
-  for f in data_tools/__init__.py data_tools/fluxrt_prompt.py fluxrt_lora/__init__.py fluxrt_lora/make_dataset.py; do
+  for f in data_tools/__init__.py data_tools/fluxrt_prompt.py data_tools/sources.py fluxrt_lora/__init__.py fluxrt_lora/make_dataset.py; do
     mkdir -p "$AZ_ROOT/azyah-tools/$(dirname "$f")"
     curl -fsSL "$RAW/$f" -o "$AZ_ROOT/azyah-tools/$f"
   done

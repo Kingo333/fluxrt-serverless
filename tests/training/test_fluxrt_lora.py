@@ -102,3 +102,22 @@ def test_run_train_builds_python311_venv():
     sh = (ROOT / "training" / "fluxrt_lora" / "run_train.sh").read_text()
     assert "uv venv --seed --python 3.11" in sh and "UV_PYTHON_INSTALL_DIR" in sh
     assert "sys.version_info < (3, 11)" in sh
+
+
+def test_selection_counts_only_used_sources(tmp_path):
+    """P8L listed vivid although AZ_VIDEO_FRAMES=0 took no ViViD sample: selection.json must count the data."""
+    assert make_dataset.selection_for({"glance"})["commercial_use_cleared"] is True
+    mixed = make_dataset.selection_for({"glance", "vivid"}, {"mode": "research", "used_sources": ["glance", "vivid"]})
+    assert mixed["commercial_use_cleared"] is False and mixed["trained_with_vivid"] is True
+    assert mixed["manifest"]["mode"] == "research"
+    assert make_dataset.selection_for({"unknown"})["commercial_use_cleared"] is False
+    pytest.importorskip("pyarrow")
+    out = tmp_path / "ds"
+    (out / "data").mkdir(parents=True)
+    rows = [{"key": "glance_womens_upperwear_train_0000001", "caption": "x", "person": png((1, 1, 1)),
+             "garment": png((2, 2, 2)), "target": png((3, 3, 3))}]
+    make_dataset.write_parquet(rows, out / "data" / "train-00000.parquet")
+    (out / "selection.json").write_text(json.dumps({"used_sources": ["glance", "vivid"], "commercial_use_cleared": False}))
+    sel = make_dataset.fix_selection(str(out))
+    assert sel["used_sources"] == ["glance"] and sel["commercial_use_cleared"] is True
+    assert json.loads((out / "selection.manifest.json").read_text())["used_sources"] == ["glance", "vivid"]
