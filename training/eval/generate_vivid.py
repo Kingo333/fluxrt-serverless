@@ -176,6 +176,10 @@ def main(argv=None) -> None:
         a.steps = a.steps or 2
         a.guidance = 1.0 if a.guidance is None else a.guidance
         a.ref_basesize = a.ref_basesize or 768
+    # The bid pretrain checkpoint may be gone from the volume (step 3 uses the 0811 clone): the
+    # config only needs JOYAI_BASE_MODEL to exist, and the weights come from --ckpt / --base anyway.
+    if not Path(os.environ.get("JOYAI_BASE_MODEL", "/nonexistent")).exists():
+        os.environ["JOYAI_BASE_MODEL"] = getattr(a, "base", None) or a.ckpt
     print("model paths:", default_model_env())
     Path(a.out).mkdir(parents=True, exist_ok=True)
 

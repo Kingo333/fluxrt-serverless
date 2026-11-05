@@ -32,6 +32,7 @@ PY="$AZ_ROOT/venv/bin/python"
 BASE="${AZ_BASE_0811:-$(find "$AZ_CKPT" -name joyai_video_edit_dit_0811.pth 2>/dev/null | head -1)}"
 BASE="$(readlink -f "$BASE")"
 case "$BASE" in "$AZ_ROOT"/*) ;; *) echo "REFUSING: base $BASE is not the clone on the training volume"; exit 1 ;; esac
+export JOYAI_BASE_MODEL="$BASE"   # never the bid pretrain checkpoint (it may be deleted to free space)
 
 curl -fsSL "$SCRIPTS_URL/setup_training_pod.sh" | bash
 git -C "$AZ_ROOT/azyah-code" fetch -q origin "$AZ_REF" && git -C "$AZ_ROOT/azyah-code" checkout -q "$AZ_REF"
