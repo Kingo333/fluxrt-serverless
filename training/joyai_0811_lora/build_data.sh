@@ -17,6 +17,9 @@ set -euo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
 AZ_PART="${AZ_PART:?set AZ_PART=cpu or AZ_PART=gpu}"
 export AZ_ROOT="${AZ_ROOT:-/workspace/azyah-vton}"
+# Plain Hugging Face downloads: the PyTorch template sets HF_HUB_ENABLE_HF_TRANSFER=1 without the
+# hf_transfer package (3b CPU run failed on it); same settings as scripts/common.sh.
+export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 C="$AZ_ROOT/checkpoints"; S="$AZ_ROOT/data/staging"; D="$AZ_ROOT/data"; M="$AZ_ROOT/manifests"
 VIVID_DRESSES="${AZ_VIVID_DRESSES:-1}"
 UPPER_LIMIT="${AZ_LIVE_UPPER:-1200}"     # live-way inputs per Glance set (~3 s each on a PRO 6000)
