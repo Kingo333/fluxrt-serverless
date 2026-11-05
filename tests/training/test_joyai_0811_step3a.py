@@ -333,3 +333,76 @@ def test_scripts_wire_the_owner_decisions():
     ev = (PKG / "eval_saves.sh").read_text()
     assert 'ITEMS="${AZ_EVAL_ITEMS:-16}"' in ev and "--pairs-from" in ev and "live0811_ref1024 --ref-basesize 1024" in ev
     assert "--height 832" in ev and "vivid_test_000000 vivid_test_000002 vivid_test_000010 vivid_test_000029" in ev
+
+
+# ---------- real-motion clips (owner 2026-11-05) ----------
+
+def _moving(n, flicker=False):
+    from PIL import Image
+    frames = []
+    for k in range(n):
+        im = Image.new("RGB", (60, 80), (200, 200, 200))
+        im.paste((40, 40, 40), (k * 2 % 40, 10, k * 2 % 40 + 15, 60))   # a person moving across
+        if flicker:
+            im.paste((255, 0, 0) if (k // 4) % 2 else (0, 0, 255), (0, 60, 60, 80))   # garment changes per chunk
+        frames.append(im)
+    return frames
+
+
+def test_clip_check_rejects_flickering_inputs():
+    from data_tools import live_source as lsrc
+    real = _moving(16)
+    assert abs(lsrc.extra_motion(real, real)) < 1e-6
+    assert lsrc.extra_motion(_moving(16, flicker=True), real) > lsrc.MAX_EXTRA_MOTION
+    from PIL import Image
+    edited = [f.copy() for f in real]
+    for e in edited:
+        e.paste((90, 150, 90), (0, 60, 60, 80))                                          # steady new garment
+    ok, em = lsrc.clip_check(real, edited, None, 0.05)
+    assert ok.ok and em is not None and em <= lsrc.MAX_EXTRA_MOTION
+    bad, em2 = lsrc.clip_check(real, _moving(16, flicker=True), None, 0.05)
+    assert not bad.ok and bad.reason == "input video flickers"
+
+
+def test_pack_only_live_source_skips_old_p8_clips(tmp_path):
+    from data_tools import pack
+    from PIL import Image
+    a = _stage(tmp_path, "glance_a", "upper")
+    b = _stage(tmp_path, "glance_b", "upper")
+    for d in (a, b):
+        Image.new("RGB", (60, 80), (1, 2, 3)).save(d / "source.png")
+    Image.new("RGB", (60, 80), (9, 9, 9)).save(a / "live_source.png")
+    m = json.loads((a / "meta.json").read_text())
+    m["live_source"] = {"ok": True}
+    (a / "meta.json").write_text(json.dumps(m))
+    r = pack.pack(str(tmp_path), str(tmp_path / "out"), "t", identity_frac=0.0, only_live_source=True, split="train")
+    assert r["samples"] == 1 and r["skipped_no_source"] == 1
+
+
+def test_motion_first_picks_the_most_moving_clips(tmp_path):
+    import importlib.util as u
+    spec = u.spec_from_file_location("gv", Path(__file__).resolve().parents[2] / "training" / "eval" / "generate_vivid.py")
+    gv = u.module_from_spec(spec)
+    spec.loader.exec_module(gv)
+    dirs = {}
+    for k in ("f1", "c1", "c2", "c3"):
+        d = tmp_path / k
+        d.mkdir()
+        (d / "target.mp4").write_bytes(b"x")
+        dirs[k] = d
+    scores = {"c1": 0.01, "c2": 0.09, "c3": 0.05}
+    fixed = [(dirs["f1"], dirs["c1"])]
+    cands = [(dirs[k], dirs["f1"]) for k in ("c1", "c2", "c3", "f1")]
+    pairs, moving = gv.motion_first(fixed, cands, 2, score=lambda p: scores[p.name])
+    assert [p.name for p, _ in pairs] == ["f1", "c2", "c3"] and moving == [("c2", 0.09), ("c3", 0.05)]
+
+
+def test_scripts_wire_real_motion_clips():
+    root = Path(__file__).resolve().parents[2] / "training" / "joyai_0811_lora"
+    bd = (root / "build_data.sh").read_text()
+    rt = (root / "run_train.sh").read_text()
+    ev = (root / "eval_saves.sh").read_text()
+    assert 'VIVID_CLIPS="${AZ_VIVID_CLIPS:-1}"' in bd and "--videos --categories" in bd and "--max-frames 97" in bd
+    assert "--only-live-source --split train" in bd and "vivid_clips_live.catalog.json" in bd
+    assert "--clip-repeat" in rt and 'CLIP_REPEAT="${AZ_CLIP_REPEAT:-3}"' in rt
+    assert "--motion-first 4" in ev and "motion_keys.txt" in ev

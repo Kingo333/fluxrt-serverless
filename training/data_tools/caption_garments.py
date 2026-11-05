@@ -114,10 +114,12 @@ def has_input(d: Path, meta: dict) -> bool:
     return find(d, "source") is not None or bool((meta.get("live_source") or {}).get("ok") and find(d, "live_source"))
 
 
-def process(staging_dir: str, captioner: Captioner, limit: int | None = None, only_with_source: bool = False) -> dict:
+def process(staging_dir: str, captioner: Captioner, limit: int | None = None, only_with_source: bool = False,
+            only_live_source: bool = False) -> dict:
     stats = {"described": 0, "skipped": 0, "failed": 0}
     for d, meta in iter_pairs(Path(staging_dir)):
-        if meta.get("garment_description") or (only_with_source and not has_input(d, meta)):
+        if meta.get("garment_description") or (only_with_source and not has_input(d, meta)) \
+                or (only_live_source and not (meta.get("live_source") or {}).get("ok")):
             stats["skipped"] += 1
             continue
         if limit is not None and stats["described"] + stats["failed"] >= limit:
@@ -146,13 +148,14 @@ def main() -> None:
     ap.add_argument("--limit", type=int)
     ap.add_argument("--backend", default="gemini", choices=["gemini", "mimo"])
     ap.add_argument("--only-with-source", action="store_true", help="only pairs that have a source/live_source input")
+    ap.add_argument("--only-live-source", action="store_true", help="only pairs with an ok live_source input")
     ap.add_argument("--model", help="gemini model name, or the MiMo-VL folder for --backend mimo")
     a = ap.parse_args()
     if a.backend == "mimo":
         cap = MiMoVLCaptioner(a.model or "/workspace/azyah-vton/checkpoints/MiMo-VL-7B-RL-2508")
     else:
         cap = GeminiCaptioner(a.model or "gemini-2.5-flash")
-    print(json.dumps(process(a.staging_dir, cap, a.limit, a.only_with_source), indent=2))
+    print(json.dumps(process(a.staging_dir, cap, a.limit, a.only_with_source, a.only_live_source), indent=2))
 
 
 if __name__ == "__main__":

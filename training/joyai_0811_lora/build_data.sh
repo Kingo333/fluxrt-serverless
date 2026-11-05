@@ -22,14 +22,19 @@ export AZ_ROOT="${AZ_ROOT:-/workspace/azyah-vton}"
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 C="$AZ_ROOT/checkpoints"; S="$AZ_ROOT/data/staging"; D="$AZ_ROOT/data"; M="$AZ_ROOT/manifests"
 VIVID_DRESSES="${AZ_VIVID_DRESSES:-1}"
-UPPER_LIMIT="${AZ_LIVE_UPPER:-800}"      # live-way inputs per Glance set (~3 s each on a PRO 6000)
-LOWER_LIMIT="${AZ_LIVE_LOWER:-800}"
+UPPER_LIMIT="${AZ_LIVE_UPPER:-500}"      # live-way inputs per Glance set (~3 s each on a PRO 6000)
+LOWER_LIMIT="${AZ_LIVE_LOWER:-500}"
 DRESS_LIMIT="${AZ_VIVID_DRESS_LIMIT:-400}"
 # Owner decision 2026-11-05: ViViD tops and bottoms too (real frames as targets, inputs made the
 # live way). Research-only like the dresses; AZ_VIVID_STILLS=0 keeps only the dresses.
 VIVID_STILLS="${AZ_VIVID_STILLS:-1}"
-VUPPER_LIMIT="${AZ_VIVID_UPPER_LIMIT:-600}"
+VUPPER_LIMIT="${AZ_VIVID_UPPER_LIMIT:-400}"
 VLOWER_LIMIT="${AZ_VIVID_LOWER_LIMIT:-343}"
+# Real-motion clips (owner 2026-11-05: accuracy while the person moves, turns, shows side/back):
+# ViViD train clips get an input made the live way (the 0811 clone, a fixed garment photo of
+# another item, 97 frames), kept only if steady (live_source.clip_check); target = the real clip.
+VIVID_CLIPS="${AZ_VIVID_CLIPS:-1}"
+CLIPS_PER_CAT="${AZ_VIVID_CLIPS_PER_CAT:-150}"
 REMOVE_FRAC="${AZ_REMOVE_FRAC:-0.25}"
 GLANCE_REV=7ae72513413932dbfdb15d02c924f3be9739b0c4
 mkdir -p "$AZ_ROOT/reports"
@@ -91,9 +96,24 @@ for v in "${VIVID_SETS[@]}"; do
   timeout -s INT 45m "$PY" "${LS[@]}" "$S/vivid_${v}_stills" --limit "$lim" || echo "VIVID_${v}_EXIT=$?"
 done
 
+if [ "$VIVID_CLIPS" = "1" ]; then
+  echo "== 1b. real-motion clips: ViViD train clips, inputs made the live way (${CLIPS_PER_CAT} per category, 97 frames)"
+  for c in dress upper lower; do
+    timeout -s INT 40m "$PY" -m data_tools.live_source "$S/vivid" --dit "$DIT" --vae "$C/vae" \
+      --text-encoder "$C/MiMo-VL-7B-RL-2508" --remove-frac 0 --videos --categories "$c" --max-frames 97 \
+      --limit "$CLIPS_PER_CAT" || echo "CLIPS_${c}_EXIT=$?"
+  done
+fi
+
 echo "== 2. detail captions (MiMo-VL-7B-RL-2508, local; only pairs that have an input)"
 CAP_LIMIT="${AZ_CAPTION_LIMIT:-1500}"   # per set, ~1 s each; half the training captions use them anyway
-for d in "${DIRS[@]}"; do
+CAP_DIRS=("${DIRS[@]}"); [ "$VIVID_CLIPS" = "1" ] && CAP_DIRS+=("$S/vivid")
+for d in "${CAP_DIRS[@]}"; do
+  if [ "$d" = "$S/vivid" ]; then
+    timeout -s INT 20m "$PY" -m data_tools.caption_garments "$d" --backend mimo --model "$C/MiMo-VL-7B-RL-2508" \
+      --only-live-source --limit 500 || echo "CAPTION_EXIT=$? ($d)"
+    continue
+  fi
   timeout -s INT 30m "$PY" -m data_tools.caption_garments "$d" --backend mimo --model "$C/MiMo-VL-7B-RL-2508" \
     --only-with-source --limit "$CAP_LIMIT" || echo "CAPTION_EXIT=$? ($d)"
 done
@@ -109,13 +129,17 @@ if [ "${#VIVID_SETS[@]}" -gt 0 ]; then
     "$PY" -m data_tools.pack "$S/vivid_${v}_stills" "$D/shards" --name "vivid_${v}_live" --prefer-live-source
     CATS+=("$D/shards/vivid_${v}_live.catalog.json")
   done
+  if [ "$VIVID_CLIPS" = "1" ]; then
+    "$PY" -m data_tools.pack "$S/vivid" "$D/shards" --name vivid_clips_live --only-live-source --split train
+    CATS+=("$D/shards/vivid_clips_live.catalog.json")
+  fi
   "$PY" -m data_tools.manifests "${CATS[@]}" --out "$M/joyai0811-research-train" --mode research --split train
 fi
 for m in "$M/joyai0811-commercial-train" "$M/joyai0811-research-train"; do
   [ -f "$m/selection.json" ] && { echo "== $m"; cat "$m/selection.json"; }
 done
 echo "== counts"
-"$PY" - "${DIRS[@]}" <<'PYEOF'
+"$PY" - "${CAP_DIRS[@]}" <<'PYEOF'
 import json, sys
 from pathlib import Path
 for d in sys.argv[1:]:

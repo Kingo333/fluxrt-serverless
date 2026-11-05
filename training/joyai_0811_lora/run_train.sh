@@ -46,8 +46,12 @@ export AZ_DETAILED_CAPTION_PROB="${AZ_DETAIL_CAPTION_FRAC:-${AZ_DETAILED_CAPTION
 export AZ_MASK_WEIGHT="${AZ_MASK_WEIGHT:-3.0}" AZ_EDGE_WEIGHT="${AZ_EDGE_WEIGHT:-0.5}"
 DETAIL_OVERSAMPLE="${AZ_DETAIL_OVERSAMPLE:-2}"
 export AZ_STAGE1_LORA=1 AZ_GRAD_ACCUM="${AZ_GRAD_ACCUM:-1}" AZ_HSDP_SHARD=1 AZ_SP_SIZE=1 AZ_AUTO_RESUME=1
-SAMPLES="${AZ_SAMPLES:-4000}"   # still triples before detail oversampling
-VIVID_VIDEOS="${AZ_VIVID_VIDEOS:-0}"                 # 1 = also the ViViD clip pairs (they flicker; owner opt-in)
+# Real-motion clips (owner 2026-11-05: garment accuracy while the person moves and turns): the
+# research manifest's v2v group holds ONLY ViViD clips whose input was made the live way and passed
+# the steadiness check (build_data.sh packs with --only-live-source), never the flickering P8 clips.
+VIVID_VIDEOS="${AZ_VIVID_VIDEOS:-$WITH_VIVID_DRESSES}"
+CLIP_REPEAT="${AZ_CLIP_REPEAT:-3}"   # each clip used 3x (a new random 25-frame window each time)
+if [ "$VIVID_VIDEOS" = "1" ]; then SAMPLES="${AZ_SAMPLES:-2500}"; else SAMPLES="${AZ_SAMPLES:-4000}"; fi   # still triples
 TOOLS="$AZ_ROOT/azyah-tools/training"
 DATA="$AZ_DATA/joyai0811_lora/$AZ_EXP"
 export JOYAI_OUTPUT_DIR="$AZ_OUT/joyai0811_lora"
@@ -85,7 +89,7 @@ done
 
 echo "== 4. data: steady static clips from the still triples ($SAMPLES, ${AZ_STATIC_FRAMES} frames, 480x840)"
 if [ ! -f "$DATA/build_summary.json" ]; then
-  EXTRA=(); [ "$VIVID_VIDEOS" = "1" ] && EXTRA=(--vivid-videos) && DATA_MODE=research
+  EXTRA=(); [ "$VIVID_VIDEOS" = "1" ] && EXTRA=(--vivid-videos --clip-repeat "$CLIP_REPEAT") && DATA_MODE=research
   "$PY" "$TOOLS/joyai_0811_lora/make_static_clips.py" --manifest-dir "$SRC_MANIFESTS" --out "$DATA" \
     --frames "$AZ_STATIC_FRAMES" --max "$SAMPLES" --mode "$DATA_MODE" "${EXTRA[@]}" \
     --staging-dirs "${STAGING_DIRS[@]}" --detail-oversample "$DETAIL_OVERSAMPLE"

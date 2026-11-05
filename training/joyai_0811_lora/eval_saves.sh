@@ -42,7 +42,7 @@ cd "$AZ_UPSTREAM/training"
 export PYTHONPATH="$PWD:$A" PATH="$AZ_ROOT/venv/bin:$PATH"
 G=(torchrun --nproc_per_node 1 -m eval.generate_vivid --config configs/azyah_fashion_stage1.py
    --staging "$AZ_DATA/staging/vivid" --out "$OUT" --max-items "$ITEMS" --live --cross)
-[ -d "$PAIRS_FROM" ] && G+=(--pairs-from "$PAIRS_FROM") || echo "WARNING: $PAIRS_FROM missing; regression pairs not fixed"
+[ -d "$PAIRS_FROM" ] && G+=(--pairs-from "$PAIRS_FROM" --motion-first 4) || echo "WARNING: $PAIRS_FROM missing; regression pairs not fixed"
 
 MODELS=(live0811 live0811_ref1024)
 "${G[@]}" --ckpt "$BASE" --name live0811
@@ -57,8 +57,8 @@ echo "GEN_DONE models: ${MODELS[*]}"
 # for live0811 and every save. The 16-clip set stays at 49 frames.
 LONG="${OUT}_long"
 GL=(torchrun --nproc_per_node 1 -m eval.generate_vivid --config configs/azyah_fashion_stage1.py
-    --staging "$AZ_DATA/staging/vivid" --out "$LONG" --max-items 4 --num-frames 97 --live --cross)
-[ -d "$PAIRS_FROM" ] && GL+=(--pairs-from "$PAIRS_FROM")
+    --staging "$AZ_DATA/staging/vivid" --out "$LONG" --max-items 8 --num-frames 97 --live --cross)
+[ -d "$PAIRS_FROM" ] && GL+=(--pairs-from "$PAIRS_FROM" --motion-first 4)
 LONG_MODELS=(live0811)
 "${GL[@]}" --ckpt "$BASE" --name live0811
 for ck in $(find "$EXP_DIR/checkpoints" -name "step_*.pth" | sort -V); do
@@ -71,6 +71,11 @@ cd "$A"
 "$PY" -m eval.run_eval "$OUT" --out "$OUT/report.md" --ref live0811; cat "$OUT/report.md"
 "$PY" -m eval.grid "$OUT" "${OUT}_grid" --models "${MODELS[@]}" --require-all --max-items 8   # owner reviews 5-10 items; all 16 are scored in report.md
 echo "grid videos: ${OUT}_grid (all.mp4 = every clip; panels: input | garment | ${MODELS[*]})"
+# Motion clips (owner 2026-11-05): the 4 test clips that move most (turns, side/back views) are
+# reviewed next to the owner's 4 regression clips.
+MOTION="$(cut -d' ' -f1 "$OUT/motion_keys.txt" 2>/dev/null | tr '\n' ' ')"
+echo "motion clips: $MOTION"
+REGRESSION="$REGRESSION $MOTION"
 REG="${OUT}_regression"
 mkdir -p "$REG"
 for k in $REGRESSION; do [ -d "$OUT/$k" ] && ln -sfn "$OUT/$k" "$REG/$k"; done

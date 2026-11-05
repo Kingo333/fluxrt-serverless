@@ -302,7 +302,7 @@ def test_run_script_guards_the_live_model_and_pins_settings():
     assert "/runpod-volume/*) echo \"REFUSING" in sh and "is not on the training volume" in sh
     for knob in ('AZ_MAX_STEPS="${AZ_MAX_STEPS:-1000}"', 'AZ_LR="${AZ_LR:-3e-5}"', 'AZ_LORA_RANK="${AZ_LORA_RANK:-32}"',
                  'AZ_CKPT_INTERVAL="${AZ_CKPT_INTERVAL:-250}"', 'AZ_STATIC_FRAMES="${AZ_STATIC_FRAMES:-25}"',
-                 'VIVID_VIDEOS="${AZ_VIVID_VIDEOS:-0}"'):
+                 'VIVID_VIDEOS="${AZ_VIVID_VIDEOS:-$WITH_VIVID_DRESSES}"'):
         assert knob in sh
     assert "prune_checkpoints" not in sh and "GOOD_SAVES" in sh
     ev = (PKG / "eval_saves.sh").read_text()
@@ -341,3 +341,11 @@ def test_real_frame_sources_are_taken_first(tmp_path):
     s2 = mod.build(str(_manifest_dir(tmp_path / "x") if (tmp_path / "x").mkdir() is None else None), str(tmp_path / "o2"),
                    frames=9, max_items=3, mode="research", detail_oversample=1, prefer_sources=())
     assert sum(s2["by_source"].values()) == 3
+
+
+def test_motion_clips_are_repeated(tmp_path):
+    pytest.importorskip("av")
+    mod = load(PKG / "make_static_clips.py", "make_static_clips4")
+    s = mod.build(str(_manifest_dir(tmp_path)), str(tmp_path / "o"), frames=9, mode="research", vivid_videos=True,
+                  detail_oversample=1, clip_repeat=3)
+    assert s["vivid_videos"] == 3

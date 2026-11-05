@@ -89,6 +89,35 @@ def build_pool(staging_dirs: list[str]) -> dict[str, list[tuple[str, Path]]]:
     return pool
 
 
+MAX_EXTRA_MOTION = 0.015  # clips: the input may move this much more per frame than the real clip
+
+
+def extra_motion(out_frames, real_frames, size=(120, 210)) -> float:
+    """Mean frame-to-frame change of the edited clip minus that of the real clip (0..1). The real
+    clip's own motion cancels out, so a high value means the edit flickers (garment changing between
+    chunks), which is what made the P8 pseudo-source videos unusable (owner check 2026-11-04)."""
+    import numpy as np
+
+    def motion(frames):
+        a = [np.asarray(f.convert("RGB").resize(size), dtype=np.float32) / 255.0 for f in frames]
+        return float(np.mean([np.abs(a[k + 1] - a[k]).mean() for k in range(len(a) - 1)])) if len(a) > 1 else 0.0
+    return motion(out_frames) - motion(real_frames)
+
+
+def clip_check(frames, out, mask, max_outside):
+    """Clips: the garment must change and the person must not, at 1/4, 1/2 and 3/4 of the clip
+    (not only the middle frame), and the edit must be steady over time."""
+    n = len(frames)
+    for k in (n // 4, n // 2, (3 * n) // 4):
+        c = quality_filter(frames[k], out[k], mask, max_outside=max_outside)
+        if not c.ok:
+            return c, None
+    em = extra_motion(out, frames)
+    if em > MAX_EXTRA_MOTION:
+        return type(c)(False, c.inside_change, c.outside_change, "input video flickers"), em
+    return c, em
+
+
 def process(staging_dirs: list[str], editor, remove_frac: float = 0.25, limit: int | None = None,
             still_frames: int = 9, videos: bool = False, categories: set[str] | None = None,
             max_frames: int | None = None) -> dict:
@@ -123,7 +152,10 @@ def process(staging_dirs: list[str], editor, remove_frac: float = 0.25, limit: i
                 frames = frames[:max_frames] if max_frames else frames
                 size = frames[0].size
                 out = [im.resize(size) for im in editor.edit(frames, prompt, _session_size(*size), ref_image=ref_img)]
-                check = quality_filter(frames[len(frames) // 2], out[len(out) // 2], mask, max_outside=max_out)
+                n = min(len(frames), len(out))
+                check, motion_extra = clip_check(frames[:n], out[:n], mask, max_out)
+                if motion_extra is not None:
+                    meta["live_source_motion_extra"] = round(motion_extra, 4)
                 if check.ok:
                     _write_video(d / "live_source.mp4", out, fps)
             else:

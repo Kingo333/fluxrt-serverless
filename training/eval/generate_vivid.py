@@ -89,6 +89,36 @@ def fill_pairs(fixed: list[tuple[Path, Path]], candidates: list[tuple[Path, Path
     return out
 
 
+def motion_score(mp4: Path, frames: int = 49, size=(96, 168)) -> float:
+    """How much the real clip moves (turns, arm raises, walking): mean frame-to-frame change of the
+    first `frames` frames at a small size (0..1)."""
+    import av
+    import numpy as np
+    prev, total, n = None, 0.0, 0
+    with av.open(str(mp4)) as c:
+        for k, f in enumerate(c.decode(c.streams.video[0])):
+            if k >= frames:
+                break
+            a = np.asarray(f.to_image().convert("RGB").resize(size), dtype=np.float32) / 255.0
+            if prev is not None:
+                total += float(np.abs(a - prev).mean())
+                n += 1
+            prev = a
+    return total / n if n else 0.0
+
+
+def motion_first(fixed: list[tuple[Path, Path]], candidates: list[tuple[Path, Path]], k: int,
+                 score=None) -> tuple[list[tuple[Path, Path]], list[tuple[str, float]]]:
+    """The fixed pairs, then the k candidate pairs whose real clip moves most (new people only).
+    Returns (pairs, [(key, score)]) so the motion clips can be named in the report."""
+    score = score or (lambda p: motion_score(p / "target.mp4"))
+    used = {p.name for p, _ in fixed}
+    scored = sorted(((score(p), p, g) for p, g in candidates if p.name not in used and (p / "target.mp4").exists()),
+                    key=lambda t: -t[0])
+    picked = scored[:k]
+    return list(fixed) + [(p, g) for _, p, g in picked], [(p.name, round(sc, 4)) for sc, p, _ in picked]
+
+
 # Same defaults as training/scripts/common.sh. The config reads these; unset, it falls back to
 # relative "checkpoints/..." paths and transformers tries them as Hub repos (P9e: HF 401 for
 # checkpoints/vae).
@@ -165,6 +195,9 @@ def main(argv=None) -> None:
                          "truth, but steady real input like the app (the P8 pseudo-source videos flicker)")
     ap.add_argument("--pairs-from", help="with --cross: start with the exact pairs of an earlier --cross run "
                                          "(its <clip>/cross.json), then fill up to --max-items across categories")
+    ap.add_argument("--motion-first", type=int, default=0,
+                    help="with --cross: after the --pairs-from pairs, add the N test clips with the most motion "
+                         "(turns, side/back views, arm raises); their keys go to OUT/motion_keys.txt")
     ap.add_argument("--live", action="store_true",
                     help="the live endpoint's settings: --steps 2 --guidance 1.0 --ref-basesize 768, and the "
                          "app's full instruction (garment name + description) "
@@ -223,7 +256,13 @@ def main(argv=None) -> None:
             a.cross = True
         items = test_items(Path(a.staging), a.max_items if not a.cross else max(a.max_items * 4, 16))
         if a.pairs_from:
-            pairs = fill_pairs(fixed_pairs(Path(a.staging), Path(a.pairs_from)), cross_pairs(items), a.max_items)
+            fixed = fixed_pairs(Path(a.staging), Path(a.pairs_from))
+            if a.motion_first:
+                fixed, moving = motion_first(fixed, cross_pairs(items), a.motion_first)
+                Path(a.out).mkdir(parents=True, exist_ok=True)
+                (Path(a.out) / "motion_keys.txt").write_text("\n".join(f"{k} {sc}" for k, sc in moving) + "\n")
+                print(f"motion clips: {moving}", flush=True)
+            pairs = fill_pairs(fixed, cross_pairs(items), a.max_items)
             print(f"pairs: {len(pairs)} ({', '.join(p.name + '+' + g.name for p, g in pairs[:4])}, ...)", flush=True)
         else:
             pairs = cross_pairs(items)[:a.max_items] if a.cross else [(d, d) for d in items]

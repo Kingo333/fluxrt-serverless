@@ -98,7 +98,7 @@ What it cannot fix:
 | Step | Pod | Expected | Cap |
 |---|---|---|---|
 | 3b CPU part: Glance lowerwear + ViViD dress stills | CPU Pod | about 30 min, about $0.10 | `timeout 60m` |
-| 3b GPU part: ViViD top/bottom stills, live-way inputs (800 Glance upper + 800 Glance lower + 400 ViViD dresses + 600 ViViD tops + 343 ViViD bottoms at ~3 s, 5 model loads), captions (~1 s each), pack | 1x RTX PRO 6000 from the endpoint image ($2.49/h) | about 4.3 h, **about $10.70** | outer `timeout 280m`: **about $11.60** (resumable) |
+| 3b GPU part: live-way inputs for stills (500 + 500 Glance, 400 + 400 + 343 ViViD) at ~3 s and 450 ViViD real-motion clips (97 frames) at ~11 s, captions, pack | 1x RTX PRO 6000 from the endpoint image ($2.49/h) | about 5 h, **about $12.50** | outer `timeout 330m`: **about $13.70** (resumable) |
 | 3c training: 1,000 steps at 5–9 s + setup | 1x RTX PRO 6000 | 1.7–2.8 h, **about $4.25–7** | `timeout 165m`, about $6.85 |
 | 3c eval: 16 clips x (2 baselines + 4 saves) at 49 frames, plus the 4 regression clips at 97 frames x (live0811 + 4 saves), frame strips | same Pod | about 1.7 h, about $4.20 | `timeout 150m`, about $6.20 |
 | **Total 3b + 3c** | | **about $15.50–18.30** | **about $21.30** |
@@ -121,7 +121,7 @@ runpodctl stop pod $RUNPOD_POD_ID
 for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo waiting for network; sleep 10; done
 export AZ_REF=<SHA>
 nvidia-smi
-timeout 280m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/build_data.sh | AZ_REF=$AZ_REF AZ_PART=gpu AZ_VIVID_DRESSES=1 AZ_VIVID_STILLS=1 bash"; echo GPU_EXIT=$?
+timeout 330m bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/joyai_0811_lora/build_data.sh | AZ_REF=$AZ_REF AZ_PART=gpu AZ_VIVID_DRESSES=1 AZ_VIVID_STILLS=1 AZ_VIVID_CLIPS=1 bash"; echo GPU_EXIT=$?
 runpodctl stop pod $RUNPOD_POD_ID
 
 3c train + eval (1x RTX PRO 6000, EU-RO-1, RunPod PyTorch CUDA 12.8 template, volume azyah-vton-train at /workspace):
@@ -166,3 +166,15 @@ ViViD frames for tops (600) and bottoms (343) next to the 400 dresses, inputs ma
 make_static_clips takes every ViViD real-frame sample first (--prefer-source vivid) and fills the
 rest of --max with Glance. Research-only like the dresses; AZ_WITH_VIVID=0 (new AZ_EXP) is the
 commercial-clean Glance-only fallback.
+
+### Real-motion clips (owner decision 2026-11-05)
+
+Goal: the garment stays accurate while the person moves, turns, raises arms or shows the side and
+back. Static clips from stills cannot teach that. 3b now makes inputs for 450 ViViD train clips
+(150 per category, 97 frames) the live way: the 0811 clone with a fixed garment photo of another
+item, kept only if the garment changes and the person does not at 1/4, 1/2 and 3/4 of the clip and
+the input moves no more than the real clip (+0.015 per frame), so flickering inputs are dropped.
+Target = the real clip. 3c uses each clip 3 times (a new random 25-frame window at 24 fps each
+time) next to 2,500 still clips, so about a third of the samples are real motion. The eval adds
+the 4 test clips with the most motion to the regression set (frame strips, worst frame, drift, and
+the 97-frame run). Research-only (ViViD).

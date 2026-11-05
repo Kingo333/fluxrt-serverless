@@ -131,7 +131,7 @@ def to_static_sample(key: str, files: dict[str, bytes], meta: dict, frames: int,
     person = Image.open(io.BytesIO(p)).convert("RGB")
     if person.size != target.size:
         person = person.resize(target.size, Image.LANCZOS)
-    extra = {k: m[k] for k in ("category", "config", "pseudo_source", "identity_pair") if k in m}
+    extra = {k: m[k] for k in ("category", "config", "pseudo_source", "identity_pair", "input") if k in m}
     extra.update({"static_clip": True, "static_frames": frames, "from_key": key})
     return Sample(
         key=f"{key}_s{frames}", task="iv2v",
@@ -153,7 +153,7 @@ def video_sample(key: str, files: dict[str, bytes], meta: dict) -> Sample | None
     return Sample(key=key, task="iv2v", files={k: files[k] for k in ("0.jpg", "0.mp4", "1.mp4")},
                   caption=meta.get("caption") or "", captions={"caption_detailed": meta.get("caption_detailed")},
                   source=m.get("source", ""), split="train", garment_id=m.get("garment_id"),
-                  person_id=m.get("person_id"), consent_id=m.get("consent_id"), extra={**extra, "flicker_risk": True})
+                  person_id=m.get("person_id"), consent_id=m.get("consent_id"), extra={**extra, "flicker_risk": m.get("input") != "live_source"})
 
 
 def detail_score(garment_bytes: bytes) -> float:
@@ -215,7 +215,7 @@ def allowed(source: str, mode: str) -> bool:
 def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, mode: str = "research",
           vivid_videos: bool = False, seed: int = 0, per_shard: int = 250,
           staging_dirs: list[str] | None = None, detail_oversample: int = 2,
-          prefer_sources: tuple[str, ...] = ("vivid",)) -> dict:
+          prefer_sources: tuple[str, ...] = ("vivid",), clip_repeat: int = 1) -> dict:
     if frames < 9 or (frames - 1) % 8:
         raise SystemExit("--frames must be 8n+1 and at least 9 (the VAE's time factor is 8)")
     if mode not in ("research", "commercial"):
@@ -274,6 +274,14 @@ def build(manifest_dir: str, out: str, frames: int = 25, max_items: int = 3000, 
             if s is not None and s.caption.strip():
                 by_source[s.source].append(s)
                 counts["vivid_videos"] += 1
+                # Real-motion clips (owner 2026-11-05): repeat each so motion is a fair share of the
+                # steps; the loader takes a new random 25-frame window of the clip each time.
+                for r in range(2, clip_repeat + 1):
+                    by_source[s.source].append(Sample(key=f"{s.key}_r{r}", task=s.task, files=s.files, caption=s.caption,
+                                                      source=s.source, split=s.split, garment_id=s.garment_id,
+                                                      person_id=s.person_id, consent_id=s.consent_id,
+                                                      extra={**s.extra, "clip_repeat": r}, captions=dict(s.captions)))
+                    counts["vivid_videos"] += 1
     catalog = []
     for source, items in sorted(by_source.items()):
         catalog += write_shards(items, out_dir / "shards", f"joyai0811-{source}", per_shard)
@@ -304,11 +312,12 @@ def main(argv=None) -> dict:
     ap.add_argument("--per-shard", type=int, default=250)
     ap.add_argument("--staging-dirs", nargs="*", default=[], help="staged pair folders (for mask.png)")
     ap.add_argument("--detail-oversample", type=int, default=2, help="repeat the most detailed third N times (1 = off)")
+    ap.add_argument("--clip-repeat", type=int, default=1, help="with --vivid-videos: use each clip N times")
     ap.add_argument("--prefer-source", nargs="*", default=["vivid"],
                     help="sources taken first, before the rest fills --max (real frames first; empty = random)")
     a = ap.parse_args(argv)
     summary = build(a.manifest_dir, a.out, a.frames, a.max, a.mode, a.vivid_videos, a.seed, a.per_shard,
-                    a.staging_dirs, a.detail_oversample, tuple(a.prefer_source))
+                    a.staging_dirs, a.detail_oversample, tuple(a.prefer_source), a.clip_repeat)
     print(json.dumps(summary, indent=2))
     return summary
 

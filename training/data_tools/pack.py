@@ -117,12 +117,17 @@ def _identity(s: Sample) -> Sample:
 
 
 def pack(staging_dir: str, out_dir: str, name: str, per_shard: int = 500, identity_frac: float = 0.1,
-         prefer_live_source: bool = False) -> dict:
+         prefer_live_source: bool = False, only_live_source: bool = False, split: str | None = None) -> dict:
     buckets: dict[tuple, list[Sample]] = defaultdict(list)
     missing = 0
     identity = 0
     for d, meta in iter_pairs(Path(staging_dir)):
-        s = _sample(d, meta, prefer_live_source)
+        if split and meta.get("split") != split:
+            continue
+        if only_live_source and not ((meta.get("live_source") or {}).get("ok") and find(d, "live_source")):
+            missing += 1  # e.g. ViViD clips whose only input is the flickering P8 source.mp4
+            continue
+        s = _sample(d, meta, prefer_live_source or only_live_source)
         if s is None:
             missing += 1
             continue
@@ -149,8 +154,12 @@ def main() -> None:
                     help="share of training pairs also added as clean-input 'no change' pairs (review R5)")
     ap.add_argument("--prefer-live-source", action="store_true",
                     help="use live_source.* (live_source.py, fixed garment photo) instead of source.* when present")
+    ap.add_argument("--only-live-source", action="store_true",
+                    help="pack only pairs that have an ok live_source.* (skip pairs whose input is the old source.*)")
+    ap.add_argument("--split", help="only this split (e.g. train)")
     a = ap.parse_args()
-    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac, a.prefer_live_source), indent=2))
+    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac, a.prefer_live_source,
+                          a.only_live_source, a.split), indent=2))
 
 
 if __name__ == "__main__":
