@@ -14,8 +14,10 @@ Per step (batch 1):
      clean history (time 0), the live scheduler's 2 steps (t = 1000, 837.64). At one of the two
      steps (AZ_EXIT: random = upstream, last = the served output) it returns the x0 prediction
      with gradient; the history chunks are its own earlier outputs, detached (self-forcing).
-  3. loss = MSE(x0 prediction, real target latents) over the whole clip; only the LoRA
-     ("generator" adapter, base frozen by patches/stage1-lora.patch) gets gradients.
+  3. loss = garment-weighted MSE(x0 prediction, real target latents) + AZ_EDGE_WEIGHT x edge L1
+     inside the garment (losses.py; mask = the staged Glance mask, cropped like the clip and
+     written by make_static_clips to AZ_MASK_DIR/<sample key>.png; no mask = weight 1 everywhere).
+     Only the LoRA ("generator" adapter, base frozen by patches/stage1-lora.patch) gets gradients.
 
 So the LoRA is only ever asked to make the live 2-step output closer to the real photo; it is
 never trained at other noise levels or step counts, which is what would undo the distillation.
@@ -36,7 +38,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 import src.train_t2v_dmd as dmd
@@ -54,6 +55,22 @@ sys.path.insert(0, os.getenv("AZ_TOOLS_DIR", str(Path(__file__).resolve().parent
 from live_schedule import (  # noqa: E402
     LIVE_MAX_TEMPORAL_IDS, LIVE_REF_BASESIZE, LIVE_STEPS, choose_exit, live_timesteps, matches_live,
 )
+from losses import garment_loss, mask_to_grid  # noqa: E402
+
+MASK_WEIGHT = float(os.getenv("AZ_MASK_WEIGHT", "3.0"))
+EDGE_WEIGHT = float(os.getenv("AZ_EDGE_WEIGHT", "0.5"))
+
+
+def load_mask(key: str, h: int, w: int, device):
+    """The garment mask of one sample on the latent grid, or None (no mask = weight 1)."""
+    d = os.getenv("AZ_MASK_DIR")
+    if not d:
+        return None
+    p = Path(d) / f"{key}.png"
+    if not p.exists():
+        return None
+    from PIL import Image
+    return torch.from_numpy(mask_to_grid(Image.open(p), h, w)).to(device=device, dtype=torch.float32)
 
 
 def self_check(cfg: ExpConfig, pipeline, model, logger) -> None:
@@ -152,6 +169,9 @@ def main(cfg: ExpConfig) -> None:
     rng = random.Random(noise_seed)
     install_exit_policy(cfg, rng)
     trainable = [p for p in model.parameters() if p.requires_grad]
+    n_masks = len(list(Path(os.environ["AZ_MASK_DIR"]).glob("*.png"))) if os.getenv("AZ_MASK_DIR") else 0
+    logger.info(f"0811 LoRA loss: garment weight {MASK_WEIGHT} inside the mask, edge weight {EDGE_WEIGHT}, "
+                f"{n_masks} masks in {os.getenv('AZ_MASK_DIR') or '(none)'}")
     logger.info(f"0811 LoRA: {sum(p.numel() for p in trainable) / 1e6:.1f}M trainable, steps {init_step + 1}.."
                 f"{cfg.max_train_steps}, LR {cfg.learning_rate}, saves every {cfg.checkpoint_interval} (all kept)")
 
@@ -162,7 +182,7 @@ def main(cfg: ExpConfig) -> None:
         t0 = time.perf_counter()
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_sum, used = 0.0, 0
+        loss_sum, used, mse_sum, edge_sum, masked = 0.0, 0, 0.0, 0.0, 0
         for _ in range(cfg.gradient_accumulation_steps):
             batch = next(it)
             latents, prompt_embeds, prompt_mask, extra = prepare_inputs(
@@ -175,7 +195,13 @@ def main(cfg: ExpConfig) -> None:
             pred, _, _ = dmd.generate_dmd_latents(
                 cfg, pipeline, model, target, prompt_embeds, prompt_mask, extra, noise_cuda,
                 requires_grad=True, rollout_num_chunks_override=-1, group_backward_fn=None, controller=None)
-            loss = F.mse_loss(pred.float(), target.float()) / cfg.gradient_accumulation_steps
+            keys = batch.get("key") or [""]
+            mask = load_mask(str(keys[0]), int(target.shape[-2]), int(target.shape[-1]), target.device)
+            terms = garment_loss(pred.float(), target.float(), mask, MASK_WEIGHT, EDGE_WEIGHT)
+            masked += int(mask is not None)
+            mse_sum += float(terms["mse"].detach())
+            edge_sum += float(terms["edge"].detach())
+            loss = terms["total"] / cfg.gradient_accumulation_steps
             if not torch.isfinite(loss):
                 logger.warning(f"step {step}: non-finite loss {loss.item()}; skipping the sample")
                 continue
@@ -197,10 +223,13 @@ def main(cfg: ExpConfig) -> None:
         step_times.append(dt)
         if step % cfg.log_interval == 0:
             loss_v = loss_sum / used
-            logger.info(f"Step {step}/{cfg.max_train_steps}: loss {loss_v:.4f} grad_norm {float(grad_norm):.4f} "
+            logger.info(f"Step {step}/{cfg.max_train_steps}: loss {loss_v:.4f} (mse {mse_sum / used:.4f} "
+                        f"edge {edge_sum / used:.4f} masked {masked}/{used}) grad_norm {float(grad_norm):.4f} "
                         f"step_time {dt:.2f}s avg {sum(step_times) / len(step_times):.2f}s "
                         f"lr {lr_scheduler.get_last_lr()[0]:.2e}")
             tb.add_scalar("Loss/sft2", loss_v, step)
+            tb.add_scalar("Loss/mse_weighted", mse_sum / used, step)
+            tb.add_scalar("Loss/edge", edge_sum / used, step)
             tb.add_scalar("Grad/norm", float(grad_norm), step)
             tb.add_scalar("Time/step", dt, step)
         if step % cfg.checkpoint_interval == 0 or step == cfg.max_train_steps:
