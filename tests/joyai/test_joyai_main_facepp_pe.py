@@ -110,13 +110,18 @@ def test_populate_facepp_refuses_without_space(tmp_path):
     fake_bin.mkdir()
     (fake_bin / "hf").write_text("#!/usr/bin/env bash\necho HF_CALLED \"$@\"\n")
     (fake_bin / "python3").write_text("#!/usr/bin/env bash\nexit 0\n")
+    # A fake df reporting 10 GB free, so the test does not depend on the machine's real disk
+    # (GitHub's runners have about 86 GB free, enough for face++).
+    (fake_bin / "df").write_text("#!/usr/bin/env bash\n"
+                                 "echo 'Filesystem 1-blocks Used Available Capacity Mounted on'\n"
+                                 "echo 'fake 107374182400 96636764160 10737418240 90% /vol'\n")
     for f in fake_bin.iterdir():
         f.chmod(0o755)
     env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", VOLUME_ROOT=str(tmp_path / "vol"), FACEPP="1")
     r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
-    # tmp has far less than 31 GB free in CI; the script must refuse, name the shortfall, and not download.
+    # 10 GB free < 31 GB: the script must refuse, name the shortfall, and not download.
     assert r.returncode == 3, r.stdout + r.stderr
-    assert "NOT ENOUGH SPACE" in r.stderr and "short by" in r.stderr and "Do NOT delete 0811" in r.stderr
+    assert "NOT ENOUGH SPACE" in r.stderr and "short by 22 GB" in r.stderr and "Do NOT delete 0811" in r.stderr
     assert "HF_CALLED" not in r.stdout
     sh = script.read_text()
     assert "joyai_video_edit_dit_1101_face++.pth" in sh and "HF_HUB_ENABLE_HF_TRANSFER=0" in sh
