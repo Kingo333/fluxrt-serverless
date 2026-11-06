@@ -80,6 +80,7 @@ def test_composite_lag_env_parsing(monkeypatch):
     assert load(monkeypatch).COMPOSITE_LAG_S is None
     assert load(monkeypatch, FLUXRT_COMPOSITE_LAG_MS="250").COMPOSITE_LAG_S == 0.25
     assert load(monkeypatch, FLUXRT_COMPOSITE_LAG_MS="abc").COMPOSITE_LAG_S is None   # never crashes a session
+    assert load(monkeypatch, FLUXRT_MU="abc").MU_OVERRIDE is None                       # typo never stops the worker
 
 
 def png_b64(w, h, rgb):

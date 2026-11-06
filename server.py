@@ -124,7 +124,11 @@ ANCHOR = _env_bool("FLUXRT_ANCHOR")
 ANCHOR_DELAY_S = max(0.0, float(os.getenv("FLUXRT_ANCHOR_DELAY_S", "1.5")))
 # F2c: fixed sampler shift (diffusers compute_empirical_mu override) via the same FluxRT patch.
 _mu = os.getenv("FLUXRT_MU", "").strip()
-MU_OVERRIDE: Optional[float] = float(_mu) if _mu else None
+try:
+    MU_OVERRIDE: Optional[float] = float(_mu) if _mu else None
+except ValueError:
+    log.warning("FLUXRT_MU=%r is not a number; mu override off", _mu)
+    MU_OVERRIDE = None
 # F2d: ask the app for frames at model size x scale (sharp real pixels for the composite).
 INPUT_SCALE = max(1, int(os.getenv("FLUXRT_INPUT_SCALE", "1")))
 SEG_NEEDED = COMPOSITE or REF_CLEAN or CACHE_MASK == "seg"
