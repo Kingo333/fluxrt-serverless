@@ -16,7 +16,7 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 # Pinned: 2026-06-13 "flow upscaler and taef2". Bump on purpose, never track main.
 ARG FLUXRT_REF=32206e8255b085b9075e05d389781bcbc728d513
-ARG JOYAI_COMMIT=d875895dd44950caf06f1a2cc4f4601c9eadc5cd
+ARG JOYAI_COMMIT=45ff66d97095640b62861198602e3d5fb64226e8
 ARG SAGE_COMMIT=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 ARG CUTLASS_COMMIT=dcf215af
 ARG MAX_JOBS=4
