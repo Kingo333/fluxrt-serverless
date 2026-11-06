@@ -248,3 +248,35 @@ def test_frame_strip_marks_the_worst_frame(tmp_path):
     assert n == 1 and sheet.height == frame_strip.HEAD_H + 3 * 44
     ch = frame_strip.person_change([green] * 8, [green] * 5 + [Image.new("RGB", (W, H), (0, 0, 0))] + [green] * 2)
     assert int(np.argmax(ch)) == 5
+
+
+def test_composite_keeps_real_face_and_background():
+    from eval import person_parse as pp
+    real = Image.new("RGB", (20, 20), (10, 10, 200))      # camera: blue
+    gen = Image.new("RGB", (20, 20), (200, 10, 10))       # generated: red
+    cat_in = np.zeros((20, 20), dtype=np.uint8)           # background everywhere
+    cat_in[0:5, :] = pp.MP["face"]
+    cat_in[10:20, 5:15] = pp.MP["clothes"]
+    cat_out = cat_in.copy()
+    cat_out[5:10, 5:15] = pp.MP["clothes"]                # the new garment is longer upwards
+    keep = pp.keep_mask(cat_in, cat_out, "upper")
+    assert keep[0, 0] and keep[2, 10] and not keep[15, 10] and not keep[7, 10]
+    out = np.asarray(pp.composite(gen, real, keep, feather=0))
+    assert tuple(out[2, 10]) == (10, 10, 200) and tuple(out[15, 10]) == (200, 10, 10)
+    shoes = pp.keep_mask(cat_in, cat_out, "shoes")         # shoes: face/hair only, no shoe masks
+    assert shoes[2, 10] and not shoes[19, 0]
+
+
+def test_tryon_agnostic_input_and_refs():
+    from eval import person_parse as pp
+    img = Image.new("RGB", (20, 20), (0, 200, 0))
+    cat = np.zeros((20, 20), dtype=np.uint8)
+    cat[5:10, 5:15] = pp.SF["upper"]
+    cat[12:18, 5:15] = pp.SF["pants"]
+    ag = np.asarray(pp.agnostic(img, cat))
+    assert tuple(ag[7, 10]) == (128, 128, 128) and tuple(ag[0, 0]) == (0, 200, 0)
+    garment = Image.new("RGB", (8, 8), (255, 0, 0))
+    top, bottom = pp.tryon_refs(img, cat, garment, "upper")
+    assert top is garment and bottom.size == (10, 6)       # the person's own pants
+    top2, bottom2 = pp.tryon_refs(img, cat, garment, "dress")
+    assert top2 is garment and bottom2 is garment

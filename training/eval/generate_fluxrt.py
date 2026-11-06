@@ -151,6 +151,10 @@ def main(argv=None) -> None:
                     help="regression items (e.g. the shoe set from eval.make_shoe_set): <item>/person.*, ref.*, "
                          "meta.json {category, name, description}; no target. Prompt = the app's buildTryOnPrompt")
     ap.add_argument("--lora-scale", type=float, default=1.0, help="LoRA strength (fallback test, e.g. 0.5)")
+    ap.add_argument("--composite", action="store_true",
+                    help="keep the real face, hair and background (MediaPipe, Apache-2.0); generated clothing only")
+    ap.add_argument("--tryon-lora", help="xocialize/tryon-FLUX.2-klein-4B-lora safetensors: clothing-agnostic input "
+                                         "(SegFormer, offline only) + [top, bottom] references + its TRYON prompt")
     a = ap.parse_args(argv)
 
     import shutil
@@ -162,6 +166,16 @@ def main(argv=None) -> None:
     w, h = (int(v) for v in a.size.lower().split("x"))
     rw, rh = (int(v) for v in a.ref_size.lower().split("x"))
     pipe = Flux2KleinPipeline.from_pretrained(a.model_dir, torch_dtype=torch.bfloat16, local_files_only=True).to("cuda")
+    if a.tryon_lora:
+        pipe.load_lora_weights(a.tryon_lora, adapter_name="tryon")
+        print(f"try-on LoRA loaded: {a.tryon_lora}", flush=True)
+    seg_mp = seg_sf = None
+    if a.composite:
+        from eval.person_parse import MediaPipeSegmenter
+        seg_mp = MediaPipeSegmenter()
+    if a.tryon_lora:
+        from eval.person_parse import SegformerParser
+        seg_sf = SegformerParser()
     if a.lora:
         pipe.load_lora_weights(a.lora, adapter_name="garment")
         if a.lora_scale != 1.0:
@@ -196,17 +210,30 @@ def main(argv=None) -> None:
         ref_path = next(p for p in gd.iterdir() if p.stem == "ref")
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
         prompt = fluxrt_prompt(meta.get("category"), meta.get("name"), meta.get("description"))
+        cat_name = meta.get("category")
         outs = []
         for i, frame in enumerate(frames):
             gen = torch.Generator(device="cuda").manual_seed(a.seed)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            img = pipe(prompt=prompt, image=[frame, garment], height=h, width=w, guidance_scale=1.0,
-                       num_inference_steps=a.steps, generator=gen).images[0]
+            if a.tryon_lora:
+                from eval.person_parse import TRYON_PROMPT, agnostic, tryon_refs
+                cat = seg_sf(frame)
+                top, bottom = tryon_refs(frame, cat, Image.open(ref_path).convert("RGB"), cat_name)
+                images = [agnostic(frame, cat), _pad(top, rw, rh), _pad(bottom, rw, rh)]
+                img = pipe(prompt=TRYON_PROMPT, image=images, height=h, width=w, guidance_scale=1.0,
+                           num_inference_steps=a.steps, generator=gen).images[0]
+            else:
+                img = pipe(prompt=prompt, image=[frame, garment], height=h, width=w, guidance_scale=1.0,
+                           num_inference_steps=a.steps, generator=gen).images[0]
+            img = img.convert("RGB").resize((w, h))
+            if seg_mp is not None:
+                from eval.person_parse import composite, keep_mask
+                img = composite(img, frame, keep_mask(seg_mp(frame), seg_mp(img), cat_name))
             torch.cuda.synchronize()
             if i >= 3:
                 latencies.append(time.perf_counter() - t0)
-            outs.append(img.convert("RGB").resize((w, h)))
+            outs.append(img)
         if a.stills or a.pairs:
             outs[-1].save(result)
         else:
