@@ -1,0 +1,169 @@
+diff -ruN a/src/fluxrt/stream_processor/model_inference_subprocess.py b/src/fluxrt/stream_processor/model_inference_subprocess.py
+--- a/src/fluxrt/stream_processor/model_inference_subprocess.py	2026-11-06 11:52:47.740570682 +0000
++++ b/src/fluxrt/stream_processor/model_inference_subprocess.py	2026-11-06 11:53:47.217001407 +0000
+@@ -182,12 +182,18 @@
+                 reference_image_res["height"] // 16
+             )
+ 
++        # Azyah patch: optional anchor reference at the frame size (set_anchor_image).
++        anchor_image_seq_len = None
++        if self.config.get("use_anchor_image", False):
++            anchor_image_seq_len = (self.width // 16) * (self.height // 16)
++
+         self.update_controller = UpdateController(
+             self.config,
+             self.height,
+             self.width,
+             compression_ratio=16,
+             reference_image_seq_len=reference_image_seq_len,
++            anchor_image_seq_len=anchor_image_seq_len,
+         )
+ 
+         self.pipe = Flux2KleinPipeline(
+@@ -251,6 +257,9 @@
+         self.load_models()
+         self.update_prompt_embeds(self.process_state["prompt"])
+         self.previous_frame = None
++        self.anchor_image = None  # Azyah patch
++        if self.config.get("mu_override") is not None:
++            print(f"Azyah patch: sampler mu override = {float(self.config['mu_override'])}")
+ 
+         if self.config.get("use_reference_image", False):
+             image = cv2.imread(self.config.get("reference_image_path", ""))
+@@ -298,6 +307,18 @@
+             )
+         self.command_queue.put(("set_reference_image", image))
+ 
++    def set_anchor_image(self, image: np.ndarray | None) -> None:
++        """
++        Azyah patch. Set (or clear with None) the anchor: a good earlier output frame used as a
++        third reference so the garment rendering stays consistent over time.
++        image: numpy uint8 RGB array at the frame resolution. Only valid when use_anchor_image is true.
++        """
++        if not self.config.get("use_anchor_image", False):
++            raise ValueError(
++                "set_anchor_image called but use_anchor_image is not enabled in the stream processor config"
++            )
++        self.command_queue.put(("set_anchor_image", image))
++
+     def set_mask(self, mask) -> None:
+         """
+         Update the mask on the fly.
+@@ -342,6 +363,18 @@
+                         )
+                     self.update_controller.reset_cache()
+ 
++                elif cmd == "set_anchor_image":
++                    # Azyah patch: the token count changes with the anchor, so the per-timestep
++                    # spatial caches are rebuilt and every cache mask recomputed once.
++                    image = payload
++                    if image is None:
++                        self.anchor_image = None
++                    else:
++                        image = cv2.resize(image, (self.width, self.height))
++                        self.anchor_image = Image.fromarray(image)
++                    self.update_controller.reset_cache()
++                    self.pipe.spatial_cache.clear()
++
+                 elif cmd == "set_mask":
+                     mask = payload  # numpy uint8 array of shape (h // compression_ratio, w // compression_ratio)
+                     mask_tensor = (
+@@ -448,6 +481,9 @@
+         reference_list = [input_frame]
+         if self.config["use_reference_image"]:
+             reference_list.append(self.reference_image)
++        # Azyah patch: [frame, reference, anchor] while an anchor is set.
++        if self.config.get("use_anchor_image", False) and getattr(self, "anchor_image", None) is not None:
++            reference_list.append(self.anchor_image)
+ 
+         out = self.pipe(
+             prompt_embeds=self.prompt_embeds,
+diff -ruN a/src/fluxrt/stream_processor/pipeline.py b/src/fluxrt/stream_processor/pipeline.py
+--- a/src/fluxrt/stream_processor/pipeline.py	2026-11-06 11:52:47.747459745 +0000
++++ b/src/fluxrt/stream_processor/pipeline.py	2026-11-06 11:53:29.109000330 +0000
+@@ -921,6 +921,10 @@
+         mu = compute_empirical_mu(
+             image_seq_len=image_seq_len, num_steps=num_inference_steps
+         )
++        # Azyah patch: fixed sampler shift from the config (FLUXRT_MU on the worker).
++        mu_override = (self.subprocess_config or {}).get("mu_override")
++        if mu_override is not None:
++            mu = float(mu_override)
+         timesteps, num_inference_steps = retrieve_timesteps(
+             self.scheduler,
+             num_inference_steps,
+@@ -962,6 +966,11 @@
+             reference_image_mask = self.update_controller.use_reference_image_mask()
+             if reference_image_mask is not None:
+                 mask = torch.cat([mask, reference_image_mask], dim=-1)
++            # Azyah patch: the anchor is the third condition image ([frame, reference, anchor]).
++            if condition_images is not None and len(condition_images) >= 3:
++                anchor_image_mask = self.update_controller.use_anchor_image_mask()
++                if anchor_image_mask is not None:
++                    mask = torch.cat([mask, anchor_image_mask], dim=-1)
+             if self.subprocess_config["logging"]:
+                 print(
+                     f"recomputing {(mask.float().sum() / mask.shape[1] * 100):.2f}% of tokens"
+diff -ruN a/src/fluxrt/stream_processor/stream_processor.py b/src/fluxrt/stream_processor/stream_processor.py
+--- a/src/fluxrt/stream_processor/stream_processor.py	2026-11-06 11:52:47.750870492 +0000
++++ b/src/fluxrt/stream_processor/stream_processor.py	2026-11-06 11:53:53.077001755 +0000
+@@ -95,6 +95,14 @@
+             )
+         self.model_inference_subprocess.set_reference_image(image)
+ 
++    def set_anchor_image(self, image: np.ndarray | None) -> None:
++        """Azyah patch: set or clear (None) the anchor reference frame (RGB uint8 at frame size)."""
++        if not self.config.get("use_anchor_image", False):
++            raise ValueError(
++                "set_anchor_image called but use_anchor_image is not enabled in the config"
++            )
++        self.model_inference_subprocess.set_anchor_image(image)
++
+     def set_mask(self, mask: np.ndarray) -> None:
+         if self.config.get("mask_calculation_method", "auto") != "manual":
+             raise ValueError(
+diff -ruN a/src/fluxrt/stream_processor/update_controller.py b/src/fluxrt/stream_processor/update_controller.py
+--- a/src/fluxrt/stream_processor/update_controller.py	2026-11-06 11:52:47.744014718 +0000
++++ b/src/fluxrt/stream_processor/update_controller.py	2026-11-06 11:53:22.604999944 +0000
+@@ -27,6 +27,7 @@
+         dtype=torch.bfloat16,
+         reset_period=None,
+         reference_image_seq_len: int = None,
++        anchor_image_seq_len: int = None,
+     ):
+         self.height = height
+         self.width = width
+@@ -35,6 +36,9 @@
+         self.device = device
+         self.dtype = dtype
+         self.reference_image_seq_len = reference_image_seq_len
++        # Azyah patch: optional third reference ("anchor", a good earlier output frame).
++        self.anchor_image_seq_len = anchor_image_seq_len
++        self.anchor_image_is_valid = False
+ 
+         self.mask_height = height // compression_ratio
+         self.mask_width = width // compression_ratio
+@@ -186,7 +190,23 @@
+ 
+         return mask
+ 
++    def use_anchor_image_mask(self):
++        """Azyah patch: cache mask for the anchor tokens (recompute once, then reuse)."""
++        if self.anchor_image_seq_len is None:
++            return None
++
++        if self.anchor_image_is_valid:
++            return torch.zeros(
++                1, self.anchor_image_seq_len, device=self.device, dtype=torch.int32
++            )
++        self.anchor_image_is_valid = True
++        return (
++            torch.ones(1, self.anchor_image_seq_len, device=self.device, dtype=torch.int32)
++            * 2
++        ).to(torch.int32)
++
+     def reset_cache(self):
+         self.requires_reset = True
+         self.text_is_valid = False
+         self.reference_image_is_valid = False
++        self.anchor_image_is_valid = False

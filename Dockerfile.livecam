@@ -57,15 +57,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # FluxRT engine (identical steps to Dockerfile.fluxrt)
 # ---------------------------------------------------------------------------
 WORKDIR /workspace
+# Small Azyah patch to FluxRT (fluxrt/patches/*.patch: anchor reference + sampler mu override,
+# both inert unless the worker's config asks for them); git apply fails the build if upstream drifts.
+COPY fluxrt/patches /tmp/fluxrt-patches
 RUN git clone https://github.com/tensorforger/FluxRT.git /workspace/FluxRT \
-    && cd /workspace/FluxRT && git checkout ${FLUXRT_REF}
+    && cd /workspace/FluxRT && git checkout ${FLUXRT_REF} \
+    && git -C /workspace/FluxRT apply /tmp/fluxrt-patches/*.patch
 WORKDIR /workspace/FluxRT
 RUN /usr/bin/python3.12 -m pip install --upgrade pip setuptools wheel \
     && /usr/bin/python3.12 -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128 \
     && /usr/bin/python3.12 -m pip install -r requirements.txt \
     && /usr/bin/python3.12 -m pip install -e . \
     && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy "huggingface_hub[hf_transfer]"
-RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt; print('fluxrt env ok', torch.__version__, torch.version.cuda)"
+# MediaPipe multiclass selfie segmenter (Apache-2.0) for the live-quality switches
+# (FLUXRT_COMPOSITE / FLUXRT_REF_CLEAN / FLUXRT_CACHE_MASK=seg). --no-deps keeps its
+# jax/jaxlib/opencv-contrib dependencies out (FluxRT's cv2 must stay); the listed extras are
+# what the import needs (verified on Python 3.12 with numpy 2.x). The model is baked in so
+# warm-up needs no network.
+RUN /usr/bin/python3.12 -m pip install --no-deps mediapipe==0.10.21 \
+    && /usr/bin/python3.12 -m pip install absl-py attrs flatbuffers "protobuf>=4.25.3,<5" sounddevice matplotlib \
+    && mkdir -p /opt/models \
+    && curl -fsSL -o /opt/models/selfie_multiclass_256x256.tflite \
+        https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite \
+    && test "$(stat -c %s /opt/models/selfie_multiclass_256x256.tflite)" -gt 1000000
+RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, mediapipe; from mediapipe.tasks.python import vision; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'mediapipe', mediapipe.__version__)"
 
 # ---------------------------------------------------------------------------
 # JoyAI engine, in its own venv. Built only for the RTX 5090 (sm_120a).
@@ -98,9 +113,10 @@ RUN /opt/joyai-venv/bin/pip install -r /tmp/joyai-adapter-requirements.txt \
 # App code (shared token module + both engines' entry points)
 # ---------------------------------------------------------------------------
 COPY server.py bootstrap.py session_token.py /app/
+COPY livecam /app/livecam
 COPY joyai /app/joyai
 RUN chmod +x /app/joyai/start_upstream.sh /app/joyai/scripts/populate_volume.sh \
-    && /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py \
+    && /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py /app/livecam/*.py \
     && /opt/joyai-venv/bin/python -m py_compile /app/session_token.py /app/joyai/adapter/*.py \
     && cd /app && SESSION_SIGNING_SECRET=build-check /usr/bin/python3.12 -c "import server; print('fluxrt server import ok')" \
     && cd /app && SESSION_SIGNING_SECRET=build-check JOYAI_UPSTREAM_COMMAND= /opt/joyai-venv/bin/python -c "from joyai.adapter.app import create_app; create_app(); print('joyai adapter import ok')"
