@@ -78,8 +78,13 @@ Behaviors worth knowing:
 | `PORT` / `PORT_HEALTH` | `8765` | RunPod LB port + health port |
 | `AUTO_LOAD` | `true` | Start loading JoyAI at boot (so `/ping` goes 204 → 200) |
 | `LOAD_TIMEOUT_S` | `3600` | Max wait for JoyAI `POST /load` (a cold start compiles kernels) |
-| `JOYOMNI_WARMUP_WAIT_S` | `900` | Patched JoyAI: how long the boot warm-up waits for its test chunks (upstream: 120) |
-| `JOYOMNI_WARMUP_CLOSE_TIMEOUT_S` | `600` | Patched JoyAI: how long the warm-up waits for busy workers to stop (upstream: 5) |
+| `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` | `900` | Upstream knob (main): how long the boot warm-up waits for its test chunks and busy workers (upstream default 600). Replaces our old `joyai-warmup-timeouts.patch` |
+| `JOYOMNI_DIT_CKPT` | 0811 | Which DiT to serve; e.g. `.../dit/joyai_video_edit_dit_1101_face++.pth` (upstream main's default, `FACEPP=1 populate_volume.sh`) |
+| `JOYAI_USE_PE` | `0` | `1`: JoyAI prompt enhancement through `OPENAI_BASE_URL` + `PE_MODEL` + `OPENAI_API_KEY` (`JOYOMNI_PE_BACKEND=api`); off with a warning if any is empty. `JOYAI_PE_TIMEOUT_S` (20) caps it |
+| `JOYAI_REF_WORDING` | `reference` | `image1`: "… in the reference image" → "… from Image 1" in the instruction |
+| `JOYAI_DETECTION_MODE` | `near` | `full` = upstream's full-body entry gate; the app's `face_gate=false` still turns all gates off |
+| `JOYAI_FULL_BODY_GATE` | unset | `1` passes `--full-body-detection` to JoyAI |
+| `JOYOMNI_FA4_ATTN` | `0` | FlashAttention-4 (B200 only) |
 | `PING_READY_WHILE_LOADING` | `false` | `true`: `/ping` answers 200 while loading, so RunPod (which stops workers still answering 204 after ~8 min) lets a slow first start finish. Sessions wait with `warming`. |
 | `UPSTREAM_BOOT_TIMEOUT_S` | `300` | Max wait for JoyAI `/health` after spawn |
 | `JOYAI_SESSION_WIDTH` / `_HEIGHT` | `480` / `840` | Session size sent in `start` (portrait) |
@@ -105,14 +110,30 @@ Behaviors worth knowing:
 | `JOYOMNI_FPS` | `24` | Target fps |
 | `LOG_LEVEL` | `INFO` | |
 
-Prompt enhancement is off (D3): `--no-use-pe`, and `OPENAI_*`/`PE_MODEL` are
-unset before JoyAI starts. Session recording is off: JoyAI is launched without
+Prompt enhancement is off by default: `--no-use-pe --pe-backend none`, and `OPENAI_*`/`PE_MODEL` are
+unset before JoyAI starts. `JOYAI_USE_PE=1` keeps the keys and passes `--use-pe --pe-backend api`
+(see `../LIVECAM_ENGINES.md`, "JoyAI upgrade switches"). Session recording is off: JoyAI is launched without
 `--record-dir`, so camera frames are never written to disk.
+
+### Upstream main (`45ff66d9`, 2026-11-06) vs the old pin `d875895`
+
+- `start` message: `gate_enabled` was replaced by `detection_mode` (`off` / `near` / `full`); the adapter
+  sends both, so either version behaves the same. `detection_mode=off` also disables the full-body gate and
+  the mid-session presence hold, which is what the app's `face_gate=false` (shoes, bottoms, back camera) needs.
+- New serve flags: `--pe-backend {qwen,api,none}`, `--pe-ckpt`, `--full-body-detection`,
+  `--full-body-face-min-ratio`, `--face-detection`; `--online-gate` and `--person-check-stride` are gone
+  (`--detection-stride` replaces the latter). `start_upstream.sh` passes none of the removed ones.
+- `JOYOMNI_FA4_ATTN` (default 1 upstream, we pass 0), `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` (our patch dropped;
+  the old patched names `JOYOMNI_WARMUP_WAIT_S` / `JOYOMNI_WARMUP_CLOSE_TIMEOUT_S` are now ignored and can be
+  deleted from the endpoint).
+- `deploy/requirements.txt`: `transformers==5.20.2` and `peft==0.21.2` (the image installs upstream's file).
+- Default DiT upstream is `joyai_video_edit_dit_1101_face++.pth`; ours stays 0811 unless `JOYOMNI_DIT_CKPT` says otherwise.
+- The local Qwen prompt enhancer (`pe_qwen.py`, 23 GB) is imported only with `--pe-backend qwen`; we never use it.
 
 ## Image
 
 `../Dockerfile.livecam` builds on `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04` with Python
-3.10, JoyAI pinned to `d875895`, SageAttention `d1a57a5` + upstream's
+3.10, JoyAI pinned to upstream main `45ff66d9` (2026-11-06), SageAttention `d1a57a5` + upstream's
 CUDA-graph patch (`TORCH_CUDA_ARCH_LIST=12.0`), and `joyomni_ops` built for
 `120a` against cutlass `dcf215af`. **No weights in the image.**
 

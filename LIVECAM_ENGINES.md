@@ -104,6 +104,58 @@ running on the existing endpoint, and the app's Premium HD button reaches JoyAI.
 | Container disk | start at 60 GB; lower it once you see the pulled image size |
 | Env | `LIVECAM_ENGINE=joyai`, `SESSION_SIGNING_SECRET` (same as the Worker, as a RunPod Secret), `ACCEPTED_TIERS=premium`, `MAX_SESSION_SECONDS=300` |
 
+## JoyAI upgrade switches (2026-11: upstream main, face++, prompt enhancement)
+
+The image now pins JoyAI upstream **main `45ff66d9`** (6 Nov 2026) instead of `d875895`. What that
+brings: the "cached attention consistency" fix (2 Nov), prompt enhancement with an external API backend,
+the full-body entry gate, and `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` (so our old warm-up-timeouts patch is gone).
+**With every switch below at its default, the worker behaves exactly as before:** checkpoint 0811, no
+prompt enhancement (keys unset), the app's wording, the near face gate.
+
+| Switch (endpoint env) | Default | On | Turn off again |
+|---|---|---|---|
+| `JOYOMNI_DIT_CKPT` | unset = `/runpod-volume/joyai/checkpoints/JoyAI-Video-Edit/dit/joyai_video_edit_dit_0811.pth` | `=/runpod-volume/joyai/checkpoints/JoyAI-Video-Edit/dit/joyai_video_edit_dit_1101_face++.pth` serves upstream's newer "face++" DiT (same layout as 0811; upstream main's default since Nov 2026) | delete the variable |
+| `JOYAI_USE_PE` | `0` | `1`: JoyAI's own prompt rewriter looks at the garment photo and the first camera frames once per start/swap and rewrites the instruction (layers, sleeves, colours, what to keep). Needs the three PE variables below. Adds 2–8 s to a start/swap; after `JOYAI_PE_TIMEOUT_S` (20) it falls back to the raw instruction | `0` |
+| `OPENAI_BASE_URL` / `PE_MODEL` / `OPENAI_API_KEY` | unset | the PE endpoint: OpenAI-compatible, e.g. Gemini's `https://generativelanguage.googleapis.com/v1beta/openai` with `PE_MODEL=gemini-2.5-flash` and the app's existing Gemini key as a **RunPod secret**; or an Anthropic-protocol URL (contains `/anthropic`). If any is empty, PE stays off with a warning. Values are never logged | unset |
+| `JOYOMNI_PE_BACKEND` | `api` when PE is on | leave; `qwen` would load a 23 GB local model (96 GB card only) | — |
+| `JOYAI_REF_WORDING` | `reference` | `image1`: "the garment in the reference image" → "the garment from Image 1" (an older upstream try-on tip). Only matters with PE off: PE's output always says "the reference image" | `reference` |
+| `JOYAI_DETECTION_MODE` | `near` | `full`: upstream's full-body entry gate for sessions that have a face gate (`JOYAI_FULL_BODY_GATE=1` makes it the server default too). The app's per-garment `face_gate=false` still turns every gate off | `near` |
+| `JOYAI_FULL_BODY_GATE` | unset | `1`: start JoyAI with `--full-body-detection` | unset |
+| `JOYOMNI_FA4_ATTN` | `0` | upstream tries FlashAttention-4 first; `1` only on B200 | `0` |
+| `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` | `900` | boot warm-up wait (upstream default 600) | — |
+
+**face++ on the volume.** azyah-joyai is 100 GB and already full (0811 32.5 GB + VAE + MiMo-VL 16 GB +
+compile caches). Resize it first in RunPod (Storage → azyah-joyai → Edit; volumes grow, never shrink;
+150 GB is enough), then on a one-off Pod with the volume at `/workspace`:
+`FACEPP=1 VOLUME_ROOT=/workspace/joyai bash joyai/scripts/populate_volume.sh`. The script checks free space,
+names the shortfall and refuses otherwise. **Never delete 0811: it is the rollback.** Optional check on the
+same Pod: `python3 joyai/scripts/check_dit_checkpoint.py <face++> --compare <0811>` must print
+"same layout" (894 tensors). face++ was added upstream on 1 Nov 2026 (HF commit 64ebcad, "Add Face++ video
+editing checkpoint"); it has no release notes yet, so the owner's phone test is the acceptance test.
+
+**Rollback:** set `JOYOMNI_DIT_CKPT` back / delete it, `JOYAI_USE_PE=0`, `JOYAI_REF_WORDING=reference`,
+`JOYAI_DETECTION_MODE=near`, delete `JOYAI_FULL_BODY_GATE`; workers restart in minutes. Full rollback of the
+upstream code = the previous image tag.
+
+### Who is in view: how JoyAI behaves per try-on case
+
+The app sends `face_gate=false` in `set_prompt` whenever no face is expected (shoes, bottoms, bags,
+accessories, the back camera); the adapter turns that into `gate_enabled=false` **and** `detection_mode=off`,
+which on upstream main disables the entry gate, the full-body gate and the mid-session "no person" hold
+(`entry_gate = detection_mode != "off"`; `gate_on = entry_gate`). So:
+
+| Case | Face in view? | Gate | What happens |
+|---|---|---|---|
+| Shoes, camera at the feet | no | off | edits start at once; no face needed, no black hold if the face never appears |
+| Bag | no / partial | off | same |
+| Watch, ring, close-up | no | off | same |
+| Trousers, lower body only | no | off | same |
+| Top, upper body in view | yes | near (default) or full | waits for a centred, still face (1 s), then edits; the person-presence hold blacks out if the face leaves for ~0.5 s |
+| Mirror selfie (phone in hand) | yes | near / full | as a top; the phone stays (it is not clothing) |
+| Two people side by side | yes | near / full | the gate skips the centring check for 2+ comparable faces; a later third person triggers a re-edit after 1 s |
+
+Nothing here needs a shoe or garment mask; the category rules live in the app.
+
 ## JoyAI tuning (Lucy-VTON-like feel)
 
 JoyAI reaches real-time with 2 denoising steps, FP8 weights and short chunks, keeping the
