@@ -44,6 +44,35 @@ Other FluxRT settings in this image:
 Both engines speak the same WebSocket messages and use the same `SESSION_SIGNING_SECRET`,
 so the app and the Cloudflare Worker don't change when you flip.
 
+## FluxRT live-quality switches (2026-11-06)
+
+All OFF by default: with none of them set the worker behaves exactly as before. Each is an
+endpoint environment variable; turning one off is editing the endpoint and letting the
+workers restart (minutes, no code change). `/ping` shows what they resolved to under
+`live_switches`, and warm-up logs the same line.
+
+| Variable | Default | On | What it does | Off / rollback |
+|---|---|---|---|---|
+| `FLUXRT_OUTPUT_PACING` | `false` | `1` | Reads FluxRT's output on its own clock (`FLUXRT_OUTPUT_POLL_HZ`, default 30) so its x4 interpolated frames reach the app, instead of only when a camera frame arrives. Adds `playback_buffer`/`playback_fps` to the `ready` hints so the app enables its jitter buffer. Both sender modes consume the frames unchanged. | unset |
+| `FLUXRT_COMPOSITE` | `false` | `1` | Keeps the camera frame's face, hair and background and takes only the clothing from FluxRT (MediaPipe multiclass selfie segmenter, baked into the image). Rules by the item's category from the app: garments keep face/hair/background minus the new clothing (no face in view: background only); shoes keep face/hair only; bags face only; accessories, unknown category, no person or a failed segmentation = pass-through. `FLUXRT_COMPOSITE_FEATHER` (3 px edge), `FLUXRT_COMPOSITE_LAG_MS` (unset = one processing time), `FLUXRT_COMPOSITE_OUT_SEG_EVERY` (1). | unset |
+| `FLUXRT_REF_CLEAN` | `false` | `1` | Cuts the garment out of an on-model product photo (keeps it on white) before FluxRT sees it. Flat-lay photos, photos without a person and garments under 5% of the photo are left untouched. | unset |
+| `FLUXRT_CACHE_MASK` | `auto` | `seg` | Drives FluxRT's spatial cache from the segmentation: the person/garment and anything that moved are recomputed every frame, static background cells reuse the cache; everything is recomputed on the first frame, every `FLUXRT_CACHE_MASK_REFRESH` (48) frames, after a prompt/garment change, and always for shoes/bags/accessories/unknown categories (identical to today for them). `FLUXRT_CACHE_MASK_DILATE` (2 cells). | `auto` |
+| `FLUXRT_ANCHOR` | `false` | `1` | `FLUXRT_ANCHOR_DELAY_S` (1.5) after a garment is set, keeps one generated frame and passes it as a third reference every frame, so the garment rendering stays consistent (needs the FluxRT patch in this image; about 20-30% more per frame). Cleared on every garment swap. | unset |
+| `FLUXRT_MU` | unset | e.g. `1.9` | Fixed sampler shift instead of diffusers' resolution-based value (lower = sharper detail, higher = softer and steadier). | unset |
+| `FLUXRT_INPUT_SCALE` | `1` | `2` | Asks the app for camera frames at model size x 2 (576x1024 for 288x512); FluxRT still runs at model size, the composite keeps the sharp real pixels. About 2x the upload. | `1` |
+
+Recommended combination for the owner's app test (live endpoint values in brackets):
+`FLUXRT_OUTPUT_PACING=1` with `ENABLE_PLAYBACK_SCHEDULER=true` (already true), `PLAYBACK_TARGET_FPS=24`
+(was 12) and `REPEAT_LAST_FRAME_WHEN_IDLE=true` (already true): the poller refreshes the latest
+output up to 30 times a second and the scheduler sends it at 24 fps. If the scheduler's target
+is above the real output rate, it repeats the last frame, as today. Then `FLUXRT_COMPOSITE=1`,
+`FLUXRT_REF_CLEAN=1`, `FLUXRT_INPUT_SCALE=2`; second round `FLUXRT_CACHE_MASK=seg`,
+`FLUXRT_ANCHOR=1`. Quality test matrix (one at a time): `FLUXRT_WIDTH=384 FLUXRT_HEIGHT=672`
+(both multiples of 16; the ready hints follow), `ENABLE_FLOW_UPSCALER=false`, `FLUXRT_MU=1.9` vs `2.5`.
+
+If the segmenter fails to load, `FLUXRT_COMPOSITE`, `FLUXRT_REF_CLEAN` and `FLUXRT_CACHE_MASK=seg`
+turn themselves off (logged, visible in `/ping`); the session runs as today.
+
 ## Switch to JoyAI
 
 On the endpoint → **Edit endpoint**:
