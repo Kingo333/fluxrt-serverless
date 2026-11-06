@@ -95,3 +95,29 @@ def test_video_stills_from_clip_pairs(tmp_path):
     assert make_dataset.caption_for(meta) == fluxrt_prompt("dresses")
     sel = json.loads((tmp_path / "m" / "selection.json").read_text())
     assert sel["trained_with_vivid"] is True and sel["commercial_use_cleared"] is False
+
+
+def test_run_train_builds_python311_venv():
+    """P8L failed: pinned diffusers needs Python >= 3.11, the PyTorch template has 3.10."""
+    sh = (ROOT / "training" / "fluxrt_lora" / "run_train.sh").read_text()
+    assert "uv venv --seed --python 3.11" in sh and "UV_PYTHON_INSTALL_DIR" in sh
+    assert "sys.version_info < (3, 11)" in sh
+
+
+def test_selection_counts_only_used_sources(tmp_path):
+    """P8L listed vivid although AZ_VIDEO_FRAMES=0 took no ViViD sample: selection.json must count the data."""
+    assert make_dataset.selection_for({"glance"})["commercial_use_cleared"] is True
+    mixed = make_dataset.selection_for({"glance", "vivid"}, {"mode": "research", "used_sources": ["glance", "vivid"]})
+    assert mixed["commercial_use_cleared"] is False and mixed["trained_with_vivid"] is True
+    assert mixed["manifest"]["mode"] == "research"
+    assert make_dataset.selection_for({"unknown"})["commercial_use_cleared"] is False
+    pytest.importorskip("pyarrow")
+    out = tmp_path / "ds"
+    (out / "data").mkdir(parents=True)
+    rows = [{"key": "glance_womens_upperwear_train_0000001", "caption": "x", "person": png((1, 1, 1)),
+             "garment": png((2, 2, 2)), "target": png((3, 3, 3))}]
+    make_dataset.write_parquet(rows, out / "data" / "train-00000.parquet")
+    (out / "selection.json").write_text(json.dumps({"used_sources": ["glance", "vivid"], "commercial_use_cleared": False}))
+    sel = make_dataset.fix_selection(str(out))
+    assert sel["used_sources"] == ["glance"] and sel["commercial_use_cleared"] is True
+    assert json.loads((out / "selection.manifest.json").read_text())["used_sources"] == ["glance", "vivid"]

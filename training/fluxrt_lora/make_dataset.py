@@ -139,8 +139,56 @@ def write_parquet(rows: list[dict], path: Path) -> None:
     pq.write_table(pa.table(cols, schema=schema), path)
 
 
+def _source_of(key: str, meta: dict) -> str:
+    src = (meta or {}).get("source")
+    if src:
+        return str(src)
+    for name in ("glance", "vivid", "own", "toydata"):
+        if key.startswith(name):
+            return name
+    return "unknown"
+
+
+def selection_for(used: set[str], manifest_sel: dict | None = None) -> dict:
+    """Provenance of the samples this dataset REALLY holds (same fields as data_tools.manifests).
+    The manifest's selection.json describes everything the manifest could offer (e.g. ViViD clips
+    even when --video-frames 0 takes none of them), so it is kept only as 'manifest'."""
+    from data_tools import sources
+    known = {s for s in used if s != "unknown"}
+    research_only = sorted(s for s in known if not sources.get(s).commercial_ok) + (["unknown"] if "unknown" in used else [])
+    out = {"used_sources": sorted(used), "research_only_sources": research_only,
+           "trained_with_vivid": "vivid" in used, "commercial_use_cleared": not research_only,
+           "attribution": sorted({sources.get(s).attribution for s in known if sources.get(s).attribution}),
+           "notice": ("Trained with research-only or unknown data (" + ", ".join(research_only) + "). Not cleared for "
+                      "commercial release without legal sign-off.") if research_only else "",
+           "counted_from": "dataset samples"}
+    if manifest_sel:
+        out["manifest"] = {k: manifest_sel.get(k) for k in ("mode", "split", "used_sources") if k in manifest_sel}
+    return out
+
+
+def fix_selection(out_dir: str) -> dict:
+    """Recompute OUT/selection.json from the keys in OUT/data/*.parquet (for datasets built before
+    this fix). The old file is kept as selection.manifest.json."""
+    import pyarrow.parquet as pq
+    out = Path(out_dir)
+    used = set()
+    for f in sorted((out / "data").glob("*.parquet")):
+        for key in pq.read_table(f, columns=["key"]).column("key").to_pylist():
+            used.add(_source_of(key, {}))
+    old = json.loads((out / "selection.json").read_text()) if (out / "selection.json").exists() else None
+    if old is not None and not (out / "selection.manifest.json").exists():
+        (out / "selection.manifest.json").write_text(json.dumps(old, indent=2) + "\n")
+    sel = selection_for(used, old)
+    (out / "selection.json").write_text(json.dumps(sel, indent=2) + "\n")
+    return sel
+
+
 def main(argv=None) -> dict:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    if argv is None and len(sys.argv) > 2 and sys.argv[1] == "--fix-selection":
+        print(json.dumps(fix_selection(sys.argv[2]), indent=2))
+        return {}
     ap.add_argument("--manifest-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--max", type=int, default=3000)
@@ -159,8 +207,9 @@ def main(argv=None) -> dict:
     items = list(iter_r2i(mdir)) + list(iter_video_stills(mdir, a.video_frames))
     random.Random(a.seed).shuffle(items)
     items = items[: a.max]
-    rows, files = [], 0
+    rows, files, used = [], 0, set()
     for key, g, p, t, meta in items:
+        used.add(_source_of(key, meta))
         person, garment, target = convert(g, p, t, (w, h))
         rows.append({"key": key, "caption": caption_for(meta), "person": person, "garment": garment, "target": target})
         if len(rows) >= a.per_file:
@@ -169,8 +218,8 @@ def main(argv=None) -> dict:
     if rows:
         write_parquet(rows, data / f"train-{files:05d}.parquet")
         files += 1
-    if (mdir / "selection.json").exists():
-        shutil.copy(mdir / "selection.json", out / "selection.json")
+    manifest_sel = json.loads((mdir / "selection.json").read_text()) if (mdir / "selection.json").exists() else None
+    (out / "selection.json").write_text(json.dumps(selection_for(used, manifest_sel), indent=2) + "\n")
     summary = {"samples": len(items), "files": files, "size": [w, h], "dataset_name": str(data)}
     (out / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary))

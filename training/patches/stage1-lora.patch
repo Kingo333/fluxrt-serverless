@@ -43,11 +43,43 @@ index 7605c36..597b676 100644
  
      model = maybe_load_fsdp_model(
          model=model,
+diff --git a/training/src/train_t2v.py b/training/src/train_t2v.py
+index 23bf36c..b9df677 100644
+--- a/training/src/train_t2v.py
++++ b/training/src/train_t2v.py
+@@ -586,7 +586,13 @@ def setup_distributed_training(cfg: ExpConfig) -> tuple[int, int, int, torch.dev
+ 
+ def setup_model_and_optimizer(cfg: ExpConfig, device: torch.device) -> tuple[torch.nn.Module, torch.optim.Optimizer, Any]:
+     dit = load_dit(cfg, device=device)
+-    dit.requires_grad_(True)
++    if getattr(cfg, "stage1_lora", False):
++        # Azyah patch: load_dit froze the base and left only the LoRA adapter trainable
++        # (_add_stage1_lora). Upstream's requires_grad_(True) here unfroze all 16.6B
++        # parameters again, so AdamW states OOMed a 96 GB card (P9 smoke #3).
++        pass
++    else:
++        dit.requires_grad_(True)
+     dit.train()
+     if cfg.enable_activation_checkpointing:
+         dit = apply_activation_checkpointing(
+@@ -594,6 +600,12 @@ def setup_model_and_optimizer(cfg: ExpConfig, device: torch.device) -> tuple[tor
+             skip_interval=cfg.activation_checkpointing_skip_interval,
+         )
+ 
++    if getattr(cfg, "stage1_lora", False):
++        trainable = sum(p.numel() for p in dit.parameters() if p.requires_grad)
++        print(f"Stage 1 LoRA: {trainable / 1e6:.1f}M trainable parameters go to the optimizer", flush=True)
++        if not 0 < trainable < 1_000_000_000:
++            raise RuntimeError(f"Stage 1 LoRA expects 0 < trainable < 1B parameters, got {trainable / 1e9:.2f}B; "
++                               "the base model is not frozen")
+     optimizer = load_optimizer(cfg.optimizer_name, dit, cfg)
+ 
+     lr_scheduler = get_scheduler(
 diff --git a/training/src/utils/checkpoint.py b/training/src/utils/checkpoint.py
-index 7b319c3..234c97b 100644
+index 7b319c3..a27527d 100644
 --- a/training/src/utils/checkpoint.py
 +++ b/training/src/utils/checkpoint.py
-@@ -15,6 +15,12 @@ from src.utils.logging import get_logger
+@@ -15,6 +15,77 @@ from src.utils.logging import get_logger
  _SAVE_OPTIONS = StateDictOptions(full_state_dict=True, cpu_offload=True)
  _LOAD_OPTIONS = StateDictOptions(
      full_state_dict=True, broadcast_from_rank0=True)
@@ -55,12 +87,77 @@ index 7b319c3..234c97b 100644
 +    full_state_dict=True, broadcast_from_rank0=True, strict=False)
 +
 +
++_WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module.", "_fsdp_wrapped_module.", "_orig_mod.")
++
++
++def _fill_missing_optim_state(model, optim_state: dict) -> int:
++    """Azyah patch: AdamW only creates state for parameters that received a gradient.
++    Some LoRA adapters never do (e.g. the last double block's text branch: its output
++    is discarded after the block loop), so the saved optimizer state has no entry for
++    them and set_optimizer_state_dict raises KeyError on resume. Give them the empty
++    state AdamW would have (zero moments; their grads stay None, so steps skip them)."""
++    state = optim_state.get("state") or {}
++    if not state:
++        return 0
++    ref = next(iter(state.values()))
++    params = {}
++    for name, p in model.named_parameters():
++        for seg in _WRAPPER_SEGMENTS:
++            name = name.replace(seg, "")
++        params[name] = p
++    added = 0
++    for group in optim_state.get("param_groups", []):
++        for fqn in group.get("params", []):
++            if fqn in state or fqn not in params:
++                continue
++            shape = tuple(params[fqn].shape)
++            entry = {}
++            for k, v in ref.items():
++                if torch.is_tensor(v) and v.dim() == 0:
++                    entry[k] = v.clone()
++                elif torch.is_tensor(v):
++                    entry[k] = torch.zeros(shape, dtype=v.dtype)
++                else:
++                    entry[k] = v
++            state[fqn] = entry
++            added += 1
++    return added
++
++
++def _canonical(name: str) -> str:
++    for seg in _WRAPPER_SEGMENTS:
++        name = name.replace(seg, "")
++    return name
++
++
++def _collect_lora(model, full_state: dict, adapter: str = "generator") -> dict:
++    """Azyah patch: the LoRA tensors in PEFT save format ('<module>.lora_A.weight').
++    PEFT's get_peft_model_state_dict returned an EMPTY dict on the FSDP full state dict, so
++    exp1 saved no weights at all. Take them straight from the full state dict (lora_ keys of
++    this adapter), and fall back to the trainable parameters if those keys are absent."""
++    tag = f".{adapter}."
++    out = {}
++    for k, v in full_state.items():
++        k = _canonical(k)
++        if (".lora_A" in k or ".lora_B" in k) and tag in k and hasattr(v, "shape"):
++            out[k.replace(tag, ".")] = v.detach().to("cpu").clone()
++    single = not (torch.distributed.is_available() and torch.distributed.is_initialized()
++                  and torch.distributed.get_world_size() > 1)
++    if not out and single:  # full_tensor() is collective: only safe when one process saves
++        for k, p in model.named_parameters():
++            k = _canonical(k)
++            if p.requires_grad and (".lora_A" in k or ".lora_B" in k) and tag in k:
++                t = p.full_tensor() if hasattr(p, "full_tensor") else p
++                out[k.replace(tag, ".")] = t.detach().to("cpu").clone()
++    return out
++
++
 +def _is_stage1_lora(model) -> bool:
 +    return bool(getattr(model, "_azyah_stage1_lora", False))
  
  
  def save_checkpoint(
-@@ -32,11 +38,34 @@ def save_checkpoint(
+@@ -32,11 +103,40 @@ def save_checkpoint(
      save_path = Path(save_dir / f"global_step{step}")
      save_path.mkdir(parents=True, exist_ok=True)
  
@@ -73,7 +170,6 @@ index 7b319c3..234c97b 100644
 +    if _is_stage1_lora(model):
 +        # Azyah patch: save only the LoRA adapter (about 1 GB, not the 32.5 GB backbone),
 +        # in the Stage 2 generator_lora format.
-+        from peft.utils import get_peft_model_state_dict
 +        adapter_cfg = model.peft_config["generator"]
 +        targets = adapter_cfg.target_modules
 +        state_dict = {
@@ -82,7 +178,7 @@ index 7b319c3..234c97b 100644
 +            "dmd_use_lora": True,
 +            "stage1_lora": True,
 +            "generator_adapter_name": "generator",
-+            "generator_lora": get_peft_model_state_dict(model, state_dict=full_state, adapter_name="generator"),
++            "generator_lora": _collect_lora(model, full_state, "generator"),
 +            "generator_lora_config": {
 +                "r": adapter_cfg.r,
 +                "lora_alpha": adapter_cfg.lora_alpha,
@@ -97,10 +193,17 @@ index 7b319c3..234c97b 100644
 +            "model": full_state,
 +        }
 +    del full_state
++    if _is_stage1_lora(model) and global_rank <= 0:
++        n_lora = len(state_dict["generator_lora"])
++        n_a = sum(".lora_A" in k for k in state_dict["generator_lora"])
++        if n_lora == 0 or n_a == 0 or n_lora != 2 * n_a:
++            raise RuntimeError(f"Stage 1 LoRA save: {n_lora} adapter tensors ({n_a} lora_A); refusing to write a "
++                               "checkpoint without the adapter weights")
++        logger.info(f"Stage 1 LoRA save: {n_lora} adapter tensors ({n_a} layers)")
  
      if optimizer is not None:
          state_dict["optimizer"] = get_optimizer_state_dict(
-@@ -87,7 +116,17 @@ def load_checkpoint(
+@@ -87,9 +187,28 @@ def load_checkpoint(
      logger.info(f"Loading checkpoint from {checkpoint_path}")
      state_dict = torch.load(checkpoint_path, map_location="cpu")
  
@@ -108,8 +211,12 @@ index 7b319c3..234c97b 100644
 +    if "generator_lora" in state_dict and "model" not in state_dict:
 +        # Azyah patch: resume a Stage 1 LoRA checkpoint (adapter weights only).
 +        from peft.utils.save_and_load import _insert_adapter_name_into_state_dict
++        if not state_dict["generator_lora"]:
++            raise RuntimeError(f"Stage 1 LoRA resume: {checkpoint_path} has NO adapter weights (empty generator_lora); "
++                               "it was written by the old save bug. Start a new AZ_EXP instead of resuming it.")
 +        named = _insert_adapter_name_into_state_dict(
 +            dict(state_dict["generator_lora"]), adapter_name="generator", parameter_prefix="lora_")
++        logger.info(f"Stage 1 LoRA resume: loading {len(named)} adapter tensors")
 +        result = set_model_state_dict(model, named, options=_LOAD_OPTIONS_PARTIAL)
 +        unexpected = list(getattr(result, "unexpected_keys", []) or [])
 +        if unexpected:
@@ -118,4 +225,11 @@ index 7b319c3..234c97b 100644
 +        set_model_state_dict(model, state_dict["model"], options=_LOAD_OPTIONS)
  
      if optimizer is not None and "optimizer" in state_dict:
++        if "generator_lora" in state_dict:
++            added = _fill_missing_optim_state(model, state_dict["optimizer"])
++            if added:
++                logger.info(f"Stage 1 LoRA resume: {added} adapter params had no optimizer state (never got a "
++                            "gradient); restored them with empty AdamW state")
          set_optimizer_state_dict(
+             model, optimizer, state_dict["optimizer"], options=_LOAD_OPTIONS)
+ 

@@ -1,0 +1,14 @@
+{
+  "note": "Shoe regression set for the FluxRT LoRA (owner requirement 2026-11-05): the app catalogue's footwear (products_public, category footwear), eval only. Images are fetched on the Pod, never stored in git.",
+  "items": [
+    {"key": "shoe_01", "name": "adidas Originals Samba LT sneakers in red", "description": "Smooth leather upper Sole: 100% Rubber, Upper: 100% Leather.", "image_url": "https://images.asos-media.com/products/adidas-originals-samba-lt-sneakers-in-red/207950761-1-red"},
+    {"key": "shoe_02", "name": "adidas Originals Sambae sneakers in light pink", "description": "Soft suede upper Sole: 100% Rubber, Upper: 100% Leather.", "image_url": "https://images.asos-media.com/products/adidas-originals-sambae-sneakers-in-light-pink/207951047-1-lightpink"},
+    {"key": "shoe_03", "name": "ASOS DESIGN Divine lace up sneakers in off white", "description": "Mesh upper Lining sock: 100% Textile, Sole: 100% Thermoplastic Polyurethane, Upper: 100% Textile.", "image_url": "https://images.asos-media.com/products/asos-design-divine-lace-up-sneakers-in-off-white/208899402-1-offwhitemix"},
+    {"key": "shoe_04", "name": "ASOS DESIGN lace up sneakers in black drench", "description": "Matte upper Lining: 60% Textile, 40% Polyurethane, Sole: 100% Rubber, Upper: 100% Polyurethane.", "image_url": "https://images.asos-media.com/products/asos-design-lace-up-sneakers-in-black-drench/208778229-1-black"},
+    {"key": "shoe_05", "name": "Nike Air Max Portal sneakers in white", "description": "Mesh and leather upper Sole: 100% Rubber, Upper: 100% Leather.", "image_url": "https://images.asos-media.com/products/nike-air-max-portal-sneakers-in-white/208019479-1-white"},
+    {"key": "shoe_06", "name": "Nike Air Max TL 2.5 sneakers in gray & red", "description": "Textile upper Sole: 100% Rubber, Upper: 100% Textile.", "image_url": "https://images.asos-media.com/products/nike-air-max-tl-25-sneakers-in-gray-red/208022573-1-grey"},
+    {"key": "shoe_07", "name": "Nike Dunk Low Retro sneakers in gray & white", "description": "Smooth leather upper Sole: 100% Rubber, Upper: 100% Leather.", "image_url": "https://images.asos-media.com/products/nike-dunk-low-retro-sneakers-in-gray-white/208022721-1-grey"},
+    {"key": "shoe_08", "name": "Nike MC Trainer 3 sneakers in black & pink", "description": "Mesh upper Sole: 100% Rubber, Upper: 100% Leather.", "image_url": "https://images.asos-media.com/products/nike-mc-trainer-3-sneakers-in-black-pink/208031955-1-black"},
+    {"key": "shoe_09", "name": "Nike Shox TL sneakers in blue", "description": "Mesh upper Main: 100% Polyester, Sole: 100% Rubber.", "image_url": "https://images.asos-media.com/products/nike-shox-tl-sneakers-in-blue/207981713-1-blue"}
+  ]
+}

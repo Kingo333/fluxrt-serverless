@@ -1,0 +1,34 @@
+diff --git a/training/src/dataset/__init__.py b/training/src/dataset/__init__.py
+index 6ce5504..827434a 100644
+--- a/training/src/dataset/__init__.py
++++ b/training/src/dataset/__init__.py
+@@ -68,7 +68,7 @@ class WebDataset(WebDatasetBase):
+             for field_name in first_examples[0]:
+                 extension = field_name.rsplit(".", 1)[-1]
+                 if extension in self.VIDEO_EXTENSIONS:
+-                    features[field_name] = datasets.Video()
++                    features[field_name] = datasets.Video(decode=False)
+ 
+             for field_name in first_examples[0]:
+                 extension = field_name.rsplit(".", 1)[-1]
+diff --git a/training/src/dataset/webdataset.py b/training/src/dataset/webdataset.py
+index cdd954e..d74c29b 100644
+--- a/training/src/dataset/webdataset.py
++++ b/training/src/dataset/webdataset.py
+@@ -249,12 +249,14 @@ class ImageVideoWebDataset(IterableDataset):
+ 
+         self._multiple_videos_dataset, self._multiple_videos_iterator = None, None
+         if multiple_videos_data_files is not None:
++            # Azyah patch: decode=False keeps raw mp4 bytes for _open_video_reader (decord);
++            # decoding here needs torchcodec, which the training venv doesn't have.
+             multiple_videos_features = datasets.Features({
+                 "json": datasets.Value("string"),
+                 "__key__": datasets.Value("string"),
+                 "__url__": datasets.Value("string"),
+-                "0.mp4": datasets.Video(),
+-                "1.mp4": datasets.Video(),
++                "0.mp4": datasets.Video(decode=False),
++                "1.mp4": datasets.Video(decode=False),
+                 "0.jpg": datasets.Image(),
+             })
+             self._multiple_videos_dataset, self._multiple_videos_iterator = self._init_dataset(
