@@ -120,7 +120,7 @@ def clip_check(frames, out, mask, max_outside):
 
 def process(staging_dirs: list[str], editor, remove_frac: float = 0.25, limit: int | None = None,
             still_frames: int = 9, videos: bool = False, categories: set[str] | None = None,
-            max_frames: int | None = None) -> dict:
+            max_frames: int | None = None, split: str | None = "train") -> dict:
     from PIL import Image
     pool = build_pool(staging_dirs)
     stats = {"done": 0, "rejected": 0, "skipped": 0, "with_extra_item": 0, "reasons": {}, "already": 0}
@@ -131,13 +131,16 @@ def process(staging_dirs: list[str], editor, remove_frac: float = 0.25, limit: i
         for d, meta in iter_pairs(Path(sd)):
             tgt = find(d, "target")
             if meta.get("live_source") and tgt is not None and (videos or tgt.suffix != ".mp4") \
-                    and not (categories and meta.get("category") not in categories):
+                    and not (categories and meta.get("category") not in categories) \
+                    and not (split and meta.get("split") != split):
                 stats["already"] += 1
     for sd in staging_dirs:
         for d, meta in iter_pairs(Path(sd)):
             if limit is not None and stats["already"] + stats["done"] + stats["rejected"] >= limit:
                 return stats
             tgt = find(d, "target")
+            if split and meta.get("split") != split:
+                continue  # training inputs only: test items sort first ("test" < "train") and must not use the budget
             if meta.get("live_source") or tgt is None or (categories and meta.get("category") not in categories):
                 stats["skipped"] += 1
                 continue

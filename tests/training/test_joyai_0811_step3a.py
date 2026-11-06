@@ -432,3 +432,15 @@ def test_live_source_limit_is_a_total_so_reruns_only_finish(tmp_path):
     assert st2["already"] == 2 and st2["done"] == 0
     st3 = lsrc.process([str(tmp_path)], _FakeEditor(), remove_frac=0.0, limit=3)
     assert st3["done"] == 1
+
+
+def test_live_source_only_makes_training_inputs(tmp_path):
+    """3b bug: test items sort first ('test' < 'train') and took the live-input budget."""
+    from data_tools import live_source as lsrc
+    for k, sp in [("g_test_1", "test"), ("g_test_2", "test"), ("g_train_1", "train"), ("g_train_2", "train"),
+                  ("g_train_3", "train")]:
+        _stage(tmp_path, k, "upper", split=sp)
+    st = lsrc.process([str(tmp_path)], _FakeEditor(), remove_frac=0.0, limit=2)
+    assert st["done"] == 2
+    made = sorted(p.parent.name for p in tmp_path.glob("*/live_source.png"))
+    assert made == ["g_train_1", "g_train_2"]
