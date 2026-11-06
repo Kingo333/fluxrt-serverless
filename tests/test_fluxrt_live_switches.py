@@ -83,6 +83,16 @@ def test_composite_lag_env_parsing(monkeypatch):
     assert load(monkeypatch, FLUXRT_MU="abc").MU_OVERRIDE is None                       # typo never stops the worker
 
 
+def test_numeric_switch_typos_use_defaults(monkeypatch):
+    s = load(monkeypatch, FLUXRT_OUTPUT_POLL_HZ="fast", FLUXRT_COMPOSITE_FEATHER="x", FLUXRT_COMPOSITE_OUT_SEG_EVERY="?",
+             FLUXRT_CACHE_MASK_DILATE="two", FLUXRT_CACHE_MASK_REFRESH="", FLUXRT_ANCHOR_DELAY_S="soon",
+             FLUXRT_INPUT_SCALE="2x")
+    assert (s.OUTPUT_POLL_HZ, s.COMPOSITE_FEATHER, s.COMPOSITE_OUT_SEG_EVERY) == (30.0, 3, 1)
+    assert (s.CACHE_MASK_DILATE, s.CACHE_MASK_REFRESH, s.ANCHOR_DELAY_S, s.INPUT_SCALE) == (2, 48, 1.5, 1)
+    assert load(monkeypatch, FLUXRT_INPUT_SCALE="2", FLUXRT_OUTPUT_POLL_HZ="24").INPUT_SCALE == 2
+    assert load(monkeypatch, FLUXRT_OUTPUT_POLL_HZ="24").OUTPUT_POLL_HZ == 24.0
+
+
 def png_b64(w, h, rgb):
     buf = io.BytesIO()
     Image.new("RGB", (w, h), rgb).save(buf, format="PNG")

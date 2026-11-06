@@ -17,6 +17,7 @@ unsure, let the model's output through rather than keep camera pixels.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -245,11 +246,15 @@ class MediaPipeSegmenter:
         opts = vision.ImageSegmenterOptions(base_options=mpt.BaseOptions(model_asset_path=str(path)),
                                             output_category_mask=True)
         self._seg = vision.ImageSegmenter.create_from_options(opts)
+        # One segmenter is shared by the camera loop, the output poller's worker thread and
+        # reference cleaning; MediaPipe task objects are not safe to call concurrently.
+        self._lock = threading.Lock()
 
     def __call__(self, rgb: np.ndarray) -> np.ndarray:
         arr = np.ascontiguousarray(rgb, dtype=np.uint8)
-        res = self._seg.segment(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=arr))
-        return res.category_mask.numpy_view().copy()
+        with self._lock:
+            res = self._seg.segment(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=arr))
+            return res.category_mask.numpy_view().copy()
 
 
 def load_segmenter(model_path: str):

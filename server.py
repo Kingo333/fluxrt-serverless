@@ -86,6 +86,18 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_num(name: str, default, cast=float):
+    """A numeric switch; a typo logs a warning and uses the default instead of stopping the worker."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return cast(default)
+    try:
+        return cast(float(raw)) if cast is int else cast(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number; using %s", name, raw, default)
+        return cast(default)
+
+
 # ---------------------------------------------------------------------------
 # Live-quality switches (2026-11-06). Every one is OFF by default: with all of
 # them unset the worker behaves exactly as before. Each can be turned off on the
@@ -94,10 +106,10 @@ def _env_bool(name: str, default: str = "false") -> bool:
 # F1a: read FluxRT's output on its own clock (its x4 interpolated frames), not only
 # when a camera frame arrives.
 OUTPUT_PACING = _env_bool("FLUXRT_OUTPUT_PACING")
-OUTPUT_POLL_HZ = max(1.0, float(os.getenv("FLUXRT_OUTPUT_POLL_HZ", "30")))
+OUTPUT_POLL_HZ = max(1.0, _env_num("FLUXRT_OUTPUT_POLL_HZ", 30))
 # F1c: keep the camera frame's face/hair/background, take the clothing from FluxRT.
 COMPOSITE = _env_bool("FLUXRT_COMPOSITE")
-COMPOSITE_FEATHER = max(0, int(os.getenv("FLUXRT_COMPOSITE_FEATHER", "3")))
+COMPOSITE_FEATHER = max(0, _env_num("FLUXRT_COMPOSITE_FEATHER", 3, int))
 # unset = auto (one FluxRT processing time), else a fixed lag in ms between the camera
 # frame and the output it produced.
 try:
@@ -108,7 +120,7 @@ except ValueError:
     COMPOSITE_LAG_S = None
 # Segment the generated frame every Nth output (1 = every output; interpolated frames
 # are near-identical, so 2 halves the segmentation cost with little change).
-COMPOSITE_OUT_SEG_EVERY = max(1, int(os.getenv("FLUXRT_COMPOSITE_OUT_SEG_EVERY", "1")))
+COMPOSITE_OUT_SEG_EVERY = max(1, _env_num("FLUXRT_COMPOSITE_OUT_SEG_EVERY", 1, int))
 SEG_MODEL = os.getenv("FLUXRT_SEG_MODEL", "/opt/models/selfie_multiclass_256x256.tflite")
 # F1d: cut the garment out of on-model product photos before it goes to FluxRT.
 REF_CLEAN = _env_bool("FLUXRT_REF_CLEAN")
@@ -117,11 +129,11 @@ CACHE_MASK = os.getenv("FLUXRT_CACHE_MASK", "auto").strip().lower() or "auto"
 if CACHE_MASK not in ("auto", "seg"):
     log.warning("FLUXRT_CACHE_MASK=%r is not auto|seg; using auto", CACHE_MASK)
     CACHE_MASK = "auto"
-CACHE_MASK_DILATE = max(0, int(os.getenv("FLUXRT_CACHE_MASK_DILATE", "2")))
-CACHE_MASK_REFRESH = max(1, int(os.getenv("FLUXRT_CACHE_MASK_REFRESH", "48")))
+CACHE_MASK_DILATE = max(0, _env_num("FLUXRT_CACHE_MASK_DILATE", 2, int))
+CACHE_MASK_REFRESH = max(1, _env_num("FLUXRT_CACHE_MASK_REFRESH", 48, int))
 # F2b: a good generated frame as a third reference ("anchor"); needs the FluxRT anchor patch.
 ANCHOR = _env_bool("FLUXRT_ANCHOR")
-ANCHOR_DELAY_S = max(0.0, float(os.getenv("FLUXRT_ANCHOR_DELAY_S", "1.5")))
+ANCHOR_DELAY_S = max(0.0, _env_num("FLUXRT_ANCHOR_DELAY_S", 1.5))
 # F2c: fixed sampler shift (diffusers compute_empirical_mu override) via the same FluxRT patch.
 _mu = os.getenv("FLUXRT_MU", "").strip()
 try:
@@ -130,7 +142,7 @@ except ValueError:
     log.warning("FLUXRT_MU=%r is not a number; mu override off", _mu)
     MU_OVERRIDE = None
 # F2d: ask the app for frames at model size x scale (sharp real pixels for the composite).
-INPUT_SCALE = max(1, int(os.getenv("FLUXRT_INPUT_SCALE", "1")))
+INPUT_SCALE = max(1, _env_num("FLUXRT_INPUT_SCALE", 1, int))
 SEG_NEEDED = COMPOSITE or REF_CLEAN or CACHE_MASK == "seg"
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))

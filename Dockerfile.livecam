@@ -80,7 +80,7 @@ RUN /usr/bin/python3.12 -m pip install --no-deps mediapipe==0.10.21 \
     && curl -fsSL -o /opt/models/selfie_multiclass_256x256.tflite \
         https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite \
     && test "$(stat -c %s /opt/models/selfie_multiclass_256x256.tflite)" -gt 1000000
-RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, mediapipe; from mediapipe.tasks.python import vision; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'mediapipe', mediapipe.__version__)"
+RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, transformers, diffusers, mediapipe; from mediapipe.tasks.python import vision; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'mediapipe', mediapipe.__version__)"
 
 # ---------------------------------------------------------------------------
 # JoyAI engine, in its own venv. Built only for the RTX 5090 (sm_120a).
