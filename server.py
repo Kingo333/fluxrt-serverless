@@ -18,6 +18,8 @@ from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect, stat
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+from livecam.pacing import FrameChangeDetector
+from livecam.session import LiveSession
 from session_token import SessionClock, SessionToken, parse_and_verify
 
 logging.basicConfig(
@@ -78,6 +80,54 @@ INPUT_FPS = float(os.getenv("FLUXRT_INPUT_FPS", "10"))
 INPUT_JPEG_QUALITY = float(os.getenv("FLUXRT_INPUT_JPEG_QUALITY", "0.8"))
 DEFAULT_STEPS = int(os.getenv("FLUXRT_STEPS", "2"))
 DEFAULT_SEED = int(os.getenv("FLUXRT_SEED", "52"))
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Live-quality switches (2026-11-06). Every one is OFF by default: with all of
+# them unset the worker behaves exactly as before. Each can be turned off on the
+# endpoint without a code change. See LIVECAM_ENGINES.md, "FluxRT live-quality switches".
+# ---------------------------------------------------------------------------
+# F1a: read FluxRT's output on its own clock (its x4 interpolated frames), not only
+# when a camera frame arrives.
+OUTPUT_PACING = _env_bool("FLUXRT_OUTPUT_PACING")
+OUTPUT_POLL_HZ = max(1.0, float(os.getenv("FLUXRT_OUTPUT_POLL_HZ", "30")))
+# F1c: keep the camera frame's face/hair/background, take the clothing from FluxRT.
+COMPOSITE = _env_bool("FLUXRT_COMPOSITE")
+COMPOSITE_FEATHER = max(0, int(os.getenv("FLUXRT_COMPOSITE_FEATHER", "3")))
+# unset = auto (one FluxRT processing time), else a fixed lag in ms between the camera
+# frame and the output it produced.
+try:
+    _lag = os.getenv("FLUXRT_COMPOSITE_LAG_MS", "").strip()
+    COMPOSITE_LAG_S: Optional[float] = (float(_lag) / 1000.0) if _lag else None
+except ValueError:
+    log.warning("FLUXRT_COMPOSITE_LAG_MS=%r is not a number; using auto", os.getenv("FLUXRT_COMPOSITE_LAG_MS"))
+    COMPOSITE_LAG_S = None
+# Segment the generated frame every Nth output (1 = every output; interpolated frames
+# are near-identical, so 2 halves the segmentation cost with little change).
+COMPOSITE_OUT_SEG_EVERY = max(1, int(os.getenv("FLUXRT_COMPOSITE_OUT_SEG_EVERY", "1")))
+SEG_MODEL = os.getenv("FLUXRT_SEG_MODEL", "/opt/models/selfie_multiclass_256x256.tflite")
+# F1d: cut the garment out of on-model product photos before it goes to FluxRT.
+REF_CLEAN = _env_bool("FLUXRT_REF_CLEAN")
+# F2a: FluxRT spatial-cache mask from the segmentation ("seg") instead of its own motion rule ("auto").
+CACHE_MASK = os.getenv("FLUXRT_CACHE_MASK", "auto").strip().lower() or "auto"
+if CACHE_MASK not in ("auto", "seg"):
+    log.warning("FLUXRT_CACHE_MASK=%r is not auto|seg; using auto", CACHE_MASK)
+    CACHE_MASK = "auto"
+CACHE_MASK_DILATE = max(0, int(os.getenv("FLUXRT_CACHE_MASK_DILATE", "2")))
+CACHE_MASK_REFRESH = max(1, int(os.getenv("FLUXRT_CACHE_MASK_REFRESH", "48")))
+# F2b: a good generated frame as a third reference ("anchor"); needs the FluxRT anchor patch.
+ANCHOR = _env_bool("FLUXRT_ANCHOR")
+ANCHOR_DELAY_S = max(0.0, float(os.getenv("FLUXRT_ANCHOR_DELAY_S", "1.5")))
+# F2c: fixed sampler shift (diffusers compute_empirical_mu override) via the same FluxRT patch.
+_mu = os.getenv("FLUXRT_MU", "").strip()
+MU_OVERRIDE: Optional[float] = float(_mu) if _mu else None
+# F2d: ask the app for frames at model size x scale (sharp real pixels for the composite).
+INPUT_SCALE = max(1, int(os.getenv("FLUXRT_INPUT_SCALE", "1")))
+SEG_NEEDED = COMPOSITE or REF_CLEAN or CACHE_MASK == "seg"
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
@@ -111,6 +161,7 @@ STATE: Dict[str, Any] = {
     "warmup_started_at": None,
     "ready_at": None,
     "warmup_thread": None,
+    "segmenter": None,
 }
 
 
@@ -148,15 +199,31 @@ def b64_to_bgr(b64_str: str) -> np.ndarray:
     return arr[:, :, ::-1].copy()
 
 
-def b64_to_reference_rgb(b64_str: str) -> np.ndarray:
+def b64_to_reference_rgb(b64_str: str, segmenter=None) -> np.ndarray:
     """Garment image for FluxRT's set_reference_image.
 
     FluxRT wants RGB here (camera frames are BGR). The image is padded with
     white to the reference aspect ratio first, because FluxRT stretches it
     to REF_WIDTH x REF_HEIGHT and a stretched garment loses its shape.
+
+    FLUXRT_REF_CLEAN=1 (with a segmenter): an on-model product photo is cut
+    down to the garment on white first, so FluxRT never sees a second person.
+    Flat-lay photos and tiny garments are left untouched (livecam.segment.clean_reference).
     """
     raw = base64.b64decode(_strip_data_url(b64_str))
     img = Image.open(io.BytesIO(raw)).convert("RGB")
+    if REF_CLEAN and segmenter is not None:
+        from livecam.segment import clean_reference
+        try:
+            arr = np.asarray(img)
+            cleaned = clean_reference(arr, segmenter(arr))
+            if cleaned is not None:
+                img = Image.fromarray(cleaned)
+                log.info("reference cleaned: garment cut out of an on-model photo")
+            else:
+                log.info("reference kept as sent (no person on the photo, or garment too small)")
+        except Exception as e:  # noqa: BLE001 - never block a garment on the cleaner
+            log.warning("reference clean skipped: %s", e)
     scale = min(REF_WIDTH / img.width, REF_HEIGHT / img.height)
     w = max(1, round(img.width * scale))
     h = max(1, round(img.height * scale))
@@ -171,13 +238,17 @@ def ready_message(deadline: float) -> Dict[str, Any]:
     if CLIENT_HINTS:
         msg.update({
             "engine": "fluxrt",
-            "input_width": WIDTH,
-            "input_height": HEIGHT,
+            "input_width": WIDTH * INPUT_SCALE,
+            "input_height": HEIGHT * INPUT_SCALE,
             "output_width": OUT_WIDTH,
             "output_height": OUT_HEIGHT,
             "input_fps": INPUT_FPS,
             "input_jpeg_quality": INPUT_JPEG_QUALITY,
         })
+        if OUTPUT_PACING:
+            # The app turns its jitter buffer on only when the worker paces its output.
+            msg["playback_buffer"] = True
+            msg["playback_fps"] = int(round(OUTPUT_POLL_HZ))
     return msg
 
 
@@ -296,6 +367,13 @@ def write_runtime_config() -> Path:
     if LORA_PATH:
         config["use_lora"] = True
         config["lora_weights_path"] = check_lora(LORA_PATH)
+    if CACHE_MASK == "seg":
+        # The worker sends the mask per frame (livecam.segment.CacheMaskBuilder).
+        config["mask_calculation_method"] = "manual"
+    if ANCHOR:
+        config["use_anchor_image"] = True  # read by fluxrt/patches/fluxrt-anchor-reference.patch
+    if MU_OVERRIDE is not None:
+        config["mu_override"] = MU_OVERRIDE  # same patch
 
     path = FLUXRT_ROOT / "config.server.runtime.json"
     path.write_text(json.dumps(config, indent=2))
@@ -342,12 +420,20 @@ def warmup_blocking() -> None:
 
             try:
                 if proc.is_ready():
+                    segmenter = None
+                    if SEG_NEEDED:
+                        from livecam.segment import load_segmenter
+                        segmenter = load_segmenter(SEG_MODEL)
+                        log.info("warmup: segmenter %s", "loaded" if segmenter is not None else "UNAVAILABLE")
+                    if ANCHOR and not hasattr(proc, "set_anchor_image"):
+                        log.error("FLUXRT_ANCHOR=1 but this FluxRT has no set_anchor_image (patch missing); anchor OFF")
                     with STATE_LOCK:
                         STATE["processor"] = proc
                         STATE["crop_fn"] = crop_maximal_rectangle
+                        STATE["segmenter"] = segmenter
                         STATE["status"] = "ready"
                         STATE["ready_at"] = time.time()
-                    log.info("warmup: ready")
+                    log.info("warmup: ready; live switches %s", live_switches(segmenter is not None))
                     return
             except Exception:
                 pass
@@ -390,7 +476,23 @@ def public_state() -> Dict[str, Any]:
             "enable_tiny_vae": ENABLE_TINY_VAE,
             "enable_flow_upscaler": ENABLE_FLOW_UPSCALER,
             "lora": Path(LORA_PATH).parent.name if LORA_PATH else None,
+            "live_switches": live_switches(STATE.get("segmenter") is not None),
         }
+
+
+def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
+    """What the live-quality switches resolve to at runtime (for /ping and the logs)."""
+    return {
+        "output_pacing": OUTPUT_PACING,
+        "output_poll_hz": OUTPUT_POLL_HZ if OUTPUT_PACING else None,
+        "composite": COMPOSITE and segmenter_loaded,
+        "ref_clean": REF_CLEAN and segmenter_loaded,
+        "cache_mask": CACHE_MASK if (CACHE_MASK == "auto" or segmenter_loaded) else "auto",
+        "anchor": ANCHOR,
+        "mu": MU_OVERRIDE,
+        "input_scale": INPUT_SCALE,
+        "segmenter_loaded": segmenter_loaded,
+    }
 
 
 @asynccontextmanager
@@ -553,7 +655,7 @@ async def api_predict(
 
         if isinstance(ref_b64, str) and ref_b64:
             try:
-                ref = b64_to_reference_rgb(ref_b64)
+                ref = b64_to_reference_rgb(ref_b64, STATE.get("segmenter"))
                 proc.set_reference_image(ref)
             except Exception as e:
                 log.warning("set_reference_image failed: %s", e)
@@ -618,6 +720,17 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     res = proc.get_resolution()
     h, w = int(res["height"]), int(res["width"])
 
+    # Live-quality switches (all off = plain crop in, untouched output out).
+    with STATE_LOCK:
+        segmenter = STATE.get("segmenter")
+    live = LiveSession(
+        proc, crop_fn, segmenter, width=w, height=h, out_width=OUT_WIDTH, out_height=OUT_HEIGHT,
+        composite_on=COMPOSITE, feather=COMPOSITE_FEATHER, lag_override_s=COMPOSITE_LAG_S,
+        out_seg_every=COMPOSITE_OUT_SEG_EVERY,
+        cache_mask=CACHE_MASK, mask_dilate=CACHE_MASK_DILATE, mask_refresh=CACHE_MASK_REFRESH,
+        anchor_on=ANCHOR, anchor_delay_s=ANCHOR_DELAY_S,
+    )
+
     # ------------------------------------------------------------------
     # Latest-frame-wins live-cam pipeline.
     #
@@ -649,6 +762,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     latest_output_ts: float = 0.0
     last_sent_seq: int = 0
     output_event = asyncio.Event()
+    # Pacing: the poller publishes only once a camera frame has been fed, so the app never
+    # sees FluxRT's initial (black / warm-up) output.
+    inputs_written: int = 0
 
     async def receiver():
         nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count
@@ -665,7 +781,11 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
                 if msg_type == "set_prompt":
                     try:
+                        # The app also sends the item's category (tops, shoes, ...); the
+                        # composite and cache-mask rules depend on it.
+                        live.set_category(data.get("category"))
                         proc.set_prompt(str(data.get("prompt", "")))
+                        live.garment_changed()
                         await websocket.send_json({"type": "ack", "name": "set_prompt"})
                     except Exception as e:
                         await websocket.send_json({"type": "error", "message": f"set_prompt_failed:{e}"})
@@ -679,8 +799,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
                 elif msg_type == "set_reference_image":
                     try:
-                        ref = b64_to_reference_rgb(data["image_b64"])
+                        ref = b64_to_reference_rgb(data["image_b64"], segmenter)
                         proc.set_reference_image(ref)
+                        live.garment_changed()
                         await websocket.send_json({"type": "ack", "name": "set_reference_image"})
                     except Exception as e:
                         await websocket.send_json({"type": "error", "message": f"set_reference_image_failed:{e}"})
@@ -709,6 +830,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
     async def processor_loop():
         nonlocal pending_frame_b64, pending_recv_ts, latest_output_b64, latest_output_seq, latest_output_ts
+        nonlocal inputs_written
         processed = 0
         try:
             while not stop_event.is_set():
@@ -725,10 +847,14 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 t_proc_start = time.time()
                 try:
                     frame = b64_to_bgr(frame_b64)
-                    resized = crop_fn(frame, h, w)
+                    resized = live.prepare_input(frame, t_proc_start)
                     input_t.copy_from(resized)
-                    output = output_t.to_numpy()
-                    out_b64 = bgr_to_b64_jpeg(output)
+                    inputs_written += 1
+                    if not OUTPUT_PACING:
+                        # As before: read whatever FluxRT has produced so far, once per camera frame.
+                        output = output_t.to_numpy()
+                        output = live.finish_output(output, time.time())
+                        out_b64 = bgr_to_b64_jpeg(output)
                 except Exception as e:
                     try:
                         await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
@@ -737,11 +863,12 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     continue
                 t_proc_end = time.time()
 
-                # Publish to sender hand-off.
-                latest_output_b64 = out_b64
-                latest_output_seq += 1
-                latest_output_ts = t_proc_end
-                output_event.set()
+                if not OUTPUT_PACING:
+                    # Publish to sender hand-off (with pacing on, output_poller does this).
+                    latest_output_b64 = out_b64
+                    latest_output_seq += 1
+                    latest_output_ts = t_proc_end
+                    output_event.set()
 
                 processed += 1
 
@@ -761,6 +888,50 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             log.info("livecam processor: websocket disconnected")
         except Exception as e:
             log.exception("livecam processor failure: %s", e)
+        finally:
+            stop_event.set()
+            output_event.set()
+
+    async def output_poller():
+        """FLUXRT_OUTPUT_PACING: refresh latest_output from FluxRT's output tensor on its own
+        clock, so its x4 interpolated frames reach the app. Both sender modes consume
+        latest_output unchanged: the playback scheduler keeps pacing the sends."""
+        nonlocal latest_output_b64, latest_output_seq, latest_output_ts
+        period = 1.0 / OUTPUT_POLL_HZ
+        detector = FrameChangeDetector()
+        polled = published = 0
+        window_start = time.time()
+
+        def finish(output: np.ndarray, now: float) -> str:
+            return bgr_to_b64_jpeg(live.finish_output(output, now))
+
+        try:
+            while not stop_event.is_set():
+                t0 = time.time()
+                try:
+                    if inputs_written > 0 and proc.is_ready():
+                        output = output_t.to_numpy()
+                        polled += 1
+                        if detector.changed(output):
+                            # Composite + JPEG off the event loop (numpy/PIL release the GIL).
+                            out_b64 = await asyncio.to_thread(finish, output, t0)
+                            latest_output_b64 = out_b64
+                            latest_output_seq += 1
+                            latest_output_ts = time.time()
+                            output_event.set()
+                            published += 1
+                except Exception as e:  # noqa: BLE001 - keep polling
+                    log.warning("livecam output poller: %s", e)
+                if ENABLE_LIVECAM_TIMING_LOG and time.time() - window_start >= 5.0:
+                    span = time.time() - window_start
+                    log.info("livecam pacing: polled=%.1f/s unique_frames=%.1f/s composite=%d pass_through=%d anchors=%d",
+                             polled / span, published / span, live.stats["composited"], live.stats["passed_through"],
+                             live.stats["anchors"])
+                    polled = published = 0
+                    window_start = time.time()
+                await asyncio.sleep(max(0.0, period - (time.time() - t0)))
+        except Exception as e:
+            log.exception("livecam output poller failure: %s", e)
         finally:
             stop_event.set()
             output_event.set()
@@ -893,7 +1064,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         except Exception:
             pass
 
-    tasks = [asyncio.ensure_future(c) for c in (receiver(), processor_loop(), sender_loop(), session_cap())]
+    coros = [receiver(), processor_loop(), sender_loop(), session_cap()]
+    if OUTPUT_PACING:
+        coros.append(output_poller())
+    tasks = [asyncio.ensure_future(c) for c in coros]
     try:
         await asyncio.gather(*tasks)
     except WebSocketDisconnect:
