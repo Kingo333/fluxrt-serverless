@@ -4,7 +4,7 @@
 #   - binds 127.0.0.1:8080 (only the adapter is public)
 #   - --no-preload: the adapter loads the model via POST /load so /ping can report 204
 #   - NO --record-dir: shoppers' camera streams are never written to disk
-#   - prompt enhancement off, mjpeg both ways
+#   - prompt enhancement off unless JOYAI_USE_PE=1, mjpeg both ways
 set -euo pipefail
 
 JOYAI_DIR="${JOYAI_DIR:-/opt/JoyAI-Video-Edit/deploy}"
@@ -47,9 +47,33 @@ export JOYOMNI_LOW_VRAM="${JOYOMNI_LOW_VRAM:-$PROFILE_LOW_VRAM}"
 # The app always sends portrait 480x840, so skip compiling/warming landscape (cold start).
 # Set "both" on the endpoint if a landscape client is ever added.
 export JOYOMNI_WARMUP_ORIENTATION="${JOYOMNI_WARMUP_ORIENTATION:-portrait}"
-echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_FAST_ACCUM LOW_VRAM=$JOYOMNI_LOW_VRAM warmup=$JOYOMNI_WARMUP_ORIENTATION cache=$CACHE_ROOT"
-# D3: no prompt enhancement. Make sure no key leaks in from the environment.
-unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
+# Upstream main (45ff66d): FA4 is tried first unless 0; it needs B200 (DEPLOYMENT.md says 0 on
+# RTX 5090 / RTX PRO 6000). The boot warm-up wait is now an upstream knob (was our patch).
+export JOYOMNI_FA4_ATTN="${JOYOMNI_FA4_ATTN:-0}"
+export JOYOMNI_LOAD_WARMUP_TIMEOUT_S="${JOYOMNI_LOAD_WARMUP_TIMEOUT_S:-900}"
+echo "[start_upstream] SAGE_ATTN=$JOYOMNI_SAGE_ATTN FP8_FAST_ACCUM=$JOYOMNI_FP8_FAST_ACCUM LOW_VRAM=$JOYOMNI_LOW_VRAM FA4=$JOYOMNI_FA4_ATTN warmup=$JOYOMNI_WARMUP_ORIENTATION warmup_wait=${JOYOMNI_LOAD_WARMUP_TIMEOUT_S}s cache=$CACHE_ROOT"
+
+# Prompt enhancement (JOYAI_USE_PE=1): JoyAI's own prompt rewriter looks at the garment photo
+# and the first camera frames once per session start / garment swap, through an external
+# OpenAI-compatible (or Anthropic-protocol) endpoint: OPENAI_BASE_URL + PE_MODEL + OPENAI_API_KEY
+# (a RunPod secret). Default off: today's behaviour, keys unset so nothing leaks in.
+PE_ARGS=(--no-use-pe --pe-backend none)
+if [ "${JOYAI_USE_PE:-0}" = "1" ]; then
+  if [ -n "${OPENAI_BASE_URL:-}" ] && [ -n "${PE_MODEL:-}" ] && [ -n "${OPENAI_API_KEY:-}" ]; then
+    PE_ARGS=(--use-pe --pe-backend "${JOYOMNI_PE_BACKEND:-api}" --pe-model "$PE_MODEL" --pe-timeout-s "${JOYAI_PE_TIMEOUT_S:-20}")
+    echo "[start_upstream] prompt enhancement ON: backend=${JOYOMNI_PE_BACKEND:-api} model=$PE_MODEL base_url=$OPENAI_BASE_URL timeout=${JOYAI_PE_TIMEOUT_S:-20}s (key: set)"
+  else
+    echo "[start_upstream] WARNING: JOYAI_USE_PE=1 but OPENAI_BASE_URL, PE_MODEL or OPENAI_API_KEY is empty: starting with prompt enhancement OFF" >&2
+    unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
+  fi
+else
+  unset OPENAI_API_KEY OPENAI_BASE_URL PE_MODEL
+fi
+# Full-body entry gate (upstream main): person-box geometry instead of the near face gate.
+GATE_ARGS=()
+if [ "${JOYAI_FULL_BODY_GATE:-0}" = "1" ]; then
+  GATE_ARGS=(--full-body-detection)
+fi
 
 DEFAULT_DIT="${JOYOMNI_DIT_CKPT:-$CKPT_ROOT/JoyAI-Video-Edit/dit/joyai_video_edit_dit_0811.pth}"
 # JOYAI_MODEL_VERSION picks a trained model from the registry on the volume (staging);
@@ -58,7 +82,9 @@ MODEL_VERSION="${JOYAI_MODEL_VERSION:-joyai-baseline}"
 REGISTRY="${JOYAI_MODEL_REGISTRY:-$VOL/models/registry.json}"
 DIT_CKPT="$("$PY" "$(dirname "$0")/tools/resolve_model.py" "$MODEL_VERSION" "$REGISTRY" "$DEFAULT_DIT")" || {
   echo "[start_upstream] cannot load model version $MODEL_VERSION (see above)" >&2; exit 2; }
-echo "[start_upstream] model version: $MODEL_VERSION -> $DIT_CKPT"
+# Which DiT: 0811 (default) or e.g. JOYOMNI_DIT_CKPT=$CKPT_ROOT/JoyAI-Video-Edit/dit/joyai_video_edit_dit_1101_face++.pth
+# (upstream main's default; populate_volume.sh FACEPP=1 downloads it next to 0811).
+echo "[start_upstream] model version: $MODEL_VERSION -> $DIT_CKPT ($(stat -c %s "$DIT_CKPT" 2>/dev/null || echo '?') bytes)"
 VAE_CKPT="${JOYOMNI_VAE_CKPT:-$CKPT_ROOT/JoyAI-Video-Edit/vae}"
 TE_CKPT="${JOYOMNI_TEXT_ENCODER_CKPT:-$CKPT_ROOT/MiMo-VL-7B-RL-2508}"
 FACE_ONNX="${JOYOMNI_FACE_ONNX:-$CKPT_ROOT/face_detection_yunet_2023mar.onnx}"
@@ -93,7 +119,8 @@ exec "$PY" xvideo/serving/serve_joyomni_streaming.py \
   --fps "${JOYOMNI_FPS:-24}" \
   --num-inference-steps "${JOYAI_STEPS:-2}" \
   --kv-reset-frames "${JOYAI_KV_RESET_FRAMES:-600}" \
-  --no-use-pe \
+  "${PE_ARGS[@]}" \
+  ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} \
   --no-preload \
   --uplink-codec mjpeg --downlink-codec mjpeg \
   --host 127.0.0.1 --port "${JOYAI_UPSTREAM_PORT:-8080}"

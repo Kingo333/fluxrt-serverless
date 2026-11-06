@@ -77,6 +77,18 @@ class Settings:
     # Optional wrapper around the app's prompt, e.g.
     # "Replace the subject's outfit with the garment from the reference image. {prompt}"
     prompt_template: str = field(default_factory=lambda: os.getenv("JOYAI_PROMPT_TEMPLATE", "{prompt}"))
+    # JoyAI's prompt enhancement (its VLM rewrites the instruction from the garment photo and
+    # the first camera frames, once per start/swap). Needs start_upstream.sh to have started
+    # JoyAI with an API backend (JOYAI_USE_PE=1 + OPENAI_BASE_URL/PE_MODEL/OPENAI_API_KEY);
+    # JoyAI ANDs this flag with its own availability, so it is harmless when PE is not set up.
+    use_pe: bool = field(default_factory=lambda: _bool("JOYAI_USE_PE", False))
+    # How the instruction refers to the garment photo: "reference" keeps the app's wording
+    # ("the garment in the reference image", what JoyAI's own prompt rewriter emits);
+    # "image1" rewrites it to "the garment from Image 1" (an older upstream try-on tip).
+    ref_wording: str = field(default_factory=lambda: os.getenv("JOYAI_REF_WORDING", "reference").strip().lower() or "reference")
+    # Which entry gate JoyAI runs: "near" (face, today's default), "full" (full-body geometry,
+    # upstream main) or "off". The app's face_gate=False still turns the gate off per garment.
+    detection_mode: str = field(default_factory=lambda: os.getenv("JOYAI_DETECTION_MODE", "near").strip().lower() or "near")
 
     @property
     def upstream_http(self) -> str:
