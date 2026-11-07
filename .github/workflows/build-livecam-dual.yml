@@ -13,6 +13,8 @@ on:
       - bootstrap.py
       - session_token.py
       - joyai/**
+      - livecam/**
+      - fluxrt/patches/**
       - .github/workflows/build-livecam-dual.yml
   workflow_dispatch:
 

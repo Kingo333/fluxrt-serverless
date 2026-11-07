@@ -44,6 +44,42 @@ Other FluxRT settings in this image:
 Both engines speak the same WebSocket messages and use the same `SESSION_SIGNING_SECRET`,
 so the app and the Cloudflare Worker don't change when you flip.
 
+## FluxRT live-quality switches (2026-11-06)
+
+All OFF by default: with none of them set the worker behaves exactly as before. Each is an
+endpoint environment variable; turning one off is editing the endpoint and letting the
+workers restart (minutes, no code change). `/ping` shows what they resolved to under
+`live_switches`, and warm-up logs the same line.
+
+| Variable | Default | On | What it does | Off / rollback |
+|---|---|---|---|---|
+| `FLUXRT_OUTPUT_PACING` | `false` | `1` | Reads FluxRT's output on its own clock (`FLUXRT_OUTPUT_POLL_HZ`, default 30) so its x4 interpolated frames reach the app, instead of only when a camera frame arrives. Adds `playback_buffer`/`playback_fps` to the `ready` hints so the app enables its jitter buffer. Both sender modes consume the frames unchanged. | unset |
+| `FLUXRT_COMPOSITE` | `false` | `1` | Keeps the camera frame's face, hair and background and takes only the clothing from FluxRT (MediaPipe multiclass selfie segmenter, baked into the image). Rules by the item's category from the app: garments keep face/hair/background minus the new clothing (no face in view: background only); shoes keep face/hair only; bags face only; accessories, unknown category, no person or a failed segmentation = pass-through. `FLUXRT_COMPOSITE_FEATHER` (3 px edge), `FLUXRT_COMPOSITE_LAG_MS` (unset = one processing time), `FLUXRT_COMPOSITE_OUT_SEG_EVERY` (1). | unset |
+| `FLUXRT_REF_CLEAN` | `false` | `1` | Cuts the garment out of an on-model product photo (keeps it on white) before FluxRT sees it. Flat-lay photos, photos without a person and garments under 5% of the photo are left untouched. | unset |
+| `FLUXRT_CACHE_MASK` | `auto` | `seg` | Drives FluxRT's spatial cache from the segmentation: the person/garment and anything that moved are recomputed every frame, static background cells reuse the cache; everything is recomputed on the first frame, every `FLUXRT_CACHE_MASK_REFRESH` (48) frames, after a prompt/garment change, and always for shoes/bags/accessories/unknown categories (identical to today for them). `FLUXRT_CACHE_MASK_DILATE` (2 cells). | `auto` |
+| `FLUXRT_ANCHOR` | `false` | `1` | `FLUXRT_ANCHOR_DELAY_S` (1.5) after a garment is set, keeps one generated frame and passes it as a third reference every frame, so the garment rendering stays consistent (needs the FluxRT patch in this image; about 20-30% more per frame). Cleared on every garment swap. | unset |
+| `FLUXRT_ANCHOR_REFRESH_S` | `0` | e.g. `4` | With `FLUXRT_ANCHOR=1`: replaces the anchor with the latest generated frame every N seconds (minimum 2), so the outfit stays steady but follows new poses. Never refreshes on a frame with nobody in it (looks again a second later). Each refresh recomputes one whole frame. `0` = one anchor per garment, as before. | unset |
+| `FLUXRT_FACE_PASTE` | `false` | `1` | Pastes only the camera's face onto FluxRT's output, so the shopper stays recognisable: face skin with its holes filled (eyes, glasses, open mouth) plus facial hair in the lower part of the face; never background, scalp hair, caps, scarves or hijabs. Only where both the camera frame and the generated frame see that face, and only when their outlines overlap at least `FLUXRT_FACE_PASTE_MIN_OVERLAP` (0.6); each face separately (two people); fades in over 6 outputs and out over 3. Soft edge `FLUXRT_FACE_PASTE_FEATHER` (8 px) ending `FLUXRT_FACE_PASTE_SHRINK` (4 px) inside the outline. Garments, shoes and bags only; accessories, unknown categories, no face in view or far-away faces = FluxRT's frame untouched. Real face colours are never changed. Off when `FLUXRT_COMPOSITE=1` (it keeps the face already). About 8 ms per output frame plus one segmentation of each camera and output frame (CPU). `livecam pacing` logs `face_pasted` and `face_gain`. | unset |
+| `FLUXRT_MU` | unset | e.g. `1.9` | Fixed sampler shift instead of diffusers' resolution-based value (lower = sharper detail, higher = softer and steadier). | unset |
+| `FLUXRT_INPUT_SCALE` | `1` | `2` | Asks the app for camera frames at model size x 2 (576x1024 for 288x512); FluxRT still runs at model size, the composite keeps the sharp real pixels. About 2x the upload. | `1` |
+
+Owner's FluxRT test after Release #40 (7 Nov 2026): `FLUXRT_OUTPUT_PACING=1`, `FLUXRT_REF_CLEAN=1`,
+`FLUXRT_ANCHOR=1`, `FLUXRT_ANCHOR_DELAY_S=3`, `FLUXRT_ANCHOR_REFRESH_S=4`, `FLUXRT_FACE_PASTE=1`;
+`FLUXRT_COMPOSITE`, `FLUXRT_CACHE_MASK` and `FLUXRT_INPUT_SCALE` unset (the full composite pasted
+background over the generated cap and body when frames did not line up).
+
+Earlier recommended combination for the owner's app test (live endpoint values in brackets):
+`FLUXRT_OUTPUT_PACING=1` with `ENABLE_PLAYBACK_SCHEDULER=true` (already true), `PLAYBACK_TARGET_FPS=24`
+(was 12) and `REPEAT_LAST_FRAME_WHEN_IDLE=true` (already true): the poller refreshes the latest
+output up to 30 times a second and the scheduler sends it at 24 fps. If the scheduler's target
+is above the real output rate, it repeats the last frame, as today. Then `FLUXRT_COMPOSITE=1`,
+`FLUXRT_REF_CLEAN=1`, `FLUXRT_INPUT_SCALE=2`; second round `FLUXRT_CACHE_MASK=seg`,
+`FLUXRT_ANCHOR=1`. Quality test matrix (one at a time): `FLUXRT_WIDTH=384 FLUXRT_HEIGHT=672`
+(both multiples of 16; the ready hints follow), `ENABLE_FLOW_UPSCALER=false`, `FLUXRT_MU=1.9` vs `2.5`.
+
+If the segmenter fails to load, `FLUXRT_COMPOSITE`, `FLUXRT_REF_CLEAN`, `FLUXRT_FACE_PASTE` and `FLUXRT_CACHE_MASK=seg`
+turn themselves off (logged, visible in `/ping`); the session runs as today.
+
 ## Switch to JoyAI
 
 On the endpoint → **Edit endpoint**:
@@ -103,6 +139,63 @@ running on the existing endpoint, and the app's Premium HD button reaches JoyAI.
 | Network volume | `azyah-joyai` (locks the endpoint to that datacenter) |
 | Container disk | start at 60 GB; lower it once you see the pulled image size |
 | Env | `LIVECAM_ENGINE=joyai`, `SESSION_SIGNING_SECRET` (same as the Worker, as a RunPod Secret), `ACCEPTED_TIERS=premium`, `MAX_SESSION_SECONDS=300` |
+
+## JoyAI upgrade switches (2026-11: upstream main, face++, prompt enhancement)
+
+The image now pins JoyAI upstream **main `45ff66d9`** (6 Nov 2026) instead of `d875895`. What that
+brings: the "cached attention consistency" fix (2 Nov), prompt enhancement with an external API backend,
+the full-body entry gate, and `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` (so our old warm-up-timeouts patch is gone).
+**With every switch below at its default, the worker behaves exactly as before:** checkpoint 0811, no
+prompt enhancement (keys unset), the app's wording, the near face gate.
+
+| Switch (endpoint env) | Default | On | Turn off again |
+|---|---|---|---|
+| `JOYOMNI_DIT_CKPT` | unset = `/runpod-volume/joyai/checkpoints/JoyAI-Video-Edit/dit/joyai_video_edit_dit_0811.pth` | `=/runpod-volume/joyai/checkpoints/JoyAI-Video-Edit/dit/joyai_video_edit_dit_1101_face++.pth` serves upstream's newer "face++" DiT (same layout as 0811; upstream main's default since Nov 2026) | delete the variable |
+| `JOYAI_USE_PE` | `0` | `1`: JoyAI's own prompt rewriter looks at the garment photo and the first camera frames once per start/swap and rewrites the instruction (layers, sleeves, colours, what to keep). Needs the three PE variables below. Adds 2–8 s to a start/swap; after `JOYAI_PE_TIMEOUT_S` (20) it falls back to the raw instruction | `0` |
+| `OPENAI_BASE_URL` / `PE_MODEL` / `OPENAI_API_KEY` | unset | the PE endpoint: OpenAI-compatible, e.g. Gemini's `https://generativelanguage.googleapis.com/v1beta/openai` with `PE_MODEL=gemini-2.5-flash` and the app's existing Gemini key as a **RunPod secret**; or an Anthropic-protocol URL (contains `/anthropic`). If any is empty, PE stays off with a warning. Values are never logged | unset |
+| `JOYOMNI_PE_BACKEND` | `api` when PE is on | leave; `qwen` would load a 23 GB local model (96 GB card only) | — |
+| `JOYAI_REF_WORDING` | `reference` | `image1`: "the garment in the reference image" → "the garment from Image 1" (an older upstream try-on tip). Only matters with PE off: PE's output always says "the reference image" | `reference` |
+| `JOYAI_DETECTION_MODE` | `near` | `full`: upstream's full-body entry gate for sessions that have a face gate (`JOYAI_FULL_BODY_GATE=1` makes it the server default too). The app's per-garment `face_gate=false` still turns every gate off | `near` |
+| `JOYAI_FULL_BODY_GATE` | unset | `1`: start JoyAI with `--full-body-detection` | unset |
+| `JOYOMNI_FA4_ATTN` | `0` | upstream tries FlashAttention-4 first; `1` only on B200 | `0` |
+| `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` | `900` | boot warm-up wait (upstream default 600) | — |
+| `JOYAI_KV_RESET_FRAMES` | `600` | `0` = never restart the edit on a timer (sessions are ≤ 5 min; JoyAI only keeps its last 8 chunks); `2400` ≈ every 100 s. 600 restarted the edit about every 25 s (owner test, 7 Nov) | `600` |
+| `JOYAI_FACE_GATE_SCORE` | unset (JoyAI 0.35) | e.g. `0.25`: finds faces shaded by a cap or in low light, so a cap no longer looks like "person left" | delete |
+| `JOYAI_PRESENCE_ABSENT_FRAMES` | unset (JoyAI 12 ≈ 0.5 s) | e.g. `36` ≈ 1.5 s of an unclear face before the hold-and-restart | delete |
+| `JOYAI_PERSON_COUNT_CHANGE_FRAMES` | unset (JoyAI 24 ≈ 1 s) | e.g. `72` ≈ 3 s a new face count must hold before a re-edit | delete |
+| `JOYAI_PRESENCE_RETURN_FRAMES` / `JOYAI_FACE_PRESENT_MIN_RATIO` | unset (JoyAI 24 / 0.15) | advanced; leave unset | delete |
+
+**face++ on the volume.** azyah-joyai is 100 GB and already full (0811 32.5 GB + VAE + MiMo-VL 16 GB +
+compile caches). Resize it first in RunPod (Storage → azyah-joyai → Edit; volumes grow, never shrink;
+150 GB is enough), then on a one-off Pod with the volume at `/workspace`:
+`FACEPP=1 VOLUME_ROOT=/workspace/joyai bash joyai/scripts/populate_volume.sh`. The script checks free space,
+names the shortfall and refuses otherwise. **Never delete 0811: it is the rollback.** Optional check on the
+same Pod: `python3 joyai/scripts/check_dit_checkpoint.py <face++> --compare <0811>` must print
+"same layout" (894 tensors). face++ was added upstream on 1 Nov 2026 (HF commit 64ebcad, "Add Face++ video
+editing checkpoint"); it has no release notes yet, so the owner's phone test is the acceptance test.
+
+**Rollback:** set `JOYOMNI_DIT_CKPT` back / delete it, `JOYAI_USE_PE=0`, `JOYAI_REF_WORDING=reference`,
+`JOYAI_DETECTION_MODE=near`, delete `JOYAI_FULL_BODY_GATE`; workers restart in minutes. Full rollback of the
+upstream code = the previous image tag.
+
+### Who is in view: how JoyAI behaves per try-on case
+
+The app sends `face_gate=false` in `set_prompt` whenever no face is expected (shoes, bottoms, bags,
+accessories, the back camera); the adapter turns that into `gate_enabled=false` **and** `detection_mode=off`,
+which on upstream main disables the entry gate, the full-body gate and the mid-session "no person" hold
+(`entry_gate = detection_mode != "off"`; `gate_on = entry_gate`). So:
+
+| Case | Face in view? | Gate | What happens |
+|---|---|---|---|
+| Shoes, camera at the feet | no | off | edits start at once; no face needed, no black hold if the face never appears |
+| Bag | no / partial | off | same |
+| Watch, ring, close-up | no | off | same |
+| Trousers, lower body only | no | off | same |
+| Top, upper body in view | yes | near (default) or full | waits for a centred, still face (1 s), then edits; the person-presence hold blacks out if the face leaves for ~0.5 s |
+| Mirror selfie (phone in hand) | yes | near / full | as a top; the phone stays (it is not clothing) |
+| Two people side by side | yes | near / full | the gate skips the centring check for 2+ comparable faces; a later third person triggers a re-edit after 1 s |
+
+Nothing here needs a shoe or garment mask; the category rules live in the app.
 
 ## JoyAI tuning (Lucy-VTON-like feel)
 

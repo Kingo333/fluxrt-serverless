@@ -22,6 +22,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
@@ -45,6 +46,19 @@ PARAM_MAP = {
 
 FRAME_META_KEEP = 512
 KEEP_SENTENCE_START = "Keep the person's"
+
+
+# JOYAI_REF_WORDING=image1: the app's "<item> in/from the reference image" -> "<item> from Image 1".
+_REF_PHRASE = re.compile(r"\b(the [a-z]+(?: [a-z]+)*?) (?:in|from) the reference image\b")
+
+
+def reword_reference(instruction: str, style: str) -> str:
+    """How the instruction names the garment photo. "reference" = unchanged (the wording
+    JoyAI's prompt rewriter itself emits); "image1" = "from Image 1", an older upstream tip."""
+    if style != "image1" or not instruction:
+        return instruction
+    out = _REF_PHRASE.sub(r"\1 from Image 1", instruction)
+    return out.replace("the reference image", "Image 1")
 
 
 def short_instruction(instruction: str) -> str:
@@ -103,7 +117,10 @@ class Bridge:
         text = self.instruction or self.prompt or ""
         if self.instruction and self.s.instruction_style == "short":
             text = short_instruction(self.instruction)
+        if self.instruction:
+            text = reword_reference(text, self.s.ref_wording)
         prompt = self.s.prompt_template.replace("{prompt}", text)
+        gate_on = self.s.gate_enabled and self.face_gate
         payload: dict[str, Any] = {
             "type": "start",
             "prompt": prompt,
@@ -115,8 +132,11 @@ class Bridge:
             "output_quality": self.s.output_quality,
             "input_codec": "mjpeg",
             "output_codec": "mjpeg",
-            "use_pe": False,  # D3: prompt enhancement off
-            "gate_enabled": self.s.gate_enabled and self.face_gate,
+            "use_pe": self.s.use_pe,  # JoyAI ANDs it with its own PE availability
+            # Our pinned JoyAI read gate_enabled; upstream main reads detection_mode
+            # (off / near / full). Both are sent so either version behaves the same.
+            "gate_enabled": gate_on,
+            "detection_mode": (self.s.detection_mode if self.s.detection_mode in ("near", "full") else "off") if gate_on else "off",
             "max_temporal_ids": self.s.max_temporal_ids,
             "source": "camera",
         }

@@ -25,7 +25,8 @@ def run(tmp_path: Path, gpu: str, **env_overrides) -> dict:
         "#!/usr/bin/env bash\n"
         f'if [ "$1" = "-c" ]; then echo "{gpu}"; exit 0; fi\n'
         'case "$1" in *resolve_model.py) exec python3 "$@";; esac\n'
-        "env | grep -E '^(JOYOMNI_|TORCHINDUCTOR_CACHE_DIR)' \n"
+        'echo "[argv] $*"\n'
+        "env | grep -E '^(JOYOMNI_|TORCHINDUCTOR_CACHE_DIR|OPENAI_|PE_MODEL)' \n"
     )
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
     env = {k: v for k, v in os.environ.items() if not k.startswith("JOYOMNI_")}
