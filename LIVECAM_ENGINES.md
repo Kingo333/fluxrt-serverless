@@ -58,10 +58,17 @@ workers restart (minutes, no code change). `/ping` shows what they resolved to u
 | `FLUXRT_REF_CLEAN` | `false` | `1` | Cuts the garment out of an on-model product photo (keeps it on white) before FluxRT sees it. Flat-lay photos, photos without a person and garments under 5% of the photo are left untouched. | unset |
 | `FLUXRT_CACHE_MASK` | `auto` | `seg` | Drives FluxRT's spatial cache from the segmentation: the person/garment and anything that moved are recomputed every frame, static background cells reuse the cache; everything is recomputed on the first frame, every `FLUXRT_CACHE_MASK_REFRESH` (48) frames, after a prompt/garment change, and always for shoes/bags/accessories/unknown categories (identical to today for them). `FLUXRT_CACHE_MASK_DILATE` (2 cells). | `auto` |
 | `FLUXRT_ANCHOR` | `false` | `1` | `FLUXRT_ANCHOR_DELAY_S` (1.5) after a garment is set, keeps one generated frame and passes it as a third reference every frame, so the garment rendering stays consistent (needs the FluxRT patch in this image; about 20-30% more per frame). Cleared on every garment swap. | unset |
+| `FLUXRT_ANCHOR_REFRESH_S` | `0` | e.g. `4` | With `FLUXRT_ANCHOR=1`: replaces the anchor with the latest generated frame every N seconds (minimum 2), so the outfit stays steady but follows new poses. Never refreshes on a frame with nobody in it (looks again a second later). Each refresh recomputes one whole frame. `0` = one anchor per garment, as before. | unset |
+| `FLUXRT_FACE_PASTE` | `false` | `1` | Pastes only the camera's face onto FluxRT's output, so the shopper stays recognisable: face skin with its holes filled (eyes, glasses, open mouth) plus facial hair in the lower part of the face; never background, scalp hair, caps, scarves or hijabs. Only where both the camera frame and the generated frame see that face, and only when their outlines overlap at least `FLUXRT_FACE_PASTE_MIN_OVERLAP` (0.6); each face separately (two people); fades in over 6 outputs and out over 3. Soft edge `FLUXRT_FACE_PASTE_FEATHER` (8 px) ending `FLUXRT_FACE_PASTE_SHRINK` (4 px) inside the outline. Garments, shoes and bags only; accessories, unknown categories, no face in view or far-away faces = FluxRT's frame untouched. Real face colours are never changed. Off when `FLUXRT_COMPOSITE=1` (it keeps the face already). About 8 ms per output frame plus one segmentation of each camera and output frame (CPU). `livecam pacing` logs `face_pasted` and `face_gain`. | unset |
 | `FLUXRT_MU` | unset | e.g. `1.9` | Fixed sampler shift instead of diffusers' resolution-based value (lower = sharper detail, higher = softer and steadier). | unset |
 | `FLUXRT_INPUT_SCALE` | `1` | `2` | Asks the app for camera frames at model size x 2 (576x1024 for 288x512); FluxRT still runs at model size, the composite keeps the sharp real pixels. About 2x the upload. | `1` |
 
-Recommended combination for the owner's app test (live endpoint values in brackets):
+Owner's FluxRT test after Release #40 (7 Nov 2026): `FLUXRT_OUTPUT_PACING=1`, `FLUXRT_REF_CLEAN=1`,
+`FLUXRT_ANCHOR=1`, `FLUXRT_ANCHOR_DELAY_S=3`, `FLUXRT_ANCHOR_REFRESH_S=4`, `FLUXRT_FACE_PASTE=1`;
+`FLUXRT_COMPOSITE`, `FLUXRT_CACHE_MASK` and `FLUXRT_INPUT_SCALE` unset (the full composite pasted
+background over the generated cap and body when frames did not line up).
+
+Earlier recommended combination for the owner's app test (live endpoint values in brackets):
 `FLUXRT_OUTPUT_PACING=1` with `ENABLE_PLAYBACK_SCHEDULER=true` (already true), `PLAYBACK_TARGET_FPS=24`
 (was 12) and `REPEAT_LAST_FRAME_WHEN_IDLE=true` (already true): the poller refreshes the latest
 output up to 30 times a second and the scheduler sends it at 24 fps. If the scheduler's target
@@ -70,7 +77,7 @@ is above the real output rate, it repeats the last frame, as today. Then `FLUXRT
 `FLUXRT_ANCHOR=1`. Quality test matrix (one at a time): `FLUXRT_WIDTH=384 FLUXRT_HEIGHT=672`
 (both multiples of 16; the ready hints follow), `ENABLE_FLOW_UPSCALER=false`, `FLUXRT_MU=1.9` vs `2.5`.
 
-If the segmenter fails to load, `FLUXRT_COMPOSITE`, `FLUXRT_REF_CLEAN` and `FLUXRT_CACHE_MASK=seg`
+If the segmenter fails to load, `FLUXRT_COMPOSITE`, `FLUXRT_REF_CLEAN`, `FLUXRT_FACE_PASTE` and `FLUXRT_CACHE_MASK=seg`
 turn themselves off (logged, visible in `/ping`); the session runs as today.
 
 ## Switch to JoyAI

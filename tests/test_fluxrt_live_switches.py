@@ -16,7 +16,8 @@ from session_token import sign
 
 SECRET = "s"
 SWITCHES = ("FLUXRT_OUTPUT_PACING", "FLUXRT_OUTPUT_POLL_HZ", "FLUXRT_COMPOSITE", "FLUXRT_REF_CLEAN",
-            "FLUXRT_CACHE_MASK", "FLUXRT_ANCHOR", "FLUXRT_MU", "FLUXRT_INPUT_SCALE", "FLUXRT_SEG_MODEL",
+            "FLUXRT_CACHE_MASK", "FLUXRT_ANCHOR", "FLUXRT_MU", "FLUXRT_ANCHOR_REFRESH_S", "FLUXRT_FACE_PASTE",
+            "FLUXRT_FACE_PASTE_FEATHER", "FLUXRT_FACE_PASTE_SHRINK", "FLUXRT_FACE_PASTE_MIN_OVERLAP", "FLUXRT_INPUT_SCALE", "FLUXRT_SEG_MODEL",
             "ENABLE_PLAYBACK_SCHEDULER", "PLAYBACK_TARGET_FPS", "REPEAT_LAST_FRAME_WHEN_IDLE",
             "FLUXRT_WIDTH", "FLUXRT_HEIGHT", "FLUXRT_CLIENT_HINTS", "FLUXRT_LORA_PATH")
 
@@ -41,7 +42,8 @@ def test_defaults_are_all_off(monkeypatch):
     assert s.CACHE_MASK == "auto" and s.MU_OVERRIDE is None and s.INPUT_SCALE == 1 and not s.SEG_NEEDED
     sw = s.live_switches(False)
     assert sw == {"output_pacing": False, "output_poll_hz": None, "composite": False, "ref_clean": False,
-                  "cache_mask": "auto", "anchor": False, "mu": None, "input_scale": 1, "segmenter_loaded": False}
+                  "cache_mask": "auto", "anchor": False, "anchor_refresh_s": None, "face_paste": False, "mu": None,
+                  "input_scale": 1, "segmenter_loaded": False}
 
 
 def test_ready_message_unchanged_when_off_and_extended_when_on(monkeypatch):
@@ -228,3 +230,22 @@ def test_pacing_off_reads_output_only_with_camera_frames(monkeypatch):
         got = _frames_until(ws, 1)
         assert len(got) == 1 and proc.input.writes == 1
     time.sleep(0.2)
+
+
+def test_face_paste_and_anchor_refresh_switches(monkeypatch):
+    s = load(monkeypatch, FLUXRT_FACE_PASTE="1", FLUXRT_ANCHOR="1", FLUXRT_ANCHOR_REFRESH_S="4")
+    assert s.FACE_PASTE and s.SEG_NEEDED and s.ANCHOR_REFRESH_S == 4.0
+    assert (s.FACE_PASTE_FEATHER, s.FACE_PASTE_SHRINK, s.FACE_PASTE_MIN_OVERLAP) == (8, 4, 0.6)
+    sw = s.live_switches(True)
+    assert sw["face_paste"] is True and sw["anchor_refresh_s"] == 4.0
+    assert s.live_switches(False)["face_paste"] is False            # no segmenter: off, said so
+    s = load(monkeypatch, FLUXRT_FACE_PASTE="1", FLUXRT_COMPOSITE="1")
+    assert s.live_switches(True)["face_paste"] is False              # the full composite wins
+
+
+def test_face_paste_values_are_clamped_and_typos_fall_back(monkeypatch):
+    s = load(monkeypatch, FLUXRT_ANCHOR_REFRESH_S="0.5", FLUXRT_FACE_PASTE_MIN_OVERLAP="3",
+             FLUXRT_FACE_PASTE_FEATHER="soft", FLUXRT_FACE_PASTE_SHRINK="-2")
+    assert s.ANCHOR_REFRESH_S == 2.0 and s.FACE_PASTE_MIN_OVERLAP == 1.0
+    assert s.FACE_PASTE_FEATHER == 8 and s.FACE_PASTE_SHRINK == 0
+    assert s.live_switches(True)["anchor_refresh_s"] is None         # anchor itself off

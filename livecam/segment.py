@@ -6,6 +6,8 @@ Used by server.py behind env switches (all default off):
 - FLUXRT_REF_CLEAN: cut the garment out of an on-model product photo (`clean_reference`).
 - FLUXRT_CACHE_MASK=seg: drive FluxRT's spatial cache from the segmentation
   (`CacheMaskBuilder`).
+- FLUXRT_FACE_PASTE: paste only the camera's face onto FluxRT's output (`face_paste_mask`,
+  `face_alpha`), never background, hair, caps or scarves.
 
 Segmenter: MediaPipe's multiclass selfie segmenter (Apache-2.0): classes
 background, hair, body skin, face skin, clothes, others. 256x256 input, a few ms.
@@ -22,6 +24,11 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+try:  # in the image (FluxRT needs it); the face paste turns itself off without it
+    import cv2  # type: ignore
+except Exception:  # noqa: BLE001
+    cv2 = None
 
 log = logging.getLogger("fluxrt-lb.segment")
 
@@ -229,6 +236,129 @@ class CacheMaskBuilder:
             return self.full()
         person = dilate_cells(cells_any(cat != BACKGROUND, self.cell), self.dilate)
         return np.where(motion | person, 2, 0).astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# Face-only paste (FLUXRT_FACE_PASTE, owner 2026-11-07).
+# FluxRT redraws the whole frame, so the face drifts from frame to frame. This pastes the
+# camera's face back, and nothing else: no background, scalp hair, cap, scarf or hijab
+# (those are hair / clothes / others, never face). Only where BOTH frames see a face, so a
+# real face can never land on background or on a generated collar, hood or scarf.
+# ---------------------------------------------------------------------------
+FACE_PASTE_KINDS = ("garment", "shoes", "bags")   # accessories may sit on the face: never paste
+# One face must cover at least this fraction of the frame to be pasted (far-away faces are skipped).
+FACE_PASTE_MIN_FACE_FRAC = 0.004
+# Facial hair (beard, moustache) counts as face below this share of the face box height.
+BEARD_FROM = 0.45
+# ... and down to this share (a beard can reach below the face skin).
+BEARD_TO = 1.2
+
+
+def face_paste_available() -> bool:
+    return cv2 is not None
+
+
+def _fill(mask: np.ndarray) -> np.ndarray:
+    """Fill the holes inside a blob (eyes, glasses, open mouth): outer contour, filled."""
+    m = mask.astype(np.uint8)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(m)
+    cv2.drawContours(out, contours, -1, 1, thickness=cv2.FILLED)
+    return out.astype(bool)
+
+
+def face_regions(cat: np.ndarray) -> list:
+    """One bool mask per face in view: face skin, holes filled, plus facial hair in the lower
+    part of that face's box. Faces smaller than FACE_PASTE_MIN_FACE_FRAC are left out."""
+    face = (cat == FACE).astype(np.uint8)
+    if not face.any():
+        return []
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(face, connectivity=8)
+    min_px = FACE_PASTE_MIN_FACE_FRAC * cat.size
+    hair = cat == HAIR
+    regions = []
+    for k in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[k])
+        if area < min_px:
+            continue
+        region = labels == k
+        y0, y1 = y + int(h * BEARD_FROM), min(cat.shape[0], y + int(np.ceil(h * BEARD_TO)))
+        box = np.zeros_like(region)
+        box[y0:y1, x:x + w] = True
+        regions.append(_fill(region | (hair & box)))
+    return regions
+
+
+def face_paste_mask(cat_in: np.ndarray, cat_out: np.ndarray, category, min_overlap: float):
+    """(paste, fade): where to put the camera's face onto the generated frame.
+
+    paste: union over faces whose camera and generated outlines line up (overlap, IoU, at
+      least min_overlap), each limited to where both frames see that face. None if none line up.
+    fade: the same intersection for every face that overlaps at all, used only to fade the
+      paste out gently; None if no face overlaps.
+    Nothing is pasted for accessories or unknown categories, with no face in view, or when
+    the maps differ in shape.
+    """
+    if normalize_category(category) not in FACE_PASTE_KINDS or cat_in.shape != cat_out.shape or cv2 is None:
+        return None, None
+    faces_in, faces_out = face_regions(cat_in), face_regions(cat_out)
+    if not faces_in or not faces_out:
+        return None, None
+    paste = np.zeros(cat_in.shape, dtype=bool)
+    fade = np.zeros(cat_in.shape, dtype=bool)
+    for r_in in faces_in:
+        best, best_iou, best_inter = None, 0.0, 0
+        for r_out in faces_out:
+            inter = int(np.count_nonzero(r_in & r_out))
+            if inter > best_inter:
+                union = int(np.count_nonzero(r_in | r_out))
+                best, best_iou, best_inter = r_out, inter / union if union else 0.0, inter
+        if best is None:
+            continue
+        both = r_in & best
+        fade |= both
+        if best_iou >= min_overlap:
+            paste |= both
+    return (paste if paste.any() else None), (fade if fade.any() else None)
+
+
+def erode(mask: np.ndarray, px: int) -> np.ndarray:
+    """Shrink a bool mask by px pixels (box), without cv2."""
+    if px <= 0:
+        return mask
+    return _blur_separable(mask.astype(np.float32), int(px)) > 0.999
+
+
+def face_alpha(mask: np.ndarray, shrink_px: int, feather_px: int) -> np.ndarray:
+    """Soft paste weights: the edge fades over feather_px and ends shrink_px inside the outline."""
+    inner = erode(mask, int(shrink_px) + int(feather_px))
+    return feather_alpha(inner, feather_px)
+
+
+def blend(generated: np.ndarray, real: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """generated * (1 - alpha) + real * alpha, alpha HxW float in [0, 1]."""
+    a = alpha[..., None]
+    out = generated.astype(np.float32) * (1.0 - a) + real.astype(np.float32) * a
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def paste_face(generated: np.ndarray, real: np.ndarray, mask: np.ndarray, shrink_px: int, feather_px: int,
+               gain: float = 1.0) -> Optional[np.ndarray]:
+    """The generated frame with the real face blended in (face_alpha x gain), or None when
+    nothing is left after shrinking. Works only inside the face's box, so it stays a few ms
+    at 576x1024."""
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0 or gain <= 0.0:
+        return None
+    pad = int(feather_px) + 1
+    y0, y1 = max(0, ys.min() - pad), min(mask.shape[0], ys.max() + 1 + pad)
+    x0, x1 = max(0, xs.min() - pad), min(mask.shape[1], xs.max() + 1 + pad)
+    alpha = face_alpha(mask[y0:y1, x0:x1], shrink_px, feather_px) * float(gain)
+    if not alpha.any():
+        return None
+    out = generated.copy()
+    out[y0:y1, x0:x1] = blend(generated[y0:y1, x0:x1], real[y0:y1, x0:x1], alpha)
+    return out
 
 
 class MediaPipeSegmenter:

@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 
 from livecam.pacing import FrameChangeDetector
+from livecam.segment import face_paste_available
 from livecam.session import LiveSession
 from session_token import SessionClock, SessionToken, parse_and_verify
 
@@ -134,6 +135,20 @@ CACHE_MASK_REFRESH = max(1, _env_num("FLUXRT_CACHE_MASK_REFRESH", 48, int))
 # F2b: a good generated frame as a third reference ("anchor"); needs the FluxRT anchor patch.
 ANCHOR = _env_bool("FLUXRT_ANCHOR")
 ANCHOR_DELAY_S = max(0.0, _env_num("FLUXRT_ANCHOR_DELAY_S", 1.5))
+# F2b+: replace the anchor every N seconds (0 = once per garment, as before). Each refresh
+# recomputes one whole frame, so values under 2 s are raised to 2.
+ANCHOR_REFRESH_S = max(0.0, _env_num("FLUXRT_ANCHOR_REFRESH_S", 0.0))
+if 0.0 < ANCHOR_REFRESH_S < 2.0:
+    log.warning("FLUXRT_ANCHOR_REFRESH_S=%s is under 2 s; using 2", ANCHOR_REFRESH_S)
+    ANCHOR_REFRESH_S = 2.0
+# F1e: paste only the camera's face onto FluxRT's output (no background, hair, cap or scarf).
+# Soft edge FEATHER px wide that ends SHRINK px inside the face outline (output pixels); only
+# when the camera and generated faces overlap at least MIN_OVERLAP (0-1). Off when the full
+# composite is on (it already keeps the face).
+FACE_PASTE = _env_bool("FLUXRT_FACE_PASTE")
+FACE_PASTE_FEATHER = max(0, _env_num("FLUXRT_FACE_PASTE_FEATHER", 8, int))
+FACE_PASTE_SHRINK = max(0, _env_num("FLUXRT_FACE_PASTE_SHRINK", 4, int))
+FACE_PASTE_MIN_OVERLAP = min(1.0, max(0.0, _env_num("FLUXRT_FACE_PASTE_MIN_OVERLAP", 0.6)))
 # F2c: fixed sampler shift (diffusers compute_empirical_mu override) via the same FluxRT patch.
 _mu = os.getenv("FLUXRT_MU", "").strip()
 try:
@@ -143,7 +158,7 @@ except ValueError:
     MU_OVERRIDE = None
 # F2d: ask the app for frames at model size x scale (sharp real pixels for the composite).
 INPUT_SCALE = max(1, _env_num("FLUXRT_INPUT_SCALE", 1, int))
-SEG_NEEDED = COMPOSITE or REF_CLEAN or CACHE_MASK == "seg"
+SEG_NEEDED = COMPOSITE or REF_CLEAN or FACE_PASTE or CACHE_MASK == "seg"
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
@@ -505,6 +520,8 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "ref_clean": REF_CLEAN and segmenter_loaded,
         "cache_mask": CACHE_MASK if (CACHE_MASK == "auto" or segmenter_loaded) else "auto",
         "anchor": ANCHOR,
+        "anchor_refresh_s": ANCHOR_REFRESH_S if ANCHOR else None,
+        "face_paste": FACE_PASTE and segmenter_loaded and face_paste_available() and not COMPOSITE,
         "mu": MU_OVERRIDE,
         "input_scale": INPUT_SCALE,
         "segmenter_loaded": segmenter_loaded,
@@ -744,7 +761,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         composite_on=COMPOSITE, feather=COMPOSITE_FEATHER, lag_override_s=COMPOSITE_LAG_S,
         out_seg_every=COMPOSITE_OUT_SEG_EVERY,
         cache_mask=CACHE_MASK, mask_dilate=CACHE_MASK_DILATE, mask_refresh=CACHE_MASK_REFRESH,
-        anchor_on=ANCHOR, anchor_delay_s=ANCHOR_DELAY_S,
+        anchor_on=ANCHOR, anchor_delay_s=ANCHOR_DELAY_S, anchor_refresh_s=ANCHOR_REFRESH_S,
+        face_paste_on=FACE_PASTE, face_feather=FACE_PASTE_FEATHER, face_shrink=FACE_PASTE_SHRINK,
+        face_min_overlap=FACE_PASTE_MIN_OVERLAP,
     )
 
     # ------------------------------------------------------------------
@@ -940,9 +959,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     log.warning("livecam output poller: %s", e)
                 if ENABLE_LIVECAM_TIMING_LOG and time.time() - window_start >= 5.0:
                     span = time.time() - window_start
-                    log.info("livecam pacing: polled=%.1f/s unique_frames=%.1f/s composite=%d pass_through=%d anchors=%d",
+                    log.info("livecam pacing: polled=%.1f/s unique_frames=%.1f/s composite=%d pass_through=%d "
+                             "anchors=%d face_pasted=%d face_gain=%.2f",
                              polled / span, published / span, live.stats["composited"], live.stats["passed_through"],
-                             live.stats["anchors"])
+                             live.stats["anchors"], live.stats.get("face_pasted", 0), live.face_gain)
                     polled = published = 0
                     window_start = time.time()
                 await asyncio.sleep(max(0.0, period - (time.time() - t0)))
