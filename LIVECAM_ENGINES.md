@@ -152,6 +152,11 @@ prompt enhancement (keys unset), the app's wording, the near face gate.
 | `JOYAI_FULL_BODY_GATE` | unset | `1`: start JoyAI with `--full-body-detection` | unset |
 | `JOYOMNI_FA4_ATTN` | `0` | upstream tries FlashAttention-4 first; `1` only on B200 | `0` |
 | `JOYOMNI_LOAD_WARMUP_TIMEOUT_S` | `900` | boot warm-up wait (upstream default 600) | — |
+| `JOYAI_KV_RESET_FRAMES` | `600` | `0` = never restart the edit on a timer (sessions are ≤ 5 min; JoyAI only keeps its last 8 chunks); `2400` ≈ every 100 s. 600 restarted the edit about every 25 s (owner test, 7 Nov) | `600` |
+| `JOYAI_FACE_GATE_SCORE` | unset (JoyAI 0.35) | e.g. `0.25`: finds faces shaded by a cap or in low light, so a cap no longer looks like "person left" | delete |
+| `JOYAI_PRESENCE_ABSENT_FRAMES` | unset (JoyAI 12 ≈ 0.5 s) | e.g. `36` ≈ 1.5 s of an unclear face before the hold-and-restart | delete |
+| `JOYAI_PERSON_COUNT_CHANGE_FRAMES` | unset (JoyAI 24 ≈ 1 s) | e.g. `72` ≈ 3 s a new face count must hold before a re-edit | delete |
+| `JOYAI_PRESENCE_RETURN_FRAMES` / `JOYAI_FACE_PRESENT_MIN_RATIO` | unset (JoyAI 24 / 0.15) | advanced; leave unset | delete |
 
 **face++ on the volume.** azyah-joyai is 100 GB and already full (0811 32.5 GB + VAE + MiMo-VL 16 GB +
 compile caches). Resize it first in RunPod (Storage → azyah-joyai → Edit; volumes grow, never shrink;

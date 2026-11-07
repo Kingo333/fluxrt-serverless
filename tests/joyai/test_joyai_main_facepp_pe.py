@@ -261,3 +261,45 @@ def test_no_face_tryon_turns_every_gate_off_on_main_and_on_our_pin(tmp_path):
     if (JOYAI_MAIN / "deploy").is_dir():
         serve = (JOYAI_MAIN / "deploy" / "xvideo" / "serving" / "serve_joyomni_streaming.py").read_text()
         assert 'entry_gate = detection_mode != "off"' in serve and "gate_on = entry_gate" in serve
+
+
+# ---------- face-check tuning pass-through (7 Nov 2026: cap shading the face) ----------
+
+def test_face_check_tuning_off_by_default(tmp_path):
+    out = run(tmp_path, "NVIDIA GeForce RTX 5090|31")["_stdout"]
+    for flag in ("--face-gate-score", "--presence-absent-frames", "--presence-return-frames",
+                 "--person-count-change-frames", "--face-present-min-ratio"):
+        assert flag not in out
+
+
+def test_face_check_tuning_passes_numbers_and_ignores_typos(tmp_path):
+    env = run(tmp_path, "NVIDIA GeForce RTX 5090|31", JOYAI_FACE_GATE_SCORE="0.25",
+              JOYAI_PRESENCE_ABSENT_FRAMES="36", JOYAI_PERSON_COUNT_CHANGE_FRAMES="72",
+              JOYAI_FACE_PRESENT_MIN_RATIO="abc")
+    out = env["_stdout"]
+    assert "--face-gate-score 0.25" in out
+    assert "--presence-absent-frames 36" in out
+    assert "--person-count-change-frames 72" in out
+    assert "--face-present-min-ratio" not in out                 # typo: JoyAI's default, no crash
+    assert "--presence-return-frames" not in out                 # unset: JoyAI's default
+
+
+def test_populate_facepp_without_pip_uses_curl(tmp_path):
+    script = ROOT / "joyai" / "scripts" / "populate_volume.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # python3 without pip (runpod/base), no hf CLI, plenty of space, and a curl that records its call.
+    (fake_bin / "python3").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (fake_bin / "df").write_text("#!/usr/bin/env bash\n"
+                                 "echo 'Filesystem 1-blocks Used Available Capacity Mounted on'\n"
+                                 "echo 'fake 161061273600 53687091200 107374182400 33% /vol'\n")
+    (fake_bin / "curl").write_text("#!/usr/bin/env bash\necho CURL_CALLED \"$@\"\nexit 0\n")
+    for f in fake_bin.iterdir():
+        f.chmod(0o755)
+    path = f"{fake_bin}:/usr/bin:/bin"
+    env = dict(os.environ, PATH=path, VOLUME_ROOT=str(tmp_path / "vol"), FACEPP="1")
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    assert "CURL_CALLED" in r.stdout and "face%2B%2B.pth" in r.stdout and "-C -" in r.stdout
+    assert "no pip / hf CLI" in r.stdout
+    # The fake curl wrote nothing, so the size check must report it as incomplete (never "Done").
+    assert r.returncode != 0 and "Done." not in r.stdout

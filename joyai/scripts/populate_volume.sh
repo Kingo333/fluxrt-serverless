@@ -23,7 +23,13 @@ WITH_YOLO=false
 mkdir -p "$CKPT" "$VOLUME_ROOT/cache_rtx5090"
 df -h "$VOLUME_ROOT" | tail -1
 
-python3 -m pip install -q --upgrade "huggingface_hub[cli]>=0.34"
+# The Hugging Face CLI needs pip. Some pod images (runpod/base) have no pip: then the face++
+# download (FACEPP=1) falls back to curl from the public resolve URL, resumable with -C -.
+HAVE_HF=0
+if python3 -m pip --version >/dev/null 2>&1; then
+  python3 -m pip install -q --upgrade "huggingface_hub[cli]>=0.34" && HAVE_HF=1
+fi
+command -v hf >/dev/null 2>&1 || HAVE_HF=0
 
 if [ "${FACEPP:-0}" = "1" ]; then
   FACEPP_FILE="$CKPT/JoyAI-Video-Edit/dit/joyai_video_edit_dit_1101_face++.pth"
@@ -41,17 +47,33 @@ if [ "${FACEPP:-0}" = "1" ]; then
     exit 3
   fi
   echo "== face++ DiT (31 GB) -> $FACEPP_FILE"
-  hf download jdopensource/JoyAI-Video-Edit \
-    --repo-type model \
-    --local-dir "$CKPT/JoyAI-Video-Edit" \
-    dit/joyai_video_edit_dit_1101_face++.pth
-  if [ "$(stat -c %s "$FACEPP_FILE")" -ne "$FACEPP_BYTES" ]; then
-    echo "face++ download is incomplete ($(stat -c %s "$FACEPP_FILE") of $FACEPP_BYTES bytes); run again" >&2; exit 4
+  if [ "$HAVE_HF" = "1" ]; then
+    hf download jdopensource/JoyAI-Video-Edit \
+      --repo-type model \
+      --local-dir "$CKPT/JoyAI-Video-Edit" \
+      dit/joyai_video_edit_dit_1101_face++.pth
+  else
+    echo "(no pip / hf CLI on this pod: downloading with curl, resumable)"
+    mkdir -p "$(dirname "$FACEPP_FILE")"
+    curl -fL --retry 5 --retry-delay 5 -C - -o "$FACEPP_FILE" \
+      "https://huggingface.co/jdopensource/JoyAI-Video-Edit/resolve/main/dit/joyai_video_edit_dit_1101_face%2B%2B.pth"
+  fi
+  # A missing file counts as 0 bytes (stat on a missing file would otherwise make the test
+  # error out and the script report "Done").
+  GOT_BYTES=$(stat -c %s "$FACEPP_FILE" 2>/dev/null || echo 0)
+  if [ "$GOT_BYTES" -ne "$FACEPP_BYTES" ]; then
+    echo "face++ download is incomplete ($GOT_BYTES of $FACEPP_BYTES bytes); run again" >&2; exit 4
   fi
   ls -la "$CKPT/JoyAI-Video-Edit/dit/"
   df -h "$VOLUME_ROOT" | tail -1
   echo "Done. Serve it with JOYOMNI_DIT_CKPT=/runpod-volume/joyai/checkpoints/JoyAI-Video-Edit/dit/joyai_video_edit_dit_1101_face++.pth"
   exit 0
+fi
+
+if [ "$HAVE_HF" != "1" ]; then
+  echo "The full download needs pip and the Hugging Face CLI. Use a pod template with Python and pip" \
+       "(e.g. RunPod PyTorch), or FACEPP=1 for the face++ file alone (works with curl)." >&2
+  exit 5
 fi
 
 echo "== 1/3 DiT (0811) + xVAE"

@@ -102,6 +102,31 @@ for f in "$DIT_CKPT" "$VAE_CKPT" "$TE_CKPT"; do
   fi
 done
 
+# Face-check tuning (owner, 7 Nov 2026: a cap shading the face caused false "person left"
+# resets). Each one is passed to JoyAI only when set; unset = JoyAI's own default (no change).
+#   JOYAI_FACE_GATE_SCORE            --face-gate-score            (upstream 0.35; lower finds shaded faces)
+#   JOYAI_PRESENCE_ABSENT_FRAMES     --presence-absent-frames     (upstream 12 = 0.5 s before "left")
+#   JOYAI_PRESENCE_RETURN_FRAMES     --presence-return-frames     (upstream 24)
+#   JOYAI_PERSON_COUNT_CHANGE_FRAMES --person-count-change-frames (upstream 24 = 1 s before a re-edit)
+#   JOYAI_FACE_PRESENT_MIN_RATIO     --face-present-min-ratio     (upstream 0.15 of the frame's short side)
+# A value that is not a plain number is ignored with a warning (never stops the worker).
+TUNE_ARGS=()
+add_tune() {  # add_tune ENV_NAME --flag
+  local val="${!1:-}"
+  [ -z "$val" ] && return 0
+  if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    TUNE_ARGS+=("$2" "$val")
+  else
+    echo "[start_upstream] WARNING: $1=$val is not a number; JoyAI's default is used" >&2
+  fi
+}
+add_tune JOYAI_FACE_GATE_SCORE --face-gate-score
+add_tune JOYAI_PRESENCE_ABSENT_FRAMES --presence-absent-frames
+add_tune JOYAI_PRESENCE_RETURN_FRAMES --presence-return-frames
+add_tune JOYAI_PERSON_COUNT_CHANGE_FRAMES --person-count-change-frames
+add_tune JOYAI_FACE_PRESENT_MIN_RATIO --face-present-min-ratio
+[ ${#TUNE_ARGS[@]} -gt 0 ] && echo "[start_upstream] face-check tuning: ${TUNE_ARGS[*]}"
+
 DEVICE="${JOYOMNI_DEVICE:-cuda:0}"
 cd "$JOYAI_DIR"
 exec "$PY" xvideo/serving/serve_joyomni_streaming.py \
@@ -121,6 +146,7 @@ exec "$PY" xvideo/serving/serve_joyomni_streaming.py \
   --kv-reset-frames "${JOYAI_KV_RESET_FRAMES:-600}" \
   "${PE_ARGS[@]}" \
   ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} \
+  ${TUNE_ARGS[@]+"${TUNE_ARGS[@]}"} \
   --no-preload \
   --uplink-codec mjpeg --downlink-codec mjpeg \
   --host 127.0.0.1 --port "${JOYAI_UPSTREAM_PORT:-8080}"
