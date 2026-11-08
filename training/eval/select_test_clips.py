@@ -101,12 +101,22 @@ def test_clips(vivid: Path) -> list[tuple[Path, dict]]:
     return out
 
 
-def download(url: str, dest: Path) -> Path:
-    if not dest.exists():
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (azyah eval)"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            dest.write_bytes(r.read())
-    return dest
+def download(url: str, dest: Path, tries: int = 4) -> Path:
+    """Fetch with retries (the shop image server timed out from the Pod on 2026-11-08)."""
+    import time
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    last = None
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (azyah eval)"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                dest.write_bytes(r.read())
+            return dest
+        except Exception as e:  # noqa: BLE001 - retried, then reported by the caller
+            last = e
+            time.sleep(5 * (k + 1))
+    raise last
 
 
 def choose(scored: list[dict], key: str, k: int, reverse: bool, used: set) -> list[dict]:
@@ -152,9 +162,13 @@ def main(argv=None) -> dict:
     out = Path(a.out)
     (out / "garments").mkdir(parents=True, exist_ok=True)
 
-    garments = json.loads(Path(a.garments).read_text())["items"]
-    for g in garments:
-        g["path"] = str(download(g["image_url"], out / "garments" / f"{g['key']}.jpg"))
+    garments, notes = [], []
+    for g in json.loads(Path(a.garments).read_text())["items"]:
+        try:
+            g["path"] = str(download(g["image_url"], out / "garments" / f"{g['key']}.jpg"))
+            garments.append(g)
+        except Exception as e:  # noqa: BLE001 - one unreachable photo must not cancel every case
+            notes.append(f"garment {g['key']} not downloaded ({type(e).__name__}); left out")
     by_cat: dict[str, list[dict]] = {}
     for g in garments:
         by_cat.setdefault(g["category"], []).append(g)
@@ -165,7 +179,7 @@ def main(argv=None) -> dict:
         s = clip_stats(d / "target.mp4")
         scored.append({"clip": d.name, "path": str(d / "target.mp4"), "category": meta.get("category", "upper"), **s})
 
-    pose, notes = None, []
+    pose = None
     try:
         pose = Pose(out / "pose_landmarker_lite.task")
     except Exception as e:  # noqa: BLE001 - arms/feet cases are then reported as not covered

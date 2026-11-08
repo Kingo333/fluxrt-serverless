@@ -229,3 +229,57 @@ def test_preserve_gate_fails_only_when_worse_than_base():
     cat = np.zeros((4, 4), np.uint8); cat[0, :] = pc.FACE
     r = pc.region_stats(inp, out, cat, np.zeros((4, 4), bool))
     assert r["face"] is None   # too few face pixels to judge
+
+
+def _clip(path, color, n=6):
+    av = pytest.importorskip("av")
+    with av.open(str(path), "w") as c:
+        s = c.add_stream("libx264", rate=24)
+        s.width, s.height, s.pix_fmt = 288, 512, "yuv420p"
+        for _ in range(n):
+            for pkt in s.encode(av.VideoFrame.from_image(Image.new("RGB", (288, 512), color))):
+                c.mux(pkt)
+        for pkt in s.encode():
+            c.mux(pkt)
+
+
+def test_owner_videos_blind_pairs_with_key(tmp_path):
+    from eval import owner_videos as ov
+    cases = tmp_path / "cases"
+    for case in ("standing", "turning"):
+        d = cases / f"{case}_clip1"
+        d.mkdir(parents=True)
+        _clip(d / "input.mp4", (50, 50, 50))
+        _clip(d / "out_base.mp4", (200, 0, 0))
+        _clip(d / "out_l1500.mp4", (0, 200, 0))
+        _clip(d / "out_l2000.mp4", (0, 0, 200))
+        Image.new("RGB", (100, 130), (9, 9, 9)).save(d / "ref.jpg")
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps({"l2000": {"pass": False}, "l1500": {"pass": True}}))
+    key = ov.main([str(cases), "--gate", str(gate), "--out", str(tmp_path / "out"), "--height", "320", "--repeats", "1"])
+    assert key["lora"] == "l1500" and key["lora_passed_gate"]               # l2000 failed the gate
+    v = key["videos"]
+    assert {"1_standing.mp4", "2_turning.mp4"} <= {n for n, x in v.items() if "missing" not in x}
+    assert "missing" in v["3_arms.mp4"]
+    assert {v["1_standing.mp4"]["A"], v["1_standing.mp4"]["B"]} == {"base", "l1500"}
+    assert (tmp_path / "out" / "1_standing.mp4").stat().st_size > 0 and (tmp_path / "out" / "README.txt").exists()
+    assert ov.pick_candidate(["l2000", "l1500"], {}) == ("l2000", False)
+
+
+def test_select_skips_a_garment_that_will_not_download(tmp_path, monkeypatch):
+    from eval import select_test_clips as st
+    calls = []
+
+    def fake(url, dest, tries=4):
+        calls.append(url)
+        if "bad" in url:
+            raise TimeoutError("read timed out")
+        dest.write_bytes(b"x")
+        return dest
+    monkeypatch.setattr(st, "download", fake)
+    g = tmp_path / "g.json"
+    g.write_text(json.dumps({"items": [{"key": "ok", "category": "tops", "image_url": "https://ok"},
+                                       {"key": "bad", "category": "tops", "image_url": "https://bad"}]}))
+    (tmp_path / "vivid").mkdir()
+    r = st.main(["--vivid", str(tmp_path / "vivid"), "--garments", str(g), "--out", str(tmp_path / "o")])
+    assert any("bad" in n for n in r["notes"]) and len(calls) == 2

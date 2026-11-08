@@ -16,7 +16,11 @@ export AZ_REF AZ_ROOT=/workspace/azyah-vton
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 EXP="${AZ_EXP:-fxreal2}"
 GUARD=/workspace/fx2_started
-stop_pod() { echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true; }
+# AZ_NO_STOP=1 keeps the Pod running at the end (to copy files out); stop it by hand afterwards.
+stop_pod() {
+  if [ "${AZ_NO_STOP:-0}" = "1" ]; then echo "== AZ_NO_STOP=1: Pod left RUNNING (billing) - stop it by hand"; return; fi
+  echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true
+}
 trap stop_pod EXIT
 [ -e "$GUARD" ] && [ "${AZ_FORCE:-0}" != "1" ] && { echo "GUARD: $GUARD exists (already ran); AZ_FORCE=1 to run again"; exit 0; }
 touch "$GUARD"
@@ -156,6 +160,10 @@ Path(sys.argv[1], "gate_summary.json").write_text(json.dumps(res, indent=2))
 PYEOF
 ) || true
 cp -f "$E/cases/cases.json" "$E/cases_picked.json" 2>/dev/null || true
+echo "== 10. five blind side-by-side videos for the owner (garment | camera | A | B)"
+( cd "$T" && "$PY" -m eval.owner_videos "$R/cases" --gate "$R/gate_summary.json" --out "$AZ_ROOT/eval/owner_videos" ) \
+  || echo "OWNER_VIDEOS_EXIT=$?"
+ls -la "$AZ_ROOT/eval/owner_videos" 2>/dev/null
 cat > "$E/PASS_RULE.txt" <<'TXT'
 Owner's pass rule (2026-11-08). The ONLY goal is a better garment change.
 A LoRA is adopted only if ALL of these hold:
