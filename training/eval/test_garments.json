@@ -1,0 +1,66 @@
+{
+ "note": "Test garments from the app catalogue (products table), picked 2026-11-08 for the FluxRT LoRA eval: a print (zebra dress), a logo/graphic (tee), fine stripes, a printed bottom, a plain dark zip hoodie, and two catalogue shoes for the feet case. Eval only; images are fetched on the Pod.",
+ "items": [
+  {
+   "key": "g1_zebra_dress",
+   "category": "dresses",
+   "test_for": "print",
+   "name": "ASOS DESIGN satin maxi dress with key hole button neck detail in zebra print",
+   "description": "Satin-style fabric: glossy, drapey and silky-smooth.",
+   "image_url": "https://images.asos-media.com/products/asos-design-satin-maxi-dress-with-key-hole-button-neck-detail-in-zebra-print/208884106-1-rusticzebraprint",
+   "product_id": "fdfd8985-a496-4780-9042-48121de87580"
+  },
+  {
+   "key": "g2_graphic_tee",
+   "category": "tops",
+   "test_for": "logo",
+   "name": "Reclaimed Vintage slim cropped boxy tee with branded graphic in gray heather",
+   "description": "Jersey: soft and stretchy knitted fabric. Main: 100% Cotton.",
+   "image_url": "https://images.asos-media.com/products/reclaimed-vintage-slim-cropped-boxy-tee-with-branded-graphic-in-gray-heather/209311474-1-greymarl",
+   "product_id": "65ee2be5-e98a-4657-b64c-bedc1bfcae9b"
+  },
+  {
+   "key": "g3_stripe_shirt",
+   "category": "tops",
+   "test_for": "fine stripes",
+   "name": "ASOS DESIGN oversized shirt in blue stripe",
+   "description": "Plain-woven fabric. Main: 85% Cotton, 15% Linen.",
+   "image_url": "https://images.asos-media.com/products/asos-design-oversized-shirt-in-blue-stripe/208684415-1-lightblue",
+   "product_id": "b191942e-d63d-49e0-bc67-073503315ca9"
+  },
+  {
+   "key": "g4_paisley_skirt",
+   "category": "bottoms",
+   "test_for": "print on bottoms",
+   "name": "ASOS DESIGN wrap front maxi skirt in paisley print",
+   "description": "Wrap front maxi skirt in paisley print.",
+   "image_url": "https://images.asos-media.com/products/asos-design-wrap-front-maxi-skirt-in-paisley-print/209140853-1-paisleyprint",
+   "product_id": "c221f5b8-bb56-421e-a793-7a706efe5cb3"
+  },
+  {
+   "key": "g5_black_hoodie",
+   "category": "tops",
+   "test_for": "plain dark garment, zip",
+   "name": "ASOS DESIGN essential boxy oversized zip up hoodie in black",
+   "description": "Boxy oversized zip up hoodie.",
+   "image_url": "https://images.asos-media.com/products/asos-design-essential-boxy-oversized-zip-up-hoodie-in-black/208551580-1-black",
+   "product_id": "cb8f78f0-12a9-4d7b-b9c5-27ea9a08197b"
+  },
+  {
+   "key": "s1_shoe_01",
+   "category": "shoes",
+   "test_for": "feet case",
+   "name": "adidas Originals Samba LT sneakers in red",
+   "description": "Smooth leather upper Sole: 100% Rubber, Upper: 100% Leather.",
+   "image_url": "https://images.asos-media.com/products/adidas-originals-samba-lt-sneakers-in-red/207950761-1-red"
+  },
+  {
+   "key": "s2_shoe_05",
+   "category": "shoes",
+   "test_for": "feet case",
+   "name": "Nike Air Max Portal sneakers in white",
+   "description": "Mesh and leather upper Sole: 100% Rubber, Upper: 100% Leather.",
+   "image_url": "https://images.asos-media.com/products/nike-air-max-portal-sneakers-in-white/208019479-1-white"
+  }
+ ]
+}

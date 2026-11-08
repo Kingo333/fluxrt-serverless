@@ -19,7 +19,7 @@ source <(curl -fsSL "$RAW/scripts/common.sh")
 : "${AZ_MANIFEST_DIR:?set AZ_MANIFEST_DIR (output of data_tools.manifests)}"
 
 DIFFUSERS_COMMIT="${DIFFUSERS_COMMIT:-86ef420b17363c28e36ebad6b58555e9aa8feda2}"
-KLEIN_REPO="${KLEIN_REPO:-black-forest-labs/FLUX.2-klein-4B}"   # Apache-2.0; the model FluxRT serves
+KLEIN_REPO="${KLEIN_REPO:-black-forest-labs/FLUX.2-klein-4B}"   # Apache-2.0. Recommended: FLUX.2-klein-base-4B (BFL: train on Base, serve on the distilled model)
 AZ_EXP="${AZ_EXP:-fluxlora}"
 MAX_STEPS="${AZ_MAX_STEPS:-1500}"
 SAMPLES="${AZ_SAMPLES:-3000}"
@@ -31,7 +31,8 @@ REF_SIZE="${AZ_REF_SIZE:-384x512}" # = FLUXRT_REF_WIDTH x FLUXRT_REF_HEIGHT
 W="${SIZE%x*}"; H="${SIZE#*x}"
 VENV="$AZ_ROOT/venv-fluxlora"
 SRC="$AZ_ROOT/diffusers"
-KLEIN="$AZ_CKPT/FLUX.2-klein-4B"
+# One folder per repo: the Base model must never land in (or be skipped because of) the distilled folder.
+KLEIN="$AZ_CKPT/$(basename "$KLEIN_REPO")"
 DATA="$AZ_DATA/fluxrt_lora/$AZ_EXP"
 OUT="$AZ_OUT/fluxrt_lora/$AZ_EXP"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -68,6 +69,9 @@ git -C "$SRC" fetch -q origin "$DIFFUSERS_COMMIT" || true
 git -C "$SRC" checkout -q -f "$DIFFUSERS_COMMIT"
 curl -fsSL "$RAW/patches/flux2-klein-garment.patch" -o "$AZ_ROOT/flux2-klein-garment.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-garment.patch"
+# Noise-level shift matched to FluxRT's live 2-step schedule (--time_shift_mu; off unless AZ_TIME_SHIFT_MU is set).
+curl -fsSL "$RAW/patches/flux2-klein-timeshift.patch" -o "$AZ_ROOT/flux2-klein-timeshift.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-timeshift.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -113,7 +117,8 @@ cd "$SRC/examples/dreambooth"
   --optimizer=adamW --use_8bit_adam --learning_rate="${AZ_LR:-1e-4}" \
   --lr_scheduler=constant_with_warmup --lr_warmup_steps=50 \
   --max_train_steps="$MAX_STEPS" \
-  --checkpointing_steps="${AZ_CKPT_INTERVAL:-100}" --checkpoints_total_limit=2 \
+  --checkpointing_steps="${AZ_CKPT_INTERVAL:-100}" --checkpoints_total_limit="${AZ_CKPT_LIMIT:-2}" \
+  ${AZ_TIME_SHIFT_MU:+--time_shift_mu="$AZ_TIME_SHIFT_MU"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

@@ -76,3 +76,19 @@ The **5090 is the right card**: the PRO 6000 is about the same speed for this si
 It needs the P8 pseudo-sources (shared with JoyAI), so it can run right after P8 and before P9.
 It is cheap enough to be the first trained model we evaluate.
 For evaluation, run `eval/run_eval.py` on the same held-out items, with FluxRT plus the LoRA versus FluxRT without it.
+
+## fxreal1 (2026-11-08): the corrected recipe
+
+P8L lost detail because it trained the fast distilled FLUX.2-klein-4B directly, with uniformly sampled
+noise (only ~12% of updates in FluxRT's live band), on synthetic Glance answers. fxreal1 changes all three:
+
+- **Model:** trains on `FLUX.2-klein-base-4B` (BFL: train on Base, serve on the distilled model), stored
+  in its own folder (`checkpoints/FLUX.2-klein-base-4B`); judged on the distilled `FLUX.2-klein-4B` at
+  2 steps, 288x512, garment 288x512 (Release #43).
+- **Noise levels:** `patches/flux2-klein-timeshift.patch` adds `--time_shift_mu`; mu 2.01 = FluxRT's
+  shift at 288x512, so ~50% of updates land at sigma >= 0.88 (FluxRT's 2 steps run at 1.0 and ~0.88).
+- **Data:** `build_real.py` - every answer is a REAL picture: VITON-HD photos (input = the same photo
+  re-dressed by klein-4B, pasted back outside the garment area, filtered), ViViD real frames with
+  live-way inputs from step 3b, 10% "no change" examples. Compact app prompt as captions.
+- **Run:** `fx1.sh` on one RTX 5090 (data ~35 min, training ~60 min, renders ~35 min), then
+  reports, grids and a blind A/B package (`eval/fx1_review.tar`), and it stops its Pod.

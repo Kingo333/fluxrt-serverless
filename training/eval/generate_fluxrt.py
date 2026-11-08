@@ -151,13 +151,19 @@ def main(argv=None) -> None:
                     help="regression items (e.g. the shoe set from eval.make_shoe_set): <item>/person.*, ref.*, "
                          "meta.json {category, name, description}; no target. Prompt = the app's buildTryOnPrompt")
     ap.add_argument("--lora-scale", type=float, default=1.0, help="LoRA strength (fallback test, e.g. 0.5)")
+    ap.add_argument("--prompt-style", choices=("full", "compact"), default="full",
+                    help="compact = the app's default FluxRT prompt since azyah-shopping #21 (buildCompactTryOnPrompt)")
+    ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
+                    "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
+                    "--staging is then ignored")
     a = ap.parse_args(argv)
 
     import shutil
     import torch
     from diffusers import Flux2KleinPipeline
     from PIL import Image
-    from data_tools.fluxrt_prompt import fluxrt_prompt
+    from data_tools.fluxrt_prompt import compact_prompt, fluxrt_prompt
+    make_prompt = compact_prompt if a.prompt_style == "compact" else fluxrt_prompt
 
     w, h = (int(v) for v in a.size.lower().split("x"))
     rw, rh = (int(v) for v in a.ref_size.lower().split("x"))
@@ -171,6 +177,9 @@ def main(argv=None) -> None:
     torch.cuda.reset_peak_memory_stats()
     out_root = Path(a.out)
     latencies: list[float] = []
+    if a.clip_list:
+        run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root, latencies)
+        return
     if a.pairs:
         pairs = [(d, d) for d in pair_items(Path(a.staging), a.max_items)]
     elif a.stills:
@@ -195,7 +204,7 @@ def main(argv=None) -> None:
             frames = [_cover(f, w, h) for f in _read_frames(d / ("target.mp4" if a.cross else "source.mp4"), a.frames)]
         ref_path = next(p for p in gd.iterdir() if p.stem == "ref")
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
-        prompt = fluxrt_prompt(meta.get("category"), meta.get("name"), meta.get("description"))
+        prompt = make_prompt(meta.get("category"), meta.get("name"), meta.get("description"))
         outs = []
         for i, frame in enumerate(frames):
             gen = torch.Generator(device="cuda").manual_seed(a.seed)
@@ -234,6 +243,46 @@ def main(argv=None) -> None:
         perf = summarize(latencies, round(torch.cuda.max_memory_reserved() / 1e9, 2))
         (dest / f"perf_{a.name}.json").write_text(json.dumps(perf))
         print(json.dumps({"key": d.name, "model": a.name, **perf}), flush=True)
+
+def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies: list) -> None:
+    """--clip-list: real clips with chosen garment photos (the owner's five test cases)."""
+    import shutil
+    import torch
+    from PIL import Image
+    items = json.loads(Path(a.clip_list).read_text())[: a.max_items]
+    for it in items:
+        dest = out_root / it["key"]
+        result = dest / f"out_{a.name}.mp4"
+        if result.exists():
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        frames = [_cover(f, w, h) for f in _read_frames(Path(it["video"]), a.frames)]
+        if not frames:
+            print(json.dumps({"key": it["key"], "skipped": "no frames"}), flush=True)
+            continue
+        ref_path = Path(it["ref"])
+        garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
+        prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"))
+        outs = []
+        for i, frame in enumerate(frames):
+            gen = torch.Generator(device="cuda").manual_seed(a.seed)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            img = pipe(prompt=prompt, image=[frame, garment], height=h, width=w, guidance_scale=1.0,
+                       num_inference_steps=a.steps, generator=gen).images[0]
+            torch.cuda.synchronize()
+            if i >= 3:
+                latencies.append(time.perf_counter() - t0)
+            outs.append(img.convert("RGB").resize((w, h)))
+        _write_mp4(result, outs)
+        if not (dest / "input.mp4").exists():
+            _write_mp4(dest / "input.mp4", frames)
+            shutil.copy(ref_path, dest / f"ref{ref_path.suffix or '.jpg'}")
+            (dest / "item.json").write_text(json.dumps(it))
+        perf = summarize(latencies, round(torch.cuda.max_memory_reserved() / 1e9, 2))
+        (dest / f"perf_{a.name}.json").write_text(json.dumps(perf))
+        print(json.dumps({"key": it["key"], "case": it.get("case"), "model": a.name, **perf}), flush=True)
+
 
 if __name__ == "__main__":
     main()

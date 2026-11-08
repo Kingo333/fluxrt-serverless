@@ -153,3 +153,50 @@ def fluxrt_prompt(category=None, name=None, description=None, hint=None) -> str:
         if v:
             parts.append(f"{label}: {v}.")
     return " ".join(parts)
+
+
+# Compact FluxRT prompt: twin of buildCompactTryOnPrompt() in the app (the default since
+# azyah-shopping #21), so LoRA captions match what live FluxRT receives today.
+COMPACT_PLACEMENT = {
+    "tops": "It replaces the current top; the pants or skirt stay as they are",
+    "bottoms": "It replaces the current pants or skirt; the top stays as it is",
+    "dresses": "It is worn as a dress and replaces the current outfit, at its own length",
+    "outerwear": "It is worn over the current outfit",
+    "shoes": "They replace the current shoes, on the feet",
+    "bags": "The person carries it naturally; the outfit stays as it is",
+    "accessories": "The person wears it naturally; the outfit stays as it is",
+}
+COMPACT_SLEEVES = {
+    "sleeveless": ", and keep it sleeveless",
+    "short_sleeve": ", with short sleeves",
+    "long_sleeve": ", with full-length sleeves",
+    "three_quarter_sleeve": ", with three-quarter sleeves",
+    "unknown": "",
+}
+
+
+def _short(text: str | None, max_chars: int = 320) -> str:
+    import re
+    s = re.sub(r"\s+", " ", re.sub(r"https?://\S+", " ", re.sub(r"<[^>]*>", " ", text or ""))).strip()
+    if len(s) > max_chars:
+        cut = s[:max_chars]
+        sp = cut.rfind(" ")
+        s = re.sub(r"[\s,;:.-]+$", "", cut[:sp] if sp > max_chars * 0.6 else cut)
+    return s
+
+
+def compact_prompt(category=None, name=None, description=None, hint=None) -> str:
+    """category may be an app category ("tops") or a dataset one ("upper")."""
+    category = DATASET_CATEGORY.get(category, category)
+    cat = normalize_category(category) or normalize_category(name) or normalize_category(hint)
+    nm = _short(name, 120)
+    details = _short(description)
+    item = f"the {nm}" if nm else "the item"
+    tail = f": {details.rstrip('.!')}." if details else "."
+    parts = [f"Virtual try-on. The person in the camera frame wears {item} from the reference image{tail}"]
+    if cat:
+        parts.append(f"{COMPACT_PLACEMENT[cat]}.")
+    sleeves = COMPACT_SLEEVES[infer_sleeve_length(category, name, description, hint)] if cat in SLEEVE_CATEGORIES else ""
+    parts.append(f"Keep its exact colour, print, pattern, logo, fabric and fit{sleeves}.")
+    parts.append("Keep the person's face, hair, body, pose and the background unchanged.")
+    return " ".join(parts)
