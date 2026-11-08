@@ -121,7 +121,7 @@ render() {  # name lora-file scale (each test set has its own 15-minute limit)
     want cross && timeout -s INT 15m $G $extra --name "$n" --cross --staging "$S/vivid" --out "$R/cross" --max-items 8
     true
   ) > "$E/render_$n.log" 2>&1
-  echo "render $n done: $(grep -c '"model"' "$E/render_$n.log") items"; grep -iE "error|traceback" "$E/render_$n.log" | tail -3
+  echo "render $n done: $(grep -c '"model"' "$E/render_$n.log") items"; grep -iE "error|traceback" "$E/render_$n.log" | tail -3; return 0
 }
 render base "" 1
 for c in $CANDS; do
