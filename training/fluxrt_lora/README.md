@@ -77,7 +77,7 @@ It needs the P8 pseudo-sources (shared with JoyAI), so it can run right after P8
 It is cheap enough to be the first trained model we evaluate.
 For evaluation, run `eval/run_eval.py` on the same held-out items, with FluxRT plus the LoRA versus FluxRT without it.
 
-## fxreal1 (2026-11-08): the corrected recipe
+## fxreal2 (2026-11-08): the corrected recipe
 
 P8L lost detail because it trained the fast distilled FLUX.2-klein-4B directly, with uniformly sampled
 noise (only ~12% of updates in FluxRT's live band), on synthetic Glance answers. fxreal1 changes all three:
@@ -90,5 +90,12 @@ noise (only ~12% of updates in FluxRT's live band), on synthetic Glance answers.
 - **Data:** `build_real.py` - every answer is a REAL picture: VITON-HD photos (input = the same photo
   re-dressed by klein-4B, pasted back outside the garment area, filtered), ViViD real frames with
   live-way inputs from step 3b, 10% "no change" examples. Compact app prompt as captions.
-- **Run:** `fx1.sh` on one RTX 5090 (data ~35 min, training ~60 min, renders ~35 min), then
-  reports, grids and a blind A/B package (`eval/fx1_review.tar`), and it stops its Pod.
+- **Garment only (owner rule):** in every training input everything outside the garment area is the
+  REAL pixels (VITON-HD paste-back; ViViD live inputs get the real frame pasted back using MediaPipe
+  garment masks, `data_tools/clothes_mask.py`), 10% "no change" examples, and the loss counts the garment
+  area 2x and everything else 1x (`patches/flux2-klein-maskloss.patch`, `--mask_column mask`). This is a
+  training-data choice only: live FluxRT (Release #43) still redraws every pixel, as today.
+- **Gate:** `eval/preserve_check.py` fails a LoRA that is worse than base FluxRT on face change, skin
+  tone or background change/steadiness on ANY clip (the bar is today's #43, not perfection).
+- **Run:** `fx2.sh` on one RTX 5090 (data ~40 min, training ~60 min, renders ~35 min, gate ~10 min),
+  then reports, grids, the gate and a blind A/B package (`eval/fx2_review.tar`), and it stops its Pod.

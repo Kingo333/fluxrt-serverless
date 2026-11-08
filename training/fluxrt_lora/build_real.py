@@ -14,13 +14,18 @@ ever appears on the input side (person):
   identical outside the garment. Inputs where the garment did not visibly change are dropped
   (DINOv2-small similarity + pixel change inside the area).
 - ViViD real frames that already have a live-way input (step 3b: the live JoyAI 0811 clone
-  re-dressed the real frame with a fixed garment photo; dresses, tops, bottoms): reused as-is.
+  re-dressed the real frame with a fixed garment photo; dresses, tops, bottoms). JoyAI redraws the
+  whole frame, so the real frame is pasted back everywhere outside the garment area
+  (garment_mask.png from data_tools.clothes_mask); items without a mask, or whose input does not
+  line up with the real frame outside the garment, are dropped.
 - "No change" examples (--nochange-frac of the VITON-HD count): the person already wears the
   reference garment, so the answer is the input. Teaches "change nothing else".
 
 All pictures are centre-cropped to portrait and resized to --size (288x512, FluxRT's frame);
 the garment stays whole (the trainer pads it to --cond_2_size). Captions are the app's compact
-FluxRT prompt (compact_prompt). Held-out VITON-HD rows (the last --holdout rows, never
+FluxRT prompt (compact_prompt). Every row also carries a "mask" image (the garment area, white)
+for the trainer's --mask_column: errors there count double, everywhere else (face, skin,
+background: input == answer) 1x, so the LoRA learns to change only the garment. Held-out VITON-HD rows (the last --holdout rows, never
 trained on) become eval pairs in --test-out (person.png = real photo, ref.png = another
 held-out garment, meta.json) for eval.generate_fluxrt --pairs.
 """
@@ -36,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data_tools.fluxrt_prompt import compact_prompt  # noqa: E402
-from fluxrt_lora.make_dataset import _cover, _jpeg, selection_for, write_parquet  # noqa: E402
+from fluxrt_lora.make_dataset import _cover, _jpeg, selection_for  # noqa: E402
 
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -101,6 +106,41 @@ def pick_other(i: int, pool: list[int], rng: random.Random) -> int:
     while j == i and len(pool) > 1:
         j = rng.choice(pool)
     return j
+
+
+def outside_diff(inp, target, mask) -> float:
+    """Mean absolute difference (0-1) OUTSIDE the mask: how well a model-made input lines up."""
+    import numpy as np
+    m = 1.0 - np.asarray(mask.resize(target.size), dtype=np.float32) / 255.0
+    if m.sum() < 1:
+        return 1.0
+    d = np.abs(np.asarray(inp.convert("RGB").resize(target.size), dtype=np.float32)
+               - np.asarray(target.convert("RGB"), dtype=np.float32)).mean(axis=2) / 255.0
+    return float((d * m).sum() / m.sum())
+
+
+def write_parquet(rows: list[dict], path: Path) -> None:
+    """person / garment / target / mask images + caption, in the Hugging Face datasets layout."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    img = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    feat = {"_type": "Image"}
+    features = {"key": {"dtype": "string", "_type": "Value"}, "caption": {"dtype": "string", "_type": "Value"},
+                "person": feat, "garment": feat, "target": feat, "mask": feat}
+    schema = pa.schema([("key", pa.string()), ("caption", pa.string()), ("person", img), ("garment", img),
+                        ("target", img), ("mask", img)],
+                       metadata={"huggingface": json.dumps({"info": {"features": features}})})
+    cols = {"key": [r["key"] for r in rows], "caption": [r["caption"] for r in rows]}
+    for c in ("person", "garment", "target", "mask"):
+        ext = "png" if c == "mask" else "jpg"
+        cols[c] = [{"bytes": r[c], "path": f"{r['key']}_{c}.{ext}"} for r in rows]
+    pq.write_table(pa.table(cols, schema=schema), path)
+
+
+def _png(img) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- data access
@@ -236,6 +276,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--gen-size", default="432x768")
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--max-sim", type=float, default=0.93, help="drop inputs whose garment crop is this similar to the answer")
+    ap.add_argument("--max-outside-diff", type=float, default=0.12,
+                    help="drop ViViD live inputs that differ more than this (0-1) from the real frame outside the "
+                         "garment area (misaligned; pasting back would leave seams)")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -248,7 +291,7 @@ def main(argv=None) -> dict:
     (out / "data").mkdir(parents=True, exist_ok=True)
     test_out.mkdir(parents=True, exist_ok=True)
     rows, files, stats = [], 0, {"viton_tried": 0, "viton_kept": 0, "viton_unchanged": 0, "nochange": 0,
-                                 "vivid_live": 0, "test_pairs": 0}
+                                 "vivid_live": 0, "vivid_no_mask": 0, "vivid_misaligned": 0, "test_pairs": 0}
     used = set()
 
     def flush(final=False):
@@ -257,18 +300,29 @@ def main(argv=None) -> dict:
             write_parquet(rows, out / "data" / f"train-{files:05d}.parquet")
             files, rows = files + 1, []
 
-    def add(key, caption, person, garment, target):
+    def add(key, caption, person, garment, target, mask):
         g = garment.copy()
         if max(g.size) > 1024:
             g.thumbnail((1024, 1024), Image.LANCZOS)
         rows.append({"key": key, "caption": caption, "person": _jpeg(_cover(person, w, h)),
-                     "garment": _jpeg(g), "target": _jpeg(_cover(target, w, h))})
+                     "garment": _jpeg(g), "target": _jpeg(_cover(target, w, h)),
+                     "mask": _png(_cover(mask.convert("L"), w, h))})
         flush()
 
-    # 1. ViViD live-way stills (no GPU)
+    # 1. ViViD live-way stills (no GPU): real frame pasted back outside the garment area
     for key, cat, p, g, t in vivid_live_items([Path(d) for d in a.vivid_stills]):
-        add(key, compact_prompt(cat), Image.open(p).convert("RGB"), Image.open(g).convert("RGB"),
-            Image.open(t).convert("RGB"))
+        mpath = p.parent / "garment_mask.png"
+        if not mpath.exists():
+            stats["vivid_no_mask"] += 1
+            continue
+        mask = Image.open(mpath).convert("L")
+        real = _cover(Image.open(t).convert("RGB"), *mask.size)
+        live = _cover(Image.open(p).convert("RGB"), *mask.size)
+        soft = soft_mask(mask)
+        if outside_diff(live, real, soft) > a.max_outside_diff:
+            stats["vivid_misaligned"] += 1
+            continue
+        add(key, compact_prompt(cat), paste_back(live, real, soft), Image.open(g).convert("RGB"), real, soft)
         used.add("vivid")
         stats["vivid_live"] += 1
     print(json.dumps({"vivid_live": stats["vivid_live"]}), flush=True)
@@ -304,7 +358,8 @@ def main(argv=None) -> dict:
         box = portrait_box(*img.size)
         real = img.crop(box).resize((gw, gh), Image.LANCZOS)
         if i in nochange:
-            add(f"viton_hd_{i:05d}_same", caption, real, cloth_i, real)
+            same_mask = soft_mask(agnostic_mask(img, agn).crop(box).resize((gw, gh)))
+            add(f"viton_hd_{i:05d}_same", caption, real, cloth_i, real, same_mask)
             stats["nochange"] += 1
             used.add("viton_hd")
             continue
@@ -320,7 +375,7 @@ def main(argv=None) -> dict:
         if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
             stats["viton_unchanged"] += 1
             continue
-        add(f"viton_hd_{i:05d}", caption, inp, cloth_i, real)
+        add(f"viton_hd_{i:05d}", caption, inp, cloth_i, real, soft)
         used.add("viton_hd")
         stats["viton_kept"] += 1
         if (n + 1) % 100 == 0:

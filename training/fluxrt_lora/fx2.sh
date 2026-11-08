@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# FluxRT LoRA "fxreal1" (owner, 2026-11-08): train on FLUX.2-klein-BASE-4B with REAL-photo answers and
+# FluxRT LoRA "fxreal2" (owner, 2026-11-08): train on FLUX.2-klein-BASE-4B with REAL-photo answers and
 # FluxRT's own noise shift, then judge it on the distilled klein-4B at 2 steps (Release #43 frame and
-# garment size 288x512) against base FluxRT. One RTX 5090 Pod (RTX PRO 6000 if no 5090), volume
+# garment size 288x512) against base FluxRT. The ONLY goal is a better garment change: everything
+# outside the garment area is the real pixels in every input (paste-back, also for ViViD), 10% "no
+# change" examples, garment-area loss x2 (outside 1x), and an automatic gate that fails the LoRA if it
+# is worse than base on face, skin tone or background on ANY clip. One RTX 5090 Pod (RTX PRO 6000 if no 5090), volume
 # azyah-vton-train at /workspace. Paid: owner approved ~$3.30 (cap $4.80) on a 5090, ~$7 (cap $10) on a
 # PRO 6000. Never touches the live endpoint or the live azyah-joyai volume. Stops its own Pod at the end.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx1.sh -o /workspace/fx1.sh
-#   AZ_REF=<SHA> nohup bash /workspace/fx1.sh > /workspace/fx1.log 2>&1 &
+#   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx2.sh -o /workspace/fx2.sh
+#   AZ_REF=<SHA> nohup bash /workspace/fx2.sh > /workspace/fx2.log 2>&1 &
 set -uo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
 export AZ_REF AZ_ROOT=/workspace/azyah-vton
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
-EXP="${AZ_EXP:-fxreal1}"
-GUARD=/workspace/fx1_started
+EXP="${AZ_EXP:-fxreal2}"
+GUARD=/workspace/fx2_started
 stop_pod() { echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true; }
 trap stop_pod EXIT
 [ -e "$GUARD" ] && [ "${AZ_FORCE:-0}" != "1" ] && { echo "GUARD: $GUARD exists (already ran); AZ_FORCE=1 to run again"; exit 0; }
 touch "$GUARD"
 for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo "waiting for network"; sleep 10; done
 nvidia-smi --query-gpu=name,memory.total --format=csv
-C="$AZ_ROOT/checkpoints"; D="$AZ_ROOT/data"; S="$D/staging"; E="$AZ_ROOT/eval/fx1"; R="$E/results"
+C="$AZ_ROOT/checkpoints"; D="$AZ_ROOT/data"; S="$D/staging"; E="$AZ_ROOT/eval/fx2"; R="$E/results"
 V="$AZ_ROOT/venv-fluxlora/bin"; PY="$V/python"
 mkdir -p "$E" "$R" "$AZ_ROOT/reports"
 START=$(date +%s)
@@ -52,6 +55,16 @@ if [ ! -f "$D/raw/viton_hd/.downloaded" ]; then
 fi
 du -sh "$D/raw/viton_hd"
 
+echo "== 3b. MediaPipe (Apache-2.0) in its own venv: garment-area masks for the ViViD stills, test cases, face gate"
+MP="$AZ_ROOT/venv-mp/bin/python"
+if [ ! -x "$MP" ] || ! "$MP" -c "import mediapipe, av" 2>/dev/null; then
+  python3 -m venv "$AZ_ROOT/venv-mp" && "$AZ_ROOT/venv-mp/bin/pip" install -q mediapipe==0.10.21 av pillow numpy \
+    || echo "MEDIAPIPE_INSTALL_FAILED"
+fi
+"$MP" -c "import mediapipe, av" 2>/dev/null || { echo "NO_MEDIAPIPE: the face/skin/background gate cannot run; stopping before any training"; exit 1; }
+( cd "$T" && "$MP" -m data_tools.clothes_mask "$S/vivid_dress_stills" "$S/vivid_upper_stills" "$S/vivid_lower_stills" \
+    --model "$AZ_ROOT/selfie_multiclass_256x256.tflite" ) || echo "MASKS_EXIT=$?"
+
 DATA="$D/fluxrt_lora/$EXP"
 if [ ! -f "$DATA/dataset_summary.json" ]; then
   echo "== 4. build the real-answer dataset (re-dress with FLUX.2-klein-4B, paste back, filter)"
@@ -71,7 +84,7 @@ if [ ! -f "$OUT/pytorch_lora_weights.safetensors" ]; then
     AZ_REF=$AZ_REF AZ_MANIFEST_DIR=$AZ_ROOT/manifests/research-train AZ_EXP=$EXP \
     KLEIN_REPO=black-forest-labs/FLUX.2-klein-base-4B AZ_TIME_SHIFT_MU=2.01 AZ_REF_SIZE=288x512 \
     AZ_MAX_STEPS=${AZ_MAX_STEPS:-2000} AZ_BATCH=4 AZ_LORA_RANK=32 AZ_LR=${AZ_LR:-1e-4} \
-    AZ_CKPT_INTERVAL=250 AZ_CKPT_LIMIT=8 bash"
+    AZ_CKPT_INTERVAL=250 AZ_CKPT_LIMIT=8 AZ_MASK_COLUMN=mask AZ_MASK_WEIGHT=2.0 bash"
   echo "TRAIN_EXIT=$?"
 fi
 ls -la "$OUT" | tail -12
@@ -81,12 +94,6 @@ echo "train done after $(( ($(date +%s) - START) / 60 )) min"
 
 echo "== 6. test sets: shoe set, no-face items, the owner's five cases (held-out ViViD clips), VITON-HD pairs"
 "$PY" -m eval.make_shoe_set "$E/shoe_set" --vivid-staging "$S/vivid" || echo "SHOE_SET_EXIT=$?"
-MP="$AZ_ROOT/venv-mp/bin/python"
-if [ ! -x "$MP" ]; then
-  python3 -m venv "$AZ_ROOT/venv-mp" && "$AZ_ROOT/venv-mp/bin/pip" install -q mediapipe==0.10.21 av pillow numpy \
-    || echo "MEDIAPIPE_INSTALL_FAILED (arms/feet cases will be reported as not covered)"
-fi
-[ -x "$MP" ] && "$MP" -c "import mediapipe, av" 2>/dev/null || MP="$PY"
 ( cd "$T" && "$MP" -m eval.select_test_clips --vivid "$S/vivid" --garments "$T/eval/test_garments.json" \
     --out "$E/cases" --shoe-set "$E/shoe_set" ) || echo "SELECT_EXIT=$?"
 
@@ -127,6 +134,37 @@ for s in pairs shoes noface cross cases; do
     [ -d "$R/$s" ] && ( cd "$T" && "$PY" -m eval.ab_sheet make "$R/$s" base "$m" "$E/ab_${m}/$s" ) || true
   done
 done
+echo "== 9. face / skin / background gate (LoRA FAILS if worse than base on ANY clip)"
+GATE=PASS
+for s in pairs shoes noface cross cases; do
+  [ -d "$R/$s" ] || continue
+  ( cd "$T" && "$MP" -m eval.preserve_check "$R/$s" --base base --candidates l2000 l2000s07 l1500 l1000 \
+      --out "$R/$s/preserve.md" --model "$AZ_ROOT/selfie_multiclass_256x256.tflite" ) || echo "GATE_${s}_EXIT=$?"
+done
+( cd "$T" && "$PY" - "$R" <<'PYEOF'
+import json, sys
+from pathlib import Path
+res = {}
+for f in sorted(Path(sys.argv[1]).glob("*/preserve_check.json")):
+    for c, v in json.loads(f.read_text())["verdict"].items():
+        r = res.setdefault(c, {"pass": True, "fails": []})
+        r["pass"] = r["pass"] and v["pass"]
+        r["fails"] += [f"{f.parent.name}/{x['clip']}: {', '.join(x['worse_on'])}" for x in v["fails"]]
+for c, r in res.items():
+    print(f"GATE {c}: {'PASS' if r['pass'] else 'FAIL'}" + ("" if r["pass"] else f" ({len(r['fails'])} clips, e.g. {r['fails'][:3]})"))
+Path(sys.argv[1], "gate_summary.json").write_text(json.dumps(res, indent=2))
+PYEOF
+) || true
 cp -f "$E/cases/cases.json" "$E/cases_picked.json" 2>/dev/null || true
-( cd "$E" && tar cf "$AZ_ROOT/eval/fx1_review.tar" grid_* ab_* cases_picked.json results/*/report.md 2>/dev/null; ls -la "$AZ_ROOT/eval/fx1_review.tar" )
-echo "FX1_DONE after $(( ($(date +%s) - START) / 60 )) min"
+cat > "$E/PASS_RULE.txt" <<'TXT'
+Owner's pass rule (2026-11-08). The ONLY goal is a better garment change.
+A LoRA is adopted only if ALL of these hold:
+1. Blind A/B (ab_<candidate>/<set>/review.csv): it wins at least 26 of 40 non-tie picks on the GARMENT.
+2. It is NOT worse than base on face likeness, skin tone or background steadiness on ANY clip,
+   judged by eye in the A/B AND by the automatic gate (results/gate_summary.json = PASS).
+3. It is not worse on any shoe or no-face item.
+Otherwise Release #43 FluxRT stays as it is.
+TXT
+( cd "$E" && tar cf "$AZ_ROOT/eval/fx2_review.tar" PASS_RULE.txt grid_* ab_* cases_picked.json results/*/report.md \
+    results/*/preserve.md results/gate_summary.json 2>/dev/null; ls -la "$AZ_ROOT/eval/fx2_review.tar" )
+echo "FX2_DONE after $(( ($(date +%s) - START) / 60 )) min"
