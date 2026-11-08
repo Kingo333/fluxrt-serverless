@@ -103,26 +103,33 @@ echo "== 6. test sets: shoe set, no-face items, the owner's five cases (held-out
 
 echo "== 7. renders: base vs LoRA saves, distilled klein-4B, 2 steps, 288x512, garment 288x512, compact prompt"
 G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --ref-size 288x512 --steps 2 --prompt-style compact"
+# Quick eval (owner, 2026-11-08): AZ_CANDIDATES picks the LoRA saves to judge (lNNNN = checkpoint NNNN,
+# l2000 = the final save, an "s07" suffix = strength 0.7); AZ_SETS the test sets; AZ_PAIRS_N the VITON-HD
+# sample size. Renders are resumable: anything already rendered is skipped.
+CANDS="${AZ_CANDIDATES:-l2000 l2000s07 l1500 l1000}"
+SETS="${AZ_SETS:-pairs shoes noface cross cases}"
+PAIRS_N="${AZ_PAIRS_N:-50}"
+want() { case " $SETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 render() {  # name lora-file scale (each test set has its own 15-minute limit)
   local n="$1" l="$2" sc="$3" extra=""
   [ -n "$l" ] && extra="--lora $l --lora-scale $sc"
   ( cd "$T"
-    timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/viton_pairs" --out "$R/pairs" --max-items 50
-    timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/shoe_set" --out "$R/shoes" --max-items 10
-    [ -d "$E/cases/noface" ] && timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/cases/noface" --out "$R/noface" --max-items 10
-    timeout -s INT 15m $G $extra --name "$n" --cross --staging "$S/vivid" --out "$R/cross" --max-items 8
-    [ -f "$E/cases/clip_list.json" ] && timeout -s INT 15m $G $extra --name "$n" --clip-list "$E/cases/clip_list.json" --staging "$S/vivid" --out "$R/cases" --max-items 12
+    want cases && [ -f "$E/cases/clip_list.json" ] && timeout -s INT 15m $G $extra --name "$n" --clip-list "$E/cases/clip_list.json" --staging "$S/vivid" --out "$R/cases" --max-items 12
+    want shoes && timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/shoe_set" --out "$R/shoes" --max-items 10
+    want noface && [ -d "$E/cases/noface" ] && timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/cases/noface" --out "$R/noface" --max-items 10
+    want pairs && timeout -s INT 15m $G $extra --name "$n" --pairs --staging "$E/viton_pairs" --out "$R/pairs" --max-items "$PAIRS_N"
+    want cross && timeout -s INT 15m $G $extra --name "$n" --cross --staging "$S/vivid" --out "$R/cross" --max-items 8
     true
   ) > "$E/render_$n.log" 2>&1
   echo "render $n done: $(grep -c '"model"' "$E/render_$n.log") items"; grep -iE "error|traceback" "$E/render_$n.log" | tail -3
 }
-LORA="$OUT/pytorch_lora_weights.safetensors"
 render base "" 1
-render l2000 "$LORA" 1.0
-render l2000s07 "$LORA" 0.7
-for st in 1500 1000; do
+for c in $CANDS; do
+  st="${c#l}"; st="${st%%s*}"; sc=1.0
+  case "$c" in *s07) sc=0.7 ;; *s05) sc=0.5 ;; esac
   f="$OUT/checkpoint-$st/pytorch_lora_weights.safetensors"
-  [ -f "$f" ] && render "l$st" "$f" 1.0
+  [ "$st" = "${AZ_MAX_STEPS:-2000}" ] && f="$OUT/pytorch_lora_weights.safetensors"
+  [ -f "$f" ] && render "$c" "$f" "$sc" || echo "skip $c (no file $f)"
 done
 echo "EVAL_DONE (after $(( ($(date +%s) - START) / 60 )) min)"
 
@@ -131,10 +138,10 @@ for s in pairs shoes noface cross cases; do
   [ -d "$R/$s" ] && ( cd "$T" && "$PY" -m eval.run_eval "$R/$s" --out "$R/$s/report.md" ) && echo "--- $s" && head -14 "$R/$s/report.md"
 done
 for s in pairs shoes noface cross cases; do
-  [ -d "$R/$s" ] && ( cd "$T" && "$PY" -m eval.grid "$R/$s" "$E/grid_$s" --models base l2000 l2000s07 l1500 l1000 ) || echo "GRID_${s}_EXIT=$?"
+  [ -d "$R/$s" ] && ( cd "$T" && "$PY" -m eval.grid "$R/$s" "$E/grid_$s" --models base $CANDS ) || echo "GRID_${s}_EXIT=$?"
 done
 for s in pairs shoes noface cross cases; do
-  for m in l2000 l2000s07; do
+  for m in $CANDS; do
     [ -d "$R/$s" ] && ( cd "$T" && "$PY" -m eval.ab_sheet make "$R/$s" base "$m" "$E/ab_${m}/$s" ) || true
   done
 done
@@ -142,7 +149,7 @@ echo "== 9. face / skin / background gate (LoRA FAILS if worse than base on ANY 
 GATE=PASS
 for s in pairs shoes noface cross cases; do
   [ -d "$R/$s" ] || continue
-  ( cd "$T" && "$MP" -m eval.preserve_check "$R/$s" --base base --candidates l2000 l2000s07 l1500 l1000 \
+  ( cd "$T" && "$MP" -m eval.preserve_check "$R/$s" --base base --candidates $CANDS \
       --out "$R/$s/preserve.md" --model "$AZ_ROOT/selfie_multiclass_256x256.tflite" ) || echo "GATE_${s}_EXIT=$?"
 done
 ( cd "$T" && "$PY" - "$R" <<'PYEOF'
@@ -161,7 +168,7 @@ PYEOF
 ) || true
 cp -f "$E/cases/cases.json" "$E/cases_picked.json" 2>/dev/null || true
 echo "== 10. five blind side-by-side videos for the owner (garment | camera | A | B)"
-( cd "$T" && "$PY" -m eval.owner_videos "$R/cases" --gate "$R/gate_summary.json" --out "$AZ_ROOT/eval/owner_videos" ) \
+( cd "$T" && "$PY" -m eval.owner_videos "$R/cases" --gate "$R/gate_summary.json" --out "$AZ_ROOT/eval/owner_videos" --candidates $CANDS ) \
   || echo "OWNER_VIDEOS_EXIT=$?"
 ls -la "$AZ_ROOT/eval/owner_videos" 2>/dev/null
 cat > "$E/PASS_RULE.txt" <<'TXT'
