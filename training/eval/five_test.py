@@ -81,12 +81,14 @@ def select(root: Path, descs: list[str] | None, cats: list[str] | None) -> list[
 
 
 def video(root: Path, lora: str, seed: int, height: int = 640, repeats: int = 2, results: str | None = None,
-          name: str = "five_test") -> dict:
+          name: str = "five_test", only: list[int] | None = None) -> dict:
     import av
     from PIL import Image
     from eval.owner_videos import _frames, _panel
     res = Path(results) if results else root / "eval/fx2/results/cases5"
     items = json.loads((root / "eval/fx2/cases5/clip_list.json").read_text())
+    if only:  # e.g. [5]: a short video of just those items (numbers as in the 5-item list)
+        items = [it for k, it in enumerate(items, 1) if k in only]
     out, key_dir = root / "eval" / name, root / "eval" / f"{name}_KEY"
     out.mkdir(parents=True, exist_ok=True)
     key_dir.mkdir(parents=True, exist_ok=True)
@@ -146,10 +148,11 @@ def main(argv=None):
     v.add_argument("--seed", type=int, default=7)
     v.add_argument("--results", help="folder with <item>/out_base.mp4 and out_<lora>.mp4 (default eval/fx2/results/cases5)")
     v.add_argument("--name", default="five_test", help="video name; also the eval/<name> and eval/<name>_KEY folders")
+    v.add_argument("--only", type=int, nargs="+", help="item numbers to include (default all 5)")
     a = ap.parse_args(argv)
     if a.cmd == "select":
         return select(Path(a.root), a.desc, a.category)
-    return video(Path(a.root), a.lora, a.seed, results=a.results, name=a.name)
+    return video(Path(a.root), a.lora, a.seed, results=a.results, name=a.name, only=a.only)
 
 
 if __name__ == "__main__":

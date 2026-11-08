@@ -137,6 +137,34 @@ def vivid_pair_items(root: Path):
         yield d.name, meta.get("category", "upper"), d / "ref.jpg", [(files[0], files[1]), (files[2], files[3])]
 
 
+def extend_down(mask, frac: float = 0.2, widen: float = 0.06):
+    """fxreal4: the garment area plus a band below its hem, `frac` of the picture tall, as wide as
+    the lowest part of the garment (+ `widen` each side). Returns (whole area, the added band only)
+    as 'L' images. The re-dresser draws a LONGER garment there; the answer keeps the real, shorter
+    one, so the model learns that leftover length turns back into trousers, skirt or skin."""
+    import numpy as np
+    from PIL import Image
+    m = np.asarray(mask.convert("L")) > 127
+    h, w = m.shape
+    rows = np.where(m.any(axis=1))[0]
+    band = np.zeros_like(m)
+    if rows.size:
+        bottom = int(rows.max())
+        low = m[max(0, bottom - max(1, (bottom - int(rows.min())) // 10)): bottom + 1]
+        cols = np.where(low.any(axis=0))[0]
+        x0 = max(0, int(cols.min()) - int(widen * w))
+        x1 = min(w, int(cols.max()) + 1 + int(widen * w))
+        band[bottom + 1: min(h, bottom + 1 + int(frac * h)), x0:x1] = True
+    whole = m | band
+    return (Image.fromarray((whole * 255).astype(np.uint8), "L"),
+            Image.fromarray((band * 255).astype(np.uint8), "L"))
+
+
+LONGER_PROMPT = ("Virtual try-on. The person in the camera frame wears the garment from the reference image, but "
+                 "made longer: a long tunic-length version that covers the hips and reaches the upper thighs, worn "
+                 "over the trousers or skirt. Keep the person's face, hair, body, pose and the background unchanged.")
+
+
 def outside_diff(inp, target, mask) -> float:
     """Mean absolute difference (0-1) OUTSIDE the mask: how well a model-made input lines up."""
     import numpy as np
@@ -258,7 +286,7 @@ class Redresser:
                 self.cache_ok = False
                 break
 
-    def __call__(self, person, garment, seed: int, category: str = "tops"):
+    def __call__(self, person, garment, seed: int, category: str = "tops", prompt: str | None = None):
         from PIL import Image
         gw, gh = self.w * 2 // 3 // 16 * 16, self.h * 2 // 3 // 16 * 16
         g = garment.copy()
@@ -268,6 +296,8 @@ class Redresser:
         gen = self.torch.Generator(device="cuda").manual_seed(seed)
         kw = dict(image=[person.resize((self.w, self.h)), canvas], height=self.h, width=self.w,
                   num_inference_steps=self.steps, guidance_scale=1.0, generator=gen)
+        if prompt:
+            return self.pipe(prompt=prompt, **kw).images[0]
         cat = {"upper": "tops", "lower": "bottoms", "dress": "dresses"}.get(category, category)
         cat = cat if cat in self.prompts else "tops"
         if self.cache_ok and cat in self.embeds:
@@ -320,6 +350,11 @@ def main(argv=None) -> dict:
                     "(fxreal3 same-clip colour term); both frames re-dressed with the same other garment")
     ap.add_argument("--photo-aug", type=float, default=0.0,
                     help="fraction of samples given the same random brightness/contrast change on input and answer")
+    ap.add_argument("--longer-frac", type=float, default=0.0,
+                    help="fxreal4: fraction of re-dressed tops whose INPUT garment is drawn longer than the answer's")
+    ap.add_argument("--longer-ext", type=float, default=0.2, help="how far below the hem the longer garment may reach")
+    ap.add_argument("--longer-min-change", type=float, default=0.06,
+                    help="the band below the hem must change at least this much (0-1) or the sample stays a normal one")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -333,7 +368,8 @@ def main(argv=None) -> dict:
     test_out.mkdir(parents=True, exist_ok=True)
     rows, files, stats = [], 0, {"viton_tried": 0, "viton_kept": 0, "viton_unchanged": 0, "nochange": 0,
                                  "vivid_live": 0, "vivid_no_mask": 0, "vivid_misaligned": 0, "test_pairs": 0,
-                                 "pair_clips_tried": 0, "pair_clips_kept": 0, "photo_aug": 0}
+                                 "pair_clips_tried": 0, "pair_clips_kept": 0, "photo_aug": 0,
+                                 "longer_tried": 0, "longer_kept": 0, "longer_pairs": 0}
     used = set()
 
     def flush(final=False):
@@ -413,17 +449,26 @@ def main(argv=None) -> dict:
         mask = agnostic_mask(img, agn).crop(box).resize((gw, gh))
         j = pick_other(i, train_pool, rng)
         cloth_j = bank(j)
-        gen = redress(real, cloth_j, seed=a.seed * 100003 + i)
+        longer = a.longer_frac > 0 and rng.random() < a.longer_frac
+        gen = redress(real, cloth_j, seed=a.seed * 100003 + i, **({"prompt": LONGER_PROMPT} if longer else {}))
         soft = soft_mask(mask)
         inp = paste_back(gen, real, soft)
+        tag = ""
+        if longer:
+            stats["longer_tried"] += 1
+            whole, band = extend_down(mask, a.longer_ext)
+            inp_long = paste_back(gen, real, soft_mask(whole))
+            if changed_enough(inp_long, real, band, a.longer_min_change):
+                inp, soft, mask, tag = inp_long, soft_mask(whole), whole, "_long"
         bb = bbox_of(mask)
         sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
         if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
             stats["viton_unchanged"] += 1
             continue
-        add(f"viton_hd_{i:05d}", caption, inp, cloth_i, real, soft)
+        add(f"viton_hd_{i:05d}{tag}", caption, inp, cloth_i, real, soft)
         used.add("viton_hd")
         stats["viton_kept"] += 1
+        stats["longer_kept"] += int(bool(tag))
         if (n + 1) % 100 == 0:
             print(json.dumps({"progress": n + 1, **stats}), flush=True)
 
@@ -442,11 +487,20 @@ def main(argv=None) -> dict:
         other = Image.open(rng.choice(others)).convert("RGB")
         seed = a.seed * 100003 + 7919 + stats["pair_clips_tried"]
         built = []
+        longer = cat == "upper" and a.longer_frac > 0 and rng.random() < a.longer_frac
         for tpath, mpath in frames:
             real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
             mask = Image.open(mpath).convert("L").resize((gw, gh))
-            soft = soft_mask(mask, grow=13)
-            inp = paste_back(redress(real, other, seed=seed, category=cat), real, soft)
+            gen = redress(real, other, seed=seed, category=cat, **({"prompt": LONGER_PROMPT} if longer else {}))
+            if longer:
+                whole, band = extend_down(mask, a.longer_ext)
+                soft = soft_mask(whole, grow=13)
+                inp = paste_back(gen, real, soft)
+                if not changed_enough(inp, real, band, a.longer_min_change):
+                    break
+            else:
+                soft = soft_mask(mask, grow=13)
+                inp = paste_back(gen, real, soft)
             bb = bbox_of(mask)
             sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
             if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
@@ -460,6 +514,7 @@ def main(argv=None) -> dict:
             add(f"vivid_pair_{clip}_{tag}", compact_prompt(cat), inp, garment, real, soft, pair=clip, jitter=jf)
         used.add("vivid")
         stats["pair_clips_kept"] += 1
+        stats["longer_pairs"] += int(longer)
     print(json.dumps({"pair_clips_kept": stats["pair_clips_kept"], "pair_clips_tried": stats["pair_clips_tried"]}),
           flush=True)
     flush(final=True)
