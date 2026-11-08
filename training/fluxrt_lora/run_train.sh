@@ -75,6 +75,9 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-timeshift.patch"
 # Garment-area loss weight (--mask_column/--mask_weight; off unless AZ_MASK_COLUMN is set).
 curl -fsSL "$RAW/patches/flux2-klein-maskloss.patch" -o "$AZ_ROOT/flux2-klein-maskloss.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-maskloss.patch"
+# fxreal3: same-clip pairs, detail term (--pair_column/--pair_weight/--detail_weight; all off unless set).
+curl -fsSL "$RAW/patches/flux2-klein-fx3.patch" -o "$AZ_ROOT/flux2-klein-fx3.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx3.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -123,6 +126,8 @@ cd "$SRC/examples/dreambooth"
   --checkpointing_steps="${AZ_CKPT_INTERVAL:-100}" --checkpoints_total_limit="${AZ_CKPT_LIMIT:-2}" \
   ${AZ_TIME_SHIFT_MU:+--time_shift_mu="$AZ_TIME_SHIFT_MU"} \
   ${AZ_MASK_COLUMN:+--mask_column="$AZ_MASK_COLUMN" --mask_weight="${AZ_MASK_WEIGHT:-2.0}"} \
+  ${AZ_PAIR_COLUMN:+--pair_column="$AZ_PAIR_COLUMN" --pair_weight="${AZ_PAIR_WEIGHT:-1.0}"} \
+  ${AZ_DETAIL_WEIGHT:+--detail_weight="$AZ_DETAIL_WEIGHT"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

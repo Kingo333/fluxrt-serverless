@@ -80,20 +80,21 @@ def select(root: Path, descs: list[str] | None, cats: list[str] | None) -> list[
     return five
 
 
-def video(root: Path, lora: str, seed: int, height: int = 640, repeats: int = 2) -> dict:
+def video(root: Path, lora: str, seed: int, height: int = 640, repeats: int = 2, results: str | None = None,
+          name: str = "five_test") -> dict:
     import av
     from PIL import Image
     from eval.owner_videos import _frames, _panel
-    res = root / "eval/fx2/results/cases5"
+    res = Path(results) if results else root / "eval/fx2/results/cases5"
     items = json.loads((root / "eval/fx2/cases5/clip_list.json").read_text())
-    out, key_dir = root / "eval/five_test", root / "eval/five_test_KEY"
+    out, key_dir = root / "eval" / name, root / "eval" / f"{name}_KEY"
     out.mkdir(parents=True, exist_ok=True)
     key_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     pw = height * 9 // 16 // 2 * 2
     W, H = pw * 4, height
     key = {"lora": lora, "base": "base", "segments": []}
-    with av.open(str(out / "five_test.mp4"), "w") as c:
+    with av.open(str(out / f"{name}.mp4"), "w") as c:
         s = c.add_stream("libx264", rate=24)
         s.width, s.height, s.pix_fmt = W, H, "yuv420p"
         s.options = {"crf": "20", "preset": "medium"}
@@ -125,9 +126,9 @@ def video(root: Path, lora: str, seed: int, height: int = 640, repeats: int = 2)
         f"{len(items)} items, one after another (the garment panel says 1/{len(items)}, 2/{len(items)}, ...).\n"
         "Panels: garment | camera | A | B. One of A/B is today's FluxRT, the other the new LoRA; the order changes "
         "per item.\nFor each item pick: which is better at the GARMENT, and is either worse at face, skin tone or "
-        "background?\nThe key is in a separate folder (five_test_KEY): open it only after picking.\n")
+        f"background?\nThe key is in a separate folder ({name}_KEY): open it only after picking.\n")
     made = [x["n"] for x in key["segments"] if "missing" not in x]
-    print(json.dumps({"video": str(out / "five_test.mp4"), "segments": made, "lora": lora,
+    print(json.dumps({"video": str(out / f"{name}.mp4"), "segments": made, "lora": lora,
                       "missing": [x["item"] for x in key["segments"] if "missing" in x]}))
     return key
 
@@ -143,10 +144,12 @@ def main(argv=None):
     v.add_argument("root", nargs="?", default="/workspace/azyah-vton")
     v.add_argument("--lora", default="l2000")
     v.add_argument("--seed", type=int, default=7)
+    v.add_argument("--results", help="folder with <item>/out_base.mp4 and out_<lora>.mp4 (default eval/fx2/results/cases5)")
+    v.add_argument("--name", default="five_test", help="video name; also the eval/<name> and eval/<name>_KEY folders")
     a = ap.parse_args(argv)
     if a.cmd == "select":
         return select(Path(a.root), a.desc, a.category)
-    return video(Path(a.root), a.lora, a.seed)
+    return video(Path(a.root), a.lora, a.seed, results=a.results, name=a.name)
 
 
 if __name__ == "__main__":

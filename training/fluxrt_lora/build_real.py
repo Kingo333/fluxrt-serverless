@@ -108,6 +108,35 @@ def pick_other(i: int, pool: list[int], rng: random.Random) -> int:
     return j
 
 
+def photo_jitter(img, brightness: float, contrast: float):
+    """The same light change for the input and the answer (fxreal3): the model learns to keep a face
+    and skin as they are in dim or bright light instead of 'correcting' them."""
+    from PIL import ImageEnhance
+    return ImageEnhance.Contrast(ImageEnhance.Brightness(img.convert("RGB")).enhance(brightness)).enhance(contrast)
+
+
+def jitter_factors(rng: random.Random, p: float):
+    """(brightness, contrast) for a fraction p of samples, else None."""
+    if p <= 0 or rng.random() >= p:
+        return None
+    return rng.uniform(0.6, 1.4), rng.uniform(0.75, 1.25)
+
+
+def vivid_pair_items(root: Path):
+    """data_tools.vivid_pairs output: (clip, category, ref, [(target_a, mask_a), (target_b, mask_b)])."""
+    if not root or not root.is_dir():
+        return
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        mp = d / "meta.json"
+        files = [d / f for f in ("a_target.png", "a_mask.png", "b_target.png", "b_mask.png", "ref.jpg")]
+        if not mp.exists() or not all(f.exists() for f in files):
+            continue
+        meta = json.loads(mp.read_text())
+        if meta.get("split", "train") != "train":
+            continue
+        yield d.name, meta.get("category", "upper"), d / "ref.jpg", [(files[0], files[1]), (files[2], files[3])]
+
+
 def outside_diff(inp, target, mask) -> float:
     """Mean absolute difference (0-1) OUTSIDE the mask: how well a model-made input lines up."""
     import numpy as np
@@ -126,11 +155,13 @@ def write_parquet(rows: list[dict], path: Path) -> None:
     img = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
     feat = {"_type": "Image"}
     features = {"key": {"dtype": "string", "_type": "Value"}, "caption": {"dtype": "string", "_type": "Value"},
+                "pair": {"dtype": "string", "_type": "Value"},
                 "person": feat, "garment": feat, "target": feat, "mask": feat}
-    schema = pa.schema([("key", pa.string()), ("caption", pa.string()), ("person", img), ("garment", img),
-                        ("target", img), ("mask", img)],
+    schema = pa.schema([("key", pa.string()), ("caption", pa.string()), ("pair", pa.string()), ("person", img),
+                        ("garment", img), ("target", img), ("mask", img)],
                        metadata={"huggingface": json.dumps({"info": {"features": features}})})
-    cols = {"key": [r["key"] for r in rows], "caption": [r["caption"] for r in rows]}
+    cols = {"key": [r["key"] for r in rows], "caption": [r["caption"] for r in rows],
+            "pair": [r.get("pair", "") for r in rows]}
     for c in ("person", "garment", "target", "mask"):
         ext = "png" if c == "mask" else "jpg"
         cols[c] = [{"bytes": r[c], "path": f"{r['key']}_{c}.{ext}"} for r in rows]
@@ -215,15 +246,19 @@ class Redresser:
         self.pipe.set_progress_bar_config(disable=True)
         self.w, self.h = gen_size
         self.steps = steps
-        self.prompt = compact_prompt("tops")
-        self.embeds = None
-        try:
-            enc = self.pipe.encode_prompt(prompt=self.prompt, device="cuda")
-            self.embeds = enc[0] if isinstance(enc, tuple) else enc
-        except Exception as e:  # noqa: BLE001 - fall back to plain prompts
-            print(f"(prompt cache off: {e})", flush=True)
+        self.prompts = {c: compact_prompt(c) for c in ("tops", "bottoms", "dresses")}
+        self.embeds = {}
+        self.cache_ok = True
+        for c, text in self.prompts.items():
+            try:
+                enc = self.pipe.encode_prompt(prompt=text, device="cuda")
+                self.embeds[c] = enc[0] if isinstance(enc, tuple) else enc
+            except Exception as e:  # noqa: BLE001 - fall back to plain prompts
+                print(f"(prompt cache off: {e})", flush=True)
+                self.cache_ok = False
+                break
 
-    def __call__(self, person, garment, seed: int):
+    def __call__(self, person, garment, seed: int, category: str = "tops"):
         from PIL import Image
         gw, gh = self.w * 2 // 3 // 16 * 16, self.h * 2 // 3 // 16 * 16
         g = garment.copy()
@@ -233,13 +268,15 @@ class Redresser:
         gen = self.torch.Generator(device="cuda").manual_seed(seed)
         kw = dict(image=[person.resize((self.w, self.h)), canvas], height=self.h, width=self.w,
                   num_inference_steps=self.steps, guidance_scale=1.0, generator=gen)
-        if self.embeds is not None:
+        cat = {"upper": "tops", "lower": "bottoms", "dress": "dresses"}.get(category, category)
+        cat = cat if cat in self.prompts else "tops"
+        if self.cache_ok and cat in self.embeds:
             try:
-                return self.pipe(prompt_embeds=self.embeds, **kw).images[0]
+                return self.pipe(prompt_embeds=self.embeds[cat], **kw).images[0]
             except Exception as e:  # noqa: BLE001 - this diffusers version wants the text itself
                 print(f"(prompt cache off: {type(e).__name__}: {e})", flush=True)
-                self.embeds = None
-        return self.pipe(prompt=self.prompt, **kw).images[0]
+                self.cache_ok = False
+        return self.pipe(prompt=self.prompts[cat], **kw).images[0]
 
 
 class DinoSim:
@@ -279,6 +316,10 @@ def main(argv=None) -> dict:
     ap.add_argument("--max-outside-diff", type=float, default=0.12,
                     help="drop ViViD live inputs that differ more than this (0-1) from the real frame outside the "
                          "garment area (misaligned; pasting back would leave seams)")
+    ap.add_argument("--vivid-pairs", help="data_tools.vivid_pairs output: two nearby frames per ViViD train clip "
+                    "(fxreal3 same-clip colour term); both frames re-dressed with the same other garment")
+    ap.add_argument("--photo-aug", type=float, default=0.0,
+                    help="fraction of samples given the same random brightness/contrast change on input and answer")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -291,7 +332,8 @@ def main(argv=None) -> dict:
     (out / "data").mkdir(parents=True, exist_ok=True)
     test_out.mkdir(parents=True, exist_ok=True)
     rows, files, stats = [], 0, {"viton_tried": 0, "viton_kept": 0, "viton_unchanged": 0, "nochange": 0,
-                                 "vivid_live": 0, "vivid_no_mask": 0, "vivid_misaligned": 0, "test_pairs": 0}
+                                 "vivid_live": 0, "vivid_no_mask": 0, "vivid_misaligned": 0, "test_pairs": 0,
+                                 "pair_clips_tried": 0, "pair_clips_kept": 0, "photo_aug": 0}
     used = set()
 
     def flush(final=False):
@@ -300,11 +342,15 @@ def main(argv=None) -> dict:
             write_parquet(rows, out / "data" / f"train-{files:05d}.parquet")
             files, rows = files + 1, []
 
-    def add(key, caption, person, garment, target, mask):
+    def add(key, caption, person, garment, target, mask, pair="", jitter="auto"):
         g = garment.copy()
         if max(g.size) > 1024:
             g.thumbnail((1024, 1024), Image.LANCZOS)
-        rows.append({"key": key, "caption": caption, "person": _jpeg(_cover(person, w, h)),
+        jf = jitter_factors(rng, a.photo_aug) if jitter == "auto" else jitter
+        if jf:
+            person, target = photo_jitter(person, *jf), photo_jitter(target, *jf)
+            stats["photo_aug"] += 1
+        rows.append({"key": key, "caption": caption, "pair": pair, "person": _jpeg(_cover(person, w, h)),
                      "garment": _jpeg(g), "target": _jpeg(_cover(target, w, h)),
                      "mask": _png(_cover(mask.convert("L"), w, h))})
         flush()
@@ -380,12 +426,48 @@ def main(argv=None) -> dict:
         stats["viton_kept"] += 1
         if (n + 1) % 100 == 0:
             print(json.dumps({"progress": n + 1, **stats}), flush=True)
+
+    # 3. ViViD same-clip pairs (fxreal3): two nearby real frames, both re-dressed with the SAME other
+    #    garment and seed and pasted back; kept or dropped together. The training patch keeps the two
+    #    in one batch and asks their garment colour to differ only as much as the real frames do.
+    pairs = list(vivid_pair_items(Path(a.vivid_pairs))) if a.vivid_pairs else []
+    by_cat: dict = {}
+    for clip, cat, ref, _ in pairs:
+        by_cat.setdefault(cat, []).append(ref)
+    for clip, cat, ref, frames in pairs:
+        stats["pair_clips_tried"] += 1
+        others = [r for r in by_cat.get(cat, []) if r != ref]
+        if not others:
+            continue
+        other = Image.open(rng.choice(others)).convert("RGB")
+        seed = a.seed * 100003 + 7919 + stats["pair_clips_tried"]
+        built = []
+        for tpath, mpath in frames:
+            real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
+            mask = Image.open(mpath).convert("L").resize((gw, gh))
+            soft = soft_mask(mask, grow=13)
+            inp = paste_back(redress(real, other, seed=seed, category=cat), real, soft)
+            bb = bbox_of(mask)
+            sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
+            if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
+                break
+            built.append((inp, real, soft))
+        if len(built) != 2:
+            continue
+        jf = jitter_factors(rng, a.photo_aug)
+        garment = Image.open(ref).convert("RGB")
+        for tag, (inp, real, soft) in zip("ab", built):
+            add(f"vivid_pair_{clip}_{tag}", compact_prompt(cat), inp, garment, real, soft, pair=clip, jitter=jf)
+        used.add("vivid")
+        stats["pair_clips_kept"] += 1
+    print(json.dumps({"pair_clips_kept": stats["pair_clips_kept"], "pair_clips_tried": stats["pair_clips_tried"]}),
+          flush=True)
     flush(final=True)
 
     sel = selection_for(used)
     sel["owner_accepted_risk"] = "2026-11-08: research-licence real data accepted for R&D; contact rights holders before commercial use"
     (out / "selection.json").write_text(json.dumps(sel, indent=2) + "\n")
-    total = stats["vivid_live"] + stats["viton_kept"] + stats["nochange"]
+    total = stats["vivid_live"] + stats["viton_kept"] + stats["nochange"] + 2 * stats["pair_clips_kept"]
     summary = {"samples": total, "files": files, "size": [w, h], "dataset_name": str(out / "data"), **stats}
     (out / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)
