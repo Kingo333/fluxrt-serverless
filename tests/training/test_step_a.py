@@ -123,3 +123,58 @@ def test_owner_descriptions_rebuild_the_prompt(tmp_path, monkeypatch):
     items = step_a.build_clip_list(root)
     assert items[0]["description_by"] == "owner" and "feathers" in items[0]["prompt"]
     assert "sleeveless" in items[0]["prompt"]          # the sleeve wording comes from the description
+
+
+def test_pick_set_excludes_every_clip_used_before_and_needs_descriptions(tmp_path, capsys):
+    from eval import step_a
+    root = tmp_path
+    vivid = root / "data/staging/vivid"
+    cats = ["upper"] * 10 + ["dress"] * 10 + ["lower"] * 10
+    for i, cat in enumerate(cats):
+        d = vivid / f"vivid_test_{i:06d}"
+        d.mkdir(parents=True)
+        (d / "target.mp4").write_bytes(b"v")
+        (d / "ref.jpg").write_bytes(f"garment-{i}".encode())
+        (d / "meta.json").write_text(json.dumps({"split": "test", "category": cat}))
+    # earlier lists: the owner's 5 (video clip 0, stand-in photo = clip 1's garment) and clips10 (person 2, donor 3)
+    (root / "eval/fx2/cases5").mkdir(parents=True)
+    (root / "eval/fx2/cases5/clip_list.json").write_text(json.dumps(
+        [{"key": "1_x", "video": str(vivid / "vivid_test_000000/target.mp4"), "ref": str(vivid / "vivid_test_000001/ref.jpg")}]))
+    (root / "eval/fxa").mkdir(parents=True)
+    (root / "eval/fxa/clips10.json").write_text(json.dumps(
+        [{"key": "6_h", "video": str(vivid / "vivid_test_000002/target.mp4"), "ref": str(vivid / "vivid_test_000003/ref.jpg"),
+          "garment_from": "vivid_test_000003"}]))
+    ids, shas = step_a.used_clip_ids(root)
+    assert {"vivid_test_000000", "vivid_test_000001", "vivid_test_000002", "vivid_test_000003"} <= ids
+    items = step_a.pick_set(root, "set2", n=6)
+    assert len(items) == 6 and all(it["needs_description"] for it in items)
+    used = {Path(it["video"]).parent.name for it in items} | {it["garment_from"] for it in items}
+    assert not used & {"vivid_test_000000", "vivid_test_000001", "vivid_test_000002", "vivid_test_000003"}
+    assert [it["category"] for it in items] == ["tops", "dresses", "bottoms"] * 2
+    assert "photo:" in capsys.readouterr().out
+    tmpl = json.loads((root / "eval/fxa/set2_descriptions.json").read_text())
+    assert tmpl == {str(i): "" for i in range(1, 7)}
+    # apply: refuses while any description is missing, builds the prompts once all are there
+    tmpl["1"] = "red satin slip dress"
+    (root / "eval/fxa/set2_descriptions.json").write_text(json.dumps(tmpl))
+    with pytest.raises(SystemExit) as e:
+        step_a.apply_descriptions(root, "set2")
+    assert e.value.code == 2
+    (root / "eval/fxa/set2_descriptions.json").write_text(json.dumps({str(i): f"garment number {i} in blue" for i in range(1, 7)}))
+    done = step_a.apply_descriptions(root, "set2")
+    assert all(it["description_by"] == "owner" and f"garment number {i} in blue" in it["prompt"] for i, it in enumerate(done, 1))
+    assert "needs_description" not in done[0]
+
+
+def test_video_without_legend_has_exactly_the_requested_panels(tmp_path):
+    av = pytest.importorskip("av")
+    from eval import step_a
+    root = tmp_path
+    d = root / "eval/fxa/results/set2/1_set2_x"
+    d.mkdir(parents=True)
+    _clip(d / "input.mp4", (40, 40, 40)); _clip(d / "out_blend05s08.mp4", (0, 0, 200)); _clip(d / "out_blend05s065.mp4", (0, 200, 0))
+    Image.new("RGB", (90, 120), (9, 9, 9)).save(d / "ref.jpg")
+    (root / "eval/fxa/set2.json").write_text(json.dumps([{"key": "1_set2_x", "case": "set2", "category": "tops"}]))
+    panels = step_a.parse_panels(["blend05s08=blend 0.5 @0.8", "blend05s065=blend 0.5 @0.65"])
+    rep = step_a.labelled_video(root, panels, repeats=1, cols=4, height=320, set_name="set2", legend=False)
+    assert rep["size"] == [180 * 4, 320] and rep["video"].endswith("set2_labelled.mp4")   # one row: garment, camera, 2 models

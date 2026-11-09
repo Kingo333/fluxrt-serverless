@@ -10,6 +10,13 @@
   python -m eval.step_a video  ROOT [--panels base=original fx3=fx3 ...] [--repeats 2]
                                                one labelled video of all clips: garment | camera | each model,
                                                names on every panel (not blind) -> eval/fxa/step_a_labelled.mp4
+  python -m eval.step_a pick   ROOT --set NAME [--n 10]   NEW held-out clips (none used by any earlier list),
+                                               garments from other held-out clips of the same type; writes
+                                               eval/fxa/NAME.json and eval/fxa/NAME_descriptions.json (empty,
+                                               for the owner to fill in) and prints each garment photo path
+  python -m eval.step_a apply  ROOT --set NAME  requires a description for EVERY item (else exits 2),
+                                               rebuilds the prompts like the live app, prints them
+  python -m eval.step_a video  ROOT --set NAME --panels ... [--no-legend]   same video for another set
 Run from the training code checkout.
 """
 
@@ -143,6 +150,85 @@ def reuse_renders(root: Path) -> dict:
     return report
 
 
+def used_clip_ids(root: Path) -> tuple[set, set]:
+    """Clip ids (persons and garment donors) and garment-photo hashes used by every earlier clip list."""
+    ids, shas = set(), set()
+    for lst in list((root / "eval/fx2").glob("cases*/clip_list.json")) + list((root / "eval/fxa").glob("*.json")):
+        try:
+            items = json.loads(lst.read_text())
+        except Exception:  # noqa: BLE001 - not a clip list (e.g. a descriptions file)
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if it.get("video"):
+                ids.add(Path(it["video"]).parent.name)
+            if it.get("garment_from"):
+                ids.add(it["garment_from"])
+            ref = Path(it["ref"]) if it.get("ref") else None
+            if ref and ref.exists():
+                shas.add(_sha(ref))
+                if ref.parent.parent.name == "vivid":
+                    ids.add(ref.parent.name)
+    return ids, shas
+
+
+def pick_set(root: Path, name: str, n: int = 10, seed: int = 11) -> list[dict]:
+    """A new set of n held-out clips (tops, dresses, bottoms in turn), each with another held-out clip's
+    garment of the same type; descriptions are left for the owner (NAME_descriptions.json)."""
+    from data_tools.fluxrt_prompt import compact_prompt
+    ids, shas = used_clip_ids(root)
+    cats = tuple(("upper", "dress", "lower")[i % 3] for i in range(n))
+    picked = pick_new_clips(held_out_clips(root / "data/staging/vivid"), ids, shas, categories=cats, seed=seed)
+    items = []
+    for k, pair in enumerate(picked, 1):
+        pname, pmeta, pdir = pair["person"]
+        dname, dmeta, ddir = pair["donor"]
+        cat = APP_CATEGORY.get(dmeta.get("category", "upper"), "tops")
+        items.append({"key": f"{k}_{name}_{pname}", "case": name, "video": str(pdir / "target.mp4"),
+                      "ref": str(ddir / "ref.jpg"), "category": cat, "name": None, "description": None,
+                      "garment_from": dname, "prompt": compact_prompt(cat, None, None), "needs_description": True})
+    out = root / "eval/fxa"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{name}.json").write_text(json.dumps(items, indent=2))
+    tmpl = out / f"{name}_descriptions.json"
+    if not tmpl.exists():
+        tmpl.write_text(json.dumps({str(i): "" for i in range(1, len(items) + 1)}, indent=1))
+    print(f"\n{len(items)} new clips (none used before). Look at each garment photo and describe it in {tmpl}:\n")
+    for i, it in enumerate(items, 1):
+        print(f"[{i}] {it['category']:8s} photo: {it['ref']}   (person clip {Path(it['video']).parent.name})")
+    if len(items) < n:
+        print(f"\nWARNING: only {len(items)} of {n} clips could be picked (not enough unused held-out clips of some type)")
+    return items
+
+
+def apply_descriptions(root: Path, name: str) -> list[dict]:
+    """Every item must have an owner description; the prompt is rebuilt from it (sleeve wording included)."""
+    from data_tools.fluxrt_prompt import compact_prompt
+    out = root / "eval/fxa"
+    items = json.loads((out / f"{name}.json").read_text())
+    given = json.loads((out / f"{name}_descriptions.json").read_text()) if (out / f"{name}_descriptions.json").exists() else {}
+    missing = []
+    for i, it in enumerate(items, 1):
+        text = (given.get(str(i)) or given.get(it["key"]) or "").strip()
+        if len(text) < 8:
+            missing.append(i)
+            continue
+        it["description"] = text
+        it["prompt"] = compact_prompt(it.get("category"), it.get("name"), text)
+        it["description_by"] = "owner"
+        it.pop("needs_description", None)
+    if missing:
+        print(f"MISSING descriptions for items {missing} in {out / f'{name}_descriptions.json'}; nothing rendered")
+        raise SystemExit(2)
+    (out / f"{name}.json").write_text(json.dumps(items, indent=2))
+    for i, it in enumerate(items, 1):
+        print(f"\n[{i}] {it['key']}  category={it['category']}\n    PROMPT: {it['prompt']}")
+    return items
+
+
 def parse_panels(specs: list[str]) -> list[tuple[str, str]]:
     out = []
     for s in specs:
@@ -152,16 +238,17 @@ def parse_panels(specs: list[str]) -> list[tuple[str, str]]:
 
 
 def labelled_video(root: Path, panels: list[tuple[str, str]], repeats: int = 2, cols: int = 5,
-                   height: int = 640, results: Path | None = None, out_path: Path | None = None) -> dict:
+                   height: int = 640, results: Path | None = None, out_path: Path | None = None,
+                   set_name: str = "clips10", legend: bool = True) -> dict:
     import av
     from PIL import Image, ImageDraw
     from eval.owner_videos import _font, _frames, _panel
-    res = results or root / "eval/fxa/results/clips10"
-    items = json.loads((root / "eval/fxa/clips10.json").read_text())
-    out_path = out_path or root / "eval/fxa/step_a_labelled.mp4"
+    res = results or root / "eval/fxa/results" / set_name
+    items = json.loads((root / "eval/fxa" / f"{set_name}.json").read_text())
+    out_path = out_path or root / "eval/fxa" / ("step_a_labelled.mp4" if set_name == "clips10" else f"{set_name}_labelled.mp4")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pw = height * 9 // 16 // 2 * 2
-    n_panels = 2 + len(panels) + 1  # garment, camera, models, legend
+    n_panels = 2 + len(panels) + (1 if legend else 0)  # garment, camera, models, legend
     rows = -(-n_panels // cols)
     W, H = pw * cols, height * rows
     made, skipped = [], []
@@ -181,8 +268,8 @@ def labelled_video(root: Path, panels: list[tuple[str, str]], repeats: int = 2, 
             ref = next((p for p in d.iterdir() if p.stem == "ref"), None)
             g = _panel(Image.open(ref).convert("RGB"), pw, height, f"{i}/{len(items)} garment") if ref else Image.new("RGB", (pw, height))
             n = min([len(cam)] + [len(v) for v in vids.values()])
-            legend = Image.new("RGB", (pw, height), (18, 18, 18))
-            dr = ImageDraw.Draw(legend)
+            legend_tile = Image.new("RGB", (pw, height), (18, 18, 18))
+            dr = ImageDraw.Draw(legend_tile)
             lines = [f"item {i} of {len(items)}", it.get("case", ""), f"type: {it.get('category')}", "",
                      "panels:", "garment, camera"] + [label for _, label in present] + ["", "(not blind)"]
             for k, line in enumerate(lines):
@@ -192,7 +279,8 @@ def labelled_video(root: Path, panels: list[tuple[str, str]], repeats: int = 2, 
                     row = Image.new("RGB", (W, H), (0, 0, 0))
                     tiles = [g, _panel(cam[k], pw, height, "camera")]
                     tiles += [_panel(vids[name][k], pw, height, label) for name, label in present]
-                    tiles.append(legend)
+                    if legend:
+                        tiles.append(legend_tile)
                     for t, tile in enumerate(tiles):
                         row.paste(tile, ((t % cols) * pw, (t // cols) * height))
                     for pkt in s.encode(av.VideoFrame.from_image(row)):
@@ -209,20 +297,30 @@ def labelled_video(root: Path, panels: list[tuple[str, str]], repeats: int = 2, 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("clips", "reuse", "video"):
+    for name in ("clips", "reuse", "video", "pick", "apply"):
         p = sub.add_parser(name)
         p.add_argument("root", nargs="?", default="/workspace/azyah-vton")
+        if name in ("video", "pick", "apply"):
+            p.add_argument("--set", default="clips10", help="clip set name (eval/fxa/<set>.json)")
+        if name == "pick":
+            p.add_argument("--n", type=int, default=10)
+            p.add_argument("--seed", type=int, default=11)
         if name == "video":
             p.add_argument("--panels", nargs="+", default=DEFAULT_PANELS, help="file name=label, in order")
             p.add_argument("--repeats", type=int, default=2)
             p.add_argument("--cols", type=int, default=5)
+            p.add_argument("--no-legend", action="store_true")
     a = ap.parse_args(argv)
     root = Path(a.root)
     if a.cmd == "clips":
         return build_clip_list(root)
     if a.cmd == "reuse":
         return reuse_renders(root)
-    return labelled_video(root, parse_panels(a.panels), a.repeats, a.cols)
+    if a.cmd == "pick":
+        return pick_set(root, a.set, a.n, a.seed)
+    if a.cmd == "apply":
+        return apply_descriptions(root, a.set)
+    return labelled_video(root, parse_panels(a.panels), a.repeats, a.cols, set_name=a.set, legend=not a.no_legend)
 
 
 if __name__ == "__main__":
