@@ -130,6 +130,13 @@ def _write_mp4(path: Path, frames, fps: int = 24) -> None:
             c.mux(pkt)
 
 
+def adapter_weights(blend: float, scale: float = 1.0) -> list[float]:
+    """Weights for two LoRAs blended in weight space: blend of the first, the rest of the second, both x scale."""
+    if not 0.0 <= blend <= 1.0:
+        raise ValueError(f"--blend must be between 0 and 1, got {blend}")
+    return [round(blend * scale, 6), round((1.0 - blend) * scale, 6)]
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-dir", required=True)
@@ -151,6 +158,9 @@ def main(argv=None) -> None:
                     help="regression items (e.g. the shoe set from eval.make_shoe_set): <item>/person.*, ref.*, "
                          "meta.json {category, name, description}; no target. Prompt = the app's buildTryOnPrompt")
     ap.add_argument("--lora-scale", type=float, default=1.0, help="LoRA strength (fallback test, e.g. 0.5)")
+    ap.add_argument("--lora2", help="second LoRA file: the two are blended in weight space (Step A, 2026-11-09)")
+    ap.add_argument("--blend", type=float, default=0.5,
+                    help="with --lora2: share of the FIRST LoRA (0.3 = 30%% first, 70%% second); --lora-scale scales both")
     ap.add_argument("--prompt-style", choices=("full", "compact"), default="full",
                     help="compact = the app's default FluxRT prompt since azyah-shopping #21 (buildCompactTryOnPrompt)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
@@ -168,7 +178,13 @@ def main(argv=None) -> None:
     w, h = (int(v) for v in a.size.lower().split("x"))
     rw, rh = (int(v) for v in a.ref_size.lower().split("x"))
     pipe = Flux2KleinPipeline.from_pretrained(a.model_dir, torch_dtype=torch.bfloat16, local_files_only=True).to("cuda")
-    if a.lora:
+    if a.lora and a.lora2:
+        # Blend: the change each LoRA makes to the model is scaled and added (blend*s and (1-blend)*s).
+        pipe.load_lora_weights(a.lora, adapter_name="first")
+        pipe.load_lora_weights(a.lora2, adapter_name="second")
+        pipe.set_adapters(["first", "second"], adapter_weights=adapter_weights(a.blend, a.lora_scale))
+        print(f"LoRA blend {a.blend:.2f} x {a.lora} + {1 - a.blend:.2f} x {a.lora2}, scale {a.lora_scale}", flush=True)
+    elif a.lora:
         pipe.load_lora_weights(a.lora, adapter_name="garment")
         if a.lora_scale != 1.0:
             pipe.set_adapters(["garment"], adapter_weights=[a.lora_scale])

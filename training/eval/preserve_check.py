@@ -10,7 +10,8 @@ The LoRA may only improve the garment. It FAILS if, on ANY clip, it is worse tha
   bg_flicker (videos) frame-to-frame jitter of the background, beyond the input's own
 "Worse" = candidate > base * 1.10 + a small margin (face 1.5, skin 2.0, background 1.0, flicker 0.5,
 on a 0-255 scale), so noise does not fail a clip. Areas come from MediaPipe's multiclass selfie
-segmenter run on the input frame (and on the outputs for the background). Needs MediaPipe.
+segmenter; face, skin and background are compared only where they are that class in the input AND in
+every output (so a garment covering or uncovering skin is not counted as a skin change). Needs MediaPipe.
 Each RESULTS_DIR/<clip>/ has input.mp4|png and out_<model>.mp4|png (eval.generate_fluxrt).
 """
 
@@ -42,12 +43,28 @@ def frames(path: Path):
     return out
 
 
-def region_stats(inp, out, cat_in, bg_both) -> dict:
-    """Per-frame numbers for one output frame against its input frame (numpy arrays HxWx3, 0-255)."""
+def common_masks(cat_in, cats_out: list) -> tuple:
+    """(face, skin, background) areas that are that class in the input AND in every output (2026-11-09 fix:
+    before, face and skin came from the input only, so a new garment covering an arm, or a shorter sleeve
+    uncovering one, counted as a skin colour change. Now only pixels that stay skin are compared)."""
     import numpy as np
-    d = np.abs(out.astype(np.float32) - inp.astype(np.float32)).mean(axis=2)
     face = cat_in == FACE
     skin = np.isin(cat_in, (FACE, BODY_SKIN))
+    bg = cat_in == BACKGROUND
+    for c in cats_out:
+        face &= c == FACE
+        skin &= np.isin(c, (FACE, BODY_SKIN))
+        bg &= c == BACKGROUND
+    return face, skin, bg
+
+
+def region_stats(inp, out, cat_in, bg_both, face_mask=None, skin_mask=None) -> dict:
+    """Per-frame numbers for one output frame against its input frame (numpy arrays HxWx3, 0-255).
+    face_mask / skin_mask: the areas to compare (from common_masks); without them, the input's own areas."""
+    import numpy as np
+    d = np.abs(out.astype(np.float32) - inp.astype(np.float32)).mean(axis=2)
+    face = (cat_in == FACE) if face_mask is None else face_mask
+    skin = np.isin(cat_in, (FACE, BODY_SKIN)) if skin_mask is None else skin_mask
     r = {"face": float(d[face].mean()) if face.sum() > 50 else None,
          "background": float(d[bg_both].mean()) if bg_both.sum() > 200 else None, "skin": None}
     if skin.sum() > 50:
@@ -84,12 +101,10 @@ def clip_scores(d: Path, models: list[str], seg) -> dict:
         fi = np.asarray(ins[k].resize(size))
         cat_in = seg(ins[k].resize(size))
         cats_out = {m: seg(outs[m][k]) for m in models}
-        bg_both = (cat_in == BACKGROUND)
-        for m in models:
-            bg_both &= cats_out[m] == BACKGROUND
+        face_both, skin_both, bg_both = common_masks(cat_in, list(cats_out.values()))
         for m in models:
             fo = np.asarray(outs[m][k])
-            for key, v in region_stats(fi, fo, cat_in, bg_both).items():
+            for key, v in region_stats(fi, fo, cat_in, bg_both, face_both, skin_both).items():
                 if v is not None:
                     acc[m][key].append(v)
             if prev[m] is not None and prev_in is not None and bg_both.sum() > 200:
@@ -138,6 +153,16 @@ def main(argv=None) -> dict:
     for c, v in result.items():
         worst = "; ".join(f"{f['clip']}: {', '.join(f['worse_on'])}" for f in v["fails"][:6]) or "-"
         lines.append(f"| {c} | {v['clips']} | {'PASS' if v['pass'] else 'FAIL'} | {worst} |")
+    lines += ["", "## Numbers per clip (base -> candidate; lower = closer to the camera input)", "",
+              "| clip | candidate | face | skin | background | bg_flicker |", "|---|---|---|---|---|---|"]
+    fmt = lambda v: "-" if v is None else f"{v:.1f}"  # noqa: E731
+    for clip, sc in per_clip.items():
+        for c in a.candidates:
+            if c not in sc:
+                continue
+            cells = [f"{fmt(sc[a.base].get(k))} -> {fmt(sc[c].get(k))}" + (" **worse**" if worse(k, sc[c].get(k), sc[a.base].get(k)) else "")
+                     for k in ("face", "skin", "background", "bg_flicker")]
+            lines.append(f"| {clip} | {c} | " + " | ".join(cells) + " |")
     text = "\n".join(lines) + "\n"
     if a.out:
         Path(a.out).write_text(text)
