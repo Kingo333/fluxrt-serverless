@@ -52,6 +52,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The moving tag livecam-dual-v1 only follows main. A build from any other branch gets its
+      # own commit tag only, so building a candidate never changes what an endpoint on the moving
+      # tag runs (owner rule, 2026-11-09: favourite #1 must not change).
+      - name: Choose image tags
+        id: tags
+        run: |
+          SHA_TAG="ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-${{ github.sha }}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            { echo "tags<<EOF"; echo "ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1"; echo "$SHA_TAG"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "tags<<EOF"; echo "$SHA_TAG"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          fi
+          echo "Image tag for this build: $SHA_TAG"
+
       - name: Build and push dual-engine image
         uses: docker/build-push-action@v6
         with:
@@ -59,9 +73,7 @@ jobs:
           file: ./Dockerfile.livecam
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1
-            ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
           # No Actions cache: the image layers exceed GitHub's 10 GB per-repo
           # cache limit, so a restored cache is partial and the build fails.
           no-cache: true
