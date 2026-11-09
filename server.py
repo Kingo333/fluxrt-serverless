@@ -76,6 +76,28 @@ OUTPUT_JPEG_QUALITY = int(os.getenv("FLUXRT_OUTPUT_JPEG_QUALITY", "82"))
 # with ViViD) loads only with FLUXRT_ALLOW_RESEARCH_MODEL=1, like the JoyAI gate.
 LORA_PATH = os.getenv("FLUXRT_LORA_PATH", "").strip()
 ALLOW_RESEARCH_MODEL = os.getenv("FLUXRT_ALLOW_RESEARCH_MODEL", "").strip() in ("1", "true", "yes")
+
+
+def _bounded(name: str, default: float, lo: float, hi: float) -> float:
+    """A numeric switch kept inside [lo, hi]; a typo uses the default."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return min(hi, max(lo, value))
+
+
+# Favourite #2 (owner, 2026-11-09). All three are inert unless set, so plain FluxRT behaves as today.
+# FLUXRT_LORA_FUSE (default on, only matters with a LoRA): the LoRA is fused into the full-precision
+#   weights before INT8 quantization, so it costs nothing per frame (fluxrt/patches/fluxrt-fuse-lora.patch).
+# FLUXRT_LORA_SCALE (default 1.0): multiplies the LoRA's effect; the merged blend05s065 file already carries
+#   its strength 0.65, so leave 1.0 for it.
+# FLUXRT_SHARPEN 0..1 (default 0 = off): unsharp mask on each output frame before JPEG; 0.3 about restores
+#   the crispness the LoRA costs, above 0.5 edges start to halo. About 1 ms per frame, no temporal effect.
+LORA_FUSE = os.getenv("FLUXRT_LORA_FUSE", "true").strip().lower() in ("1", "true", "yes", "on")
+LORA_SCALE = _bounded("FLUXRT_LORA_SCALE", 1.0, 0.0, 2.0)
+SHARPEN = _bounded("FLUXRT_SHARPEN", 0.0, 0.0, 1.0)
 CLIENT_HINTS = os.getenv("FLUXRT_CLIENT_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
 INPUT_FPS = float(os.getenv("FLUXRT_INPUT_FPS", "10"))
 INPUT_JPEG_QUALITY = float(os.getenv("FLUXRT_INPUT_JPEG_QUALITY", "0.8"))
@@ -283,9 +305,18 @@ def ready_message(deadline: float) -> Dict[str, Any]:
     return msg
 
 
+def sharpen_rgb(img: Image.Image, amount: float) -> Image.Image:
+    """Unsharp mask (radius 1 px) at `amount` 0..1; 0 returns the image untouched."""
+    if amount <= 0:
+        return img
+    from PIL import ImageFilter
+    return img.filter(ImageFilter.UnsharpMask(radius=1, percent=int(round(100 * amount)), threshold=0))
+
+
 def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = OUTPUT_JPEG_QUALITY) -> str:
     rgb = bgr[:, :, ::-1]
     img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
+    img = sharpen_rgb(img, SHARPEN)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -398,6 +429,8 @@ def write_runtime_config() -> Path:
     if LORA_PATH:
         config["use_lora"] = True
         config["lora_weights_path"] = check_lora(LORA_PATH)
+        config["fuse_lora"] = LORA_FUSE      # read by fluxrt/patches/fluxrt-fuse-lora.patch
+        config["lora_scale"] = LORA_SCALE
     if CACHE_MASK == "seg":
         # The worker sends the mask per frame (livecam.segment.CacheMaskBuilder).
         config["mask_calculation_method"] = "manual"
@@ -434,6 +467,12 @@ def warmup_blocking() -> None:
 
         config_path = write_runtime_config()
         log.info("warmup: config written to %s", config_path)
+        if LORA_PATH:
+            log.info("warmup: LoRA %s (folder %s, fused before INT8: %s, scale %s)",
+                     LORA_PATH, Path(LORA_PATH).parent.name, LORA_FUSE, LORA_SCALE)
+        else:
+            log.info("warmup: no LoRA (plain FluxRT)")
+        log.info("warmup: output sharpen %s", SHARPEN if SHARPEN > 0 else "off")
 
         proc = StreamProcessor(str(config_path))
         proc.start()
@@ -507,6 +546,9 @@ def public_state() -> Dict[str, Any]:
             "enable_tiny_vae": ENABLE_TINY_VAE,
             "enable_flow_upscaler": ENABLE_FLOW_UPSCALER,
             "lora": Path(LORA_PATH).parent.name if LORA_PATH else None,
+            "lora_fused": bool(LORA_PATH) and LORA_FUSE,
+            "lora_scale": LORA_SCALE if LORA_PATH else None,
+            "sharpen": SHARPEN,
             "live_switches": live_switches(STATE.get("segmenter") is not None),
         }
 

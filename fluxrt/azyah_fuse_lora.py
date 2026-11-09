@@ -1,0 +1,72 @@
+"""Azyah: fuse a LoRA into FluxRT's full-precision transformer, then quantize to INT8 like the pre-quantized model.
+
+Used by fluxrt/patches/fluxrt-fuse-lora.patch (FluxRT's model process) when the worker config has use_lora and
+fuse_lora. Zero per-frame cost: afterwards the model runs the same INT8 kernels as without a LoRA. The LoRA's
+change (scale x B A) is added to the full-precision weights first, then everything is quantized with the same
+scheme (same layers, same weight type) as the pre-quantized model, read from its quanto_qmap.json.
+The canonical copy lives in fluxrt/azyah_fuse_lora.py; the patch carries the same text (a test checks that).
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import os
+import time
+
+log = logging.getLogger("azyah.fuse_lora")
+
+
+def read_qmap(int8_models_path: str) -> dict:
+    with open(os.path.join(int8_models_path, "quanto_qmap.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def qmap_scheme(qmap: dict) -> tuple:
+    """(weights qtype name, activations qtype name or None) used by every quantized layer; mixed = error."""
+    weights = {v.get("weights", "none") for v in qmap.values()}
+    acts = {v.get("activations", "none") for v in qmap.values()}
+    if len(weights) != 1 or len(acts) != 1:
+        raise ValueError(f"mixed quantization scheme in quanto_qmap.json: weights {weights}, activations {acts}")
+    w, a = weights.pop(), acts.pop()
+    return (None if w == "none" else w), (None if a == "none" else a)
+
+
+def load_lora_state(lora_path: str) -> tuple:
+    """The LoRA tensors and the diffusers settings record (rank, alpha, layers) stored in the file, if any."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+    with safe_open(lora_path, framework="pt") as f:
+        raw = (f.metadata() or {}).get("lora_adapter_metadata")
+    return load_file(lora_path), (json.loads(raw) if raw else None)
+
+
+def fuse_lora_into_int8(model_cls, transformer_dir: str, int8_models_path: str, lora_path: str,
+                        lora_scale: float, device, dtype):
+    """Full-precision model + LoRA (fused at lora_scale) -> INT8 model with the pre-quantized model's scheme."""
+    import torch
+    from optimum.quanto import freeze, quantization_map, quantize
+    t0 = time.time()
+    qmap = read_qmap(int8_models_path)
+    weights_q, acts_q = qmap_scheme(qmap)
+    model = model_cls.from_pretrained(transformer_dir, local_files_only=True, torch_dtype=dtype)
+    state, meta = load_lora_state(lora_path)
+    model.load_lora_adapter(state, prefix="transformer", adapter_name="garment", metadata=meta)
+    model.fuse_lora(lora_scale=float(lora_scale), adapter_names=["garment"])
+    model.unload_lora()
+    del state
+    model.to(device)
+    quantize(model, weights=weights_q, activations=acts_q, include=list(qmap))
+    freeze(model)
+    model.eval()
+    got, want = set(quantization_map(model)), set(qmap)
+    if got != want:
+        log.warning("fused model quantizes %d layers, pre-quantized model had %d (%d differ)",
+                    len(got), len(want), len(got ^ want))
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.info("fused LoRA %s (scale %s) into the weights and quantized %d layers to %s in %.0fs",
+             lora_path, lora_scale, len(got), weights_q, time.time() - t0)
+    return model

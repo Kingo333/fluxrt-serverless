@@ -13,7 +13,8 @@ def load(monkeypatch, **env):
     monkeypatch.setenv("SESSION_SIGNING_SECRET", "s")
     for k in ("ENABLE_TINY_VAE", "ENABLE_FLOW_UPSCALER", "FLUXRT_WIDTH", "FLUXRT_HEIGHT",
               "FLUXRT_REF_WIDTH", "FLUXRT_REF_HEIGHT", "FLUXRT_CLIENT_HINTS",
-              "FLUXRT_LORA_PATH", "FLUXRT_ALLOW_RESEARCH_MODEL"):
+              "FLUXRT_LORA_PATH", "FLUXRT_ALLOW_RESEARCH_MODEL",
+              "FLUXRT_LORA_FUSE", "FLUXRT_LORA_SCALE", "FLUXRT_SHARPEN"):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -104,3 +105,47 @@ def test_no_lora_by_default(monkeypatch, tmp_path):
     s = load(monkeypatch)
     monkeypatch.setattr(s, "FLUXRT_ROOT", tmp_path)
     assert "use_lora" not in json.loads(s.write_runtime_config().read_text())
+
+
+def test_favourite_2_switches_default_to_plain_fluxrt(monkeypatch, tmp_path):
+    s = load(monkeypatch)
+    monkeypatch.setattr(s, "FLUXRT_ROOT", tmp_path)
+    assert s.LORA_FUSE is True and s.LORA_SCALE == 1.0 and s.SHARPEN == 0.0
+    assert "fuse_lora" not in json.loads(s.write_runtime_config().read_text())   # no LoRA: nothing added
+    lora = tmp_path / "blend05s065" / "pytorch_lora_weights.safetensors"
+    lora.parent.mkdir()
+    lora.write_bytes(b"x")
+    (lora.parent / "selection.json").write_text(json.dumps({"commercial_use_cleared": True}))
+    s = load(monkeypatch, FLUXRT_LORA_PATH=str(lora))
+    monkeypatch.setattr(s, "FLUXRT_ROOT", tmp_path)
+    cfg = json.loads(s.write_runtime_config().read_text())
+    assert cfg["use_lora"] is True and cfg["fuse_lora"] is True and cfg["lora_scale"] == 1.0
+    s = load(monkeypatch, FLUXRT_LORA_PATH=str(lora), FLUXRT_LORA_FUSE="0", FLUXRT_LORA_SCALE="0.7")
+    monkeypatch.setattr(s, "FLUXRT_ROOT", tmp_path)
+    cfg = json.loads(s.write_runtime_config().read_text())
+    assert cfg["fuse_lora"] is False and cfg["lora_scale"] == 0.7
+    s = load(monkeypatch, FLUXRT_SHARPEN="1.7")
+    assert s.SHARPEN == 1.0                                                        # clamped
+    s = load(monkeypatch, FLUXRT_SHARPEN="abc")
+    assert s.SHARPEN == 0.0                                                        # typo = off
+
+
+def test_sharpen_is_off_at_zero_and_adds_edge_contrast_otherwise(monkeypatch):
+    from PIL import Image
+    import numpy as np
+    s = load(monkeypatch)
+    rng = np.random.default_rng(0)
+    base = np.zeros((64, 64, 3), np.uint8)
+    base[:, 32:] = 180
+    base = np.clip(base + rng.integers(0, 20, base.shape), 0, 255).astype(np.uint8)   # an edge plus texture
+    img = Image.fromarray(base)
+    assert s.sharpen_rgb(img, 0.0) is img
+    out = np.asarray(s.sharpen_rgb(img, 0.3)).astype(int)
+    edge = lambda a: np.abs(np.diff(a[:, :, 0].astype(int), axis=1)).mean()  # noqa: E731
+    assert edge(out) > edge(base) * 1.05
+    assert out.shape == base.shape
+    # the encoder applies it only when FLUXRT_SHARPEN is set
+    s2 = load(monkeypatch, FLUXRT_SHARPEN="0.3")
+    plain = s.bgr_to_b64_jpeg(base[:, :, ::-1].copy())
+    sharp = s2.bgr_to_b64_jpeg(base[:, :, ::-1].copy())
+    assert plain != sharp and s.bgr_to_b64_jpeg(base[:, :, ::-1].copy()) == plain
