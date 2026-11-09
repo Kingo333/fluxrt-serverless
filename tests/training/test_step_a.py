@@ -108,3 +108,18 @@ def test_reuse_and_labelled_video(tmp_path, monkeypatch):
     with av.open(rep["video"]) as c:
         n = sum(1 for _ in c.decode(video=0))
     assert n == 5                                   # one pass over the 5-frame clip
+
+
+def test_owner_descriptions_rebuild_the_prompt(tmp_path, monkeypatch):
+    from eval import step_a
+    root = tmp_path
+    (root / "eval/fx2/cases5").mkdir(parents=True)
+    (root / "eval/fx2/cases5/clip_list.json").write_text(json.dumps(
+        [{"key": "1_standing_x", "case": "standing", "video": str(root / "v/vivid_test_000001/target.mp4"),
+          "ref": str(root / "nope.jpg"), "category": "tops", "name": None, "description": None}]))
+    (root / "data/staging/vivid").mkdir(parents=True)
+    (root / "eval/fxa").mkdir(parents=True)
+    (root / "eval/fxa/descriptions.json").write_text(json.dumps({"1": "white strapless bandeau top with feathers"}))
+    items = step_a.build_clip_list(root)
+    assert items[0]["description_by"] == "owner" and "feathers" in items[0]["prompt"]
+    assert "sleeveless" in items[0]["prompt"]          # the sleeve wording comes from the description

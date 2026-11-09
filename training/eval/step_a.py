@@ -1,6 +1,7 @@
 """Step A (owner, 2026-11-09): blends of fxreal3 and fxreal4, judged on 10 clips, every panel labelled.
 
   python -m eval.step_a clips  ROOT            the 10-clip list: the owner's 5 (eval/fx2/cases5) + 5 held-out
+                                               (eval/fxa/descriptions.json {"7": "..."} adds owner descriptions)
                                                ViViD test clips, each trying on another held-out clip's garment
                                                of the same type -> eval/fxa/clips10.json (prints the prompts)
   python -m eval.step_a reuse  ROOT            copies the renders that already exist for the owner's 5 clips
@@ -92,6 +93,17 @@ def build_clip_list(root: Path) -> list[dict]:
                       "garment_from": dname, "prompt": compact_prompt(cat, None, desc)})
     out = root / "eval/fxa"
     out.mkdir(parents=True, exist_ok=True)
+    # Owner-written garment descriptions (eval/fxa/descriptions.json: {"7": "...", "10": "..."} by item number
+    # or by key); the prompt is rebuilt from them like the live app does, sleeve wording included.
+    desc_file = out / "descriptions.json"
+    if desc_file.exists():
+        given = json.loads(desc_file.read_text())
+        for i, it in enumerate(items, 1):
+            text = given.get(str(i)) or given.get(it["key"])
+            if text:
+                it["description"] = text.strip()
+                it["prompt"] = compact_prompt(it.get("category"), it.get("name"), it["description"])
+                it["description_by"] = "owner"
     (out / "clips10.json").write_text(json.dumps(items, indent=2))
     for i, it in enumerate(items, 1):
         print(f"\n[{i}] {it['key']}  category={it['category']}  garment={Path(it['ref']).parent.name}/{Path(it['ref']).name}"
