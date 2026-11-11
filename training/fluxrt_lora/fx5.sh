@@ -13,6 +13,10 @@
 #   - garment photo size AZ_REF_SIZE: the live FLUXRT_REF_WIDTH x HEIGHT. Favourite #2 was trained and served at
 #     288x512; Option A (Release #52, 2026-11-11) serves 576x768. Train at 576x768 only if the owner keeps it.
 #   - the live dress prompt names the shopper's own hijab or head covering (data_tools.fluxrt_prompt, = the app)
+#   - garment photo sizes (owner, 2026-11-11): AZ_REF_SIZES="576x768:2,432x576:1,288x512:1" trains on several
+#     sizes, one per batch (patches/flux2-klein-refsizes.patch), so fxreal5 works at whatever FLUXRT_REF size runs
+#     live; the test then also renders favourite #2 and fxreal5 at the other sizes on dress10 and set2 (PRIORITY
+#     lines per size, extra panels in those videos). Unset = AZ_REF_SIZE only, as before.
 # Then renders on 10 NEW held-out dress clips (dress10, auto-described), the owner's Step B set (set2, his own
 # descriptions; two long black maxi dresses), his 5 cases (regression) and the HIJAB set (hijab-wearing people
 # trying on a dress: own clips from eval/own_clips plus checked free stock clips, eval.hijab_set; her hijab
@@ -24,7 +28,8 @@
 # Never touches the live endpoint or the azyah-joyai volume. About 2-3 h on an RTX PRO 6000 ($2.49/h): about $6-8, cap $12.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx5.sh -o /workspace/fx5.sh
-#   AZ_REF=<SHA> AZ_REF_SIZE=576x768 AZ_NO_STOP=1 nohup bash /workspace/fx5.sh > /workspace/fx5.log 2>&1 &
+#   AZ_REF=<SHA> AZ_REF_SIZE=576x768 AZ_REF_SIZES="576x768:2,432x576:1,288x512:1" AZ_NO_STOP=1 \
+#     nohup bash /workspace/fx5.sh > /workspace/fx5.log 2>&1 &
 #   (AZ_REF_SIZE=288x512 if the owner goes back to the old garment photo size)
 set -uo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
@@ -34,6 +39,12 @@ EXP="${AZ_EXP:-fxreal5}"
 REF_SIZE="${AZ_REF_SIZE:-288x512}"
 case "$REF_SIZE" in *x*) ;; *) echo "BAD_AZ_REF_SIZE: $REF_SIZE (e.g. 384x512 or 576x768)"; exit 1 ;; esac
 TAG="r${REF_SIZE%%x*}"
+EXTRA_SIZES=""  # the other trained garment-photo sizes, rendered too
+for spec in $(echo "${AZ_REF_SIZES:-}" | tr ',' ' '); do
+  sz="${spec%%:*}"
+  case "$sz" in [0-9]*x[0-9]*) ;; *) echo "BAD_AZ_REF_SIZES: $AZ_REF_SIZES (e.g. 576x768:2,432x576:1,288x512:1)"; exit 1 ;; esac
+  [ "$sz" != "$REF_SIZE" ] && EXTRA_SIZES="$EXTRA_SIZES $sz"
+done
 GUARD=/workspace/fx5_started
 stop_pod() {
   if [ "${AZ_NO_STOP:-0}" = "1" ]; then echo "== AZ_NO_STOP=1: Pod left RUNNING (billing) - stop it by hand"; return; fi
@@ -50,7 +61,7 @@ INIT="$AZ_ROOT/outputs/fluxrt_lora/blend05s065"
 mkdir -p "$E" "$R" "$AZ_ROOT/reports"
 START=$(date +%s)
 mins() { echo "$(( ($(date +%s) - START) / 60 )) min"; }
-echo "== fxreal5: garment photo $REF_SIZE (tag $TAG), continuing favourite #2"
+echo "== fxreal5: garment photo $REF_SIZE (tag $TAG), trained sizes ${AZ_REF_SIZES:-$REF_SIZE only}, continuing favourite #2"
 
 echo "== 0. GPU and space"
 nvidia-smi --query-gpu=name,memory.total --format=csv
@@ -113,10 +124,11 @@ if [ ! -f "$OUT/pytorch_lora_weights.safetensors" ]; then
     AZ_CKPT_INTERVAL=250 AZ_CKPT_LIMIT=8 AZ_MASK_COLUMN=mask AZ_MASK_WEIGHT=${AZ_MASK_WEIGHT:-3.0} \
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
     AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
-    AZ_INIT_LORA=$INIT bash"
+    AZ_REF_SIZES=${AZ_REF_SIZES:-} AZ_INIT_LORA=$INIT bash"
   echo "TRAIN_EXIT=$?"
 fi
 grep -h "LoRA initialised from" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -1 || true
+grep -h "^REF_SIZES" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -1 || true
 ls -la "$OUT" | tail -12
 [ -f "$OUT/pytorch_lora_weights.safetensors" ] || { echo LORA_MISSING; exit 1; }
 cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true
@@ -137,11 +149,11 @@ for s in dress10 set2 cases5 hijab; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; d
 echo "sets:$SETS"
 
 echo "== 7. renders at garment size $REF_SIZE: original, favourite #2, fxreal5 (final, step 1000) ($(mins))"
-G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --ref-size $REF_SIZE --steps 2 --prompt-style compact"
-render() {  # set name [lora-file]
+G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --steps 2 --prompt-style compact"
+render() {  # set name [lora-file] [garment-photo size]
   local s="$1" n="$2" extra=""
   [ -n "${3:-}" ] && extra="--lora $3 --lora-scale 1.0"
-  ( cd "$T" && timeout -s INT 25m $G $extra --name "$n" --clip-list "$E/$s.json" --staging "$S/vivid" --out "$R/$s" --max-items 10 ) \
+  ( cd "$T" && timeout -s INT 25m $G --ref-size "${4:-$REF_SIZE}" $extra --name "$n" --clip-list "$E/$s.json" --staging "$S/vivid" --out "$R/$s" --max-items 10 ) \
     > "$E/render_fx5_${s}_$n.log" 2>&1
   echo "render $s/$n: $(grep -c '"model"' "$E/render_fx5_${s}_$n.log") clips ($(mins))"
   grep -iE "error|traceback" "$E/render_fx5_${s}_$n.log" | tail -3; return 0
@@ -152,6 +164,17 @@ for s in $SETS; do
   render "$s" "fx5_$TAG" "$OUT/pytorch_lora_weights.safetensors"
   [ -f "$OUT/checkpoint-1000/pytorch_lora_weights.safetensors" ] && render "$s" "fx5s1000_$TAG" "$OUT/checkpoint-1000/pytorch_lora_weights.safetensors"
 done
+SIZE_SETS=""
+for s in dress10 set2; do case " $SETS " in *" $s "*) SIZE_SETS="$SIZE_SETS $s" ;; esac; done
+if [ -n "$EXTRA_SIZES" ]; then
+  echo "== 7b. the other garment-photo sizes:$EXTRA_SIZES; favourite #2 and fxreal5 on$SIZE_SETS ($(mins))"
+  for sz in $EXTRA_SIZES; do
+    for s in $SIZE_SETS; do
+      render "$s" "fav2_r${sz%%x*}" "$INIT/pytorch_lora_weights.safetensors" "$sz"
+      render "$s" "fx5_r${sz%%x*}" "$OUT/pytorch_lora_weights.safetensors" "$sz"
+    done
+  done
+fi
 
 echo "== 8. face / skin / background gate vs the original, and steadiness ($(mins))"
 CANDS="fav2_$TAG fx5_$TAG fx5s1000_$TAG"
@@ -202,13 +225,27 @@ for s in $SETS; do
     2>&1 | grep -E "^PRIORITY|DINO" || echo "GARMENT_SCORE_${s}_EXIT=$?"
 done
 
-echo "== 9. labelled videos: garment | camera | favourite #2 (today) | fxreal5 ($(mins))"
+for sz in $EXTRA_SIZES; do
+  t="r${sz%%x*}"
+  for s in $SIZE_SETS; do
+    ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "fav2_$t" "fx5_$t" --model "$SEG" ) \
+      > "$E/garment_seg_fx5_${s}_$t.log" 2>&1 || echo "GARMENT_SEG_${s}_${t}_EXIT=$?"
+    echo "-- $s, garment photo $sz"
+    ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "fav2_$t" "fx5_$t" --baseline "fav2_$t" \
+        --out "$E/garment_fx5_${s}_$t.md" --json "$R/$s/garment_report_$t.json" ) 2>&1 | grep -E "^PRIORITY" \
+      || echo "GARMENT_SCORE_${s}_${t}_EXIT=$?"
+  done
+done
+
+echo "== 9. labelled videos: garment | camera | favourite #2 (today) | fxreal5 [| fxreal5 at the other sizes] ($(mins))"
 for s in $SETS; do
-  ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols 4 --no-legend \
-      --panels "fav2_$TAG=favourite #2 (today)" "fx5_$TAG=fxreal5" ) || echo "VIDEO_${s}_EXIT=$?"
+  PANELS=("fav2_$TAG=favourite #2 (today)" "fx5_$TAG=fxreal5")
+  case " $SIZE_SETS " in *" $s "*) for sz in $EXTRA_SIZES; do PANELS+=("fx5_r${sz%%x*}=fxreal5, photo $sz"); done ;; esac
+  ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
+      --panels "${PANELS[@]}" ) || echo "VIDEO_${s}_EXIT=$?"
   [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx5_${s}_${TAG}.mp4"
 done
 ( cd "$E" && tar cf "$AZ_ROOT/eval/fx5_review.tar" dress10.json $( [ -f hijab.json ] && echo hijab.json ) preserve_fx5_*.md stability_fx5_*.md garment_fx5_*.md \
-    results/fx5_gate_summary.json results/*/garment_report.json render_fx5_*.log 2>/dev/null )
+    results/fx5_gate_summary.json results/*/garment_report*.json render_fx5_*.log 2>/dev/null )
 echo "FX5_DONE after $(mins): videos $(ls "$E"/fx5_*_"$TAG".mp4 2>/dev/null | tr '\n' ' ')"
 echo "LoRA $OUT/pytorch_lora_weights.safetensors (+ selection.json); reports $AZ_ROOT/eval/fx5_review.tar"

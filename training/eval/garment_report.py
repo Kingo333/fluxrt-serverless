@@ -309,7 +309,8 @@ class Dino:
             return float((f[0] * f[1]).sum())
 
 
-def score_stage(root: Path, models: list[str], baseline: str, out: Path | None, use_dino: bool) -> dict:
+def score_stage(root: Path, models: list[str], baseline: str, out: Path | None, use_dino: bool,
+                json_out: Path | None = None) -> dict:
     dino = None
     if use_dino:
         try:
@@ -344,7 +345,7 @@ def score_stage(root: Path, models: list[str], baseline: str, out: Path | None, 
         print(f"PRIORITY {r['priority']} ({r['metric']}, {arrow}): {r['model']} better on {r['better']}/{r['clips']} clips, "
               f"worse on {r['worse']} (mean {r['mean']} vs {r['baseline']} {r['baseline_mean']})")
     result = {"baseline": baseline, "models": models, "scorecard": card, "items": per_item}
-    (root / "garment_report.json").write_text(json.dumps(result, indent=1))
+    (json_out or root / "garment_report.json").write_text(json.dumps(result, indent=1))
     if out:
         keys = ("colour_de", "likeness", "fabric", "follow_px", "on_body", "jitter", "flicker_de")
         lines = ["| clip | model | " + " | ".join(keys) + " |", "|---|---|" + "---|" * len(keys)]
@@ -367,11 +368,13 @@ def main(argv=None):
     ap.add_argument("--model", default="/workspace/azyah-vton/selfie_multiclass_256x256.tflite", help="segmenter (seg)")
     ap.add_argument("--out", help="markdown report (score)")
     ap.add_argument("--no-dino", action="store_true")
+    ap.add_argument("--json", help="report json (score); default RESULTS/garment_report.json")
     a = ap.parse_args(argv)
     root = Path(a.results)
     if a.stage == "seg":
         return seg_stage(root, a.models, a.model)
-    return score_stage(root, a.models, a.baseline or a.models[0], Path(a.out) if a.out else None, not a.no_dino)
+    return score_stage(root, a.models, a.baseline or a.models[0], Path(a.out) if a.out else None, not a.no_dino,
+                       Path(a.json) if a.json else None)
 
 
 if __name__ == "__main__":

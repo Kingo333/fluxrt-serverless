@@ -179,7 +179,7 @@ def test_fx5_script_continues_favourite2_with_dresses_first():
     for s in ("AZ_INIT_LORA=$INIT", "AZ_LORA_RANK=64", "AZ_LR=${AZ_LR:-5e-5}", "AZ_REF_SIZE=$REF_SIZE",
               "data_tools.vivid_motion", "--motion \"$S/vivid_dress_motion\"", "--dress-outfit-frac",
               "--other-live-max", "AZ_MASK_WEIGHT=${AZ_MASK_WEIGHT:-3.0}", "AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05}",
-              "--categories dress --auto-describe", "--ref-size $REF_SIZE", "fav2_$TAG=favourite #2 (today)",
+              "--categories dress --auto-describe", '--ref-size "${4:-$REF_SIZE}"', "fav2_$TAG=favourite #2 (today)",
               "eval.preserve_check", "outputs/fluxrt_lora/blend05s065"):
         assert s in sh, s
     rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
@@ -464,3 +464,77 @@ def test_fx5_script_runs_the_hijab_set_at_the_live_photo_size():
     assert 'REF_SIZE="${AZ_REF_SIZE:-288x512}"' in sh
     for s in ("eval.hijab_set", '--own "$AZ_ROOT/eval/own_clips"', "dress10 set2 cases5 hijab", "HIJAB "):
         assert s in sh, s
+
+
+PATCHES_REF = PATCHES_ALL + ("flux2-klein-refsizes.patch",)
+
+
+def test_mixed_garment_photo_sizes_one_size_per_batch(tmp_path):
+    """Owner, 2026-11-11: train at several garment-photo sizes so fxreal5 works at whatever FLUXRT_REF size runs live."""
+    import random
+    import types
+    local = Path("/home/user/repos/diffusers")
+    if not (local / "examples" / "dreambooth" / TRAINER).exists():
+        pytest.skip("diffusers checkout not present")
+    r = subprocess.run(["git", "-C", str(local), "show", f"HEAD:examples/dreambooth/{TRAINER}"], capture_output=True, text=True)
+    repo = tmp_path / "d"
+    (repo / "examples" / "dreambooth").mkdir(parents=True)
+    (repo / "examples" / "dreambooth" / TRAINER).write_text(r.stdout)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for name in PATCHES_REF:
+        rr = subprocess.run(["git", "-C", str(repo), "apply", str(ROOT / "training" / "patches" / name)], capture_output=True, text=True)
+        assert rr.returncode == 0, f"{name}: {rr.stderr}"
+    src = (repo / "examples" / "dreambooth" / TRAINER).read_text()
+    compile(src, TRAINER, "exec")
+    for s in ('"--cond_2_sizes"', "_AZ_REF_SIZES = _azyah_parse_ref_sizes(args.cond_2_sizes)", 'batch["cond_2_size"]',
+              'print(f"REF_SIZES {_az_ref_size_counts}"'):
+        assert s in src, s
+    torch = pytest.importorskip("torch")
+    from PIL import Image, ImageOps
+    start = src.index("# Azyah fxreal5: garment-photo sizes for --cond_2_sizes")
+    end = src.index("\n\n\n", src.index("def collate_fn(examples):"))
+    tf = types.SimpleNamespace(
+        to_tensor=lambda im: torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1),
+        normalize=lambda t, mean, std: (t - mean[0]) / std[0])
+    ns = {"random": random, "torch": torch, "Image": Image, "TF": tf, "exif_transpose": ImageOps.exif_transpose}
+    exec(compile(src[start:end] + "\n", "refsizes_block", "exec"), ns)
+    sizes = ns["_azyah_parse_ref_sizes"]("576x768:2, 432x576:1,288x512")
+    assert sizes == [(576, 768, 2.0), (432, 576, 1.0), (288, 512, 1.0)]
+    with pytest.raises(ValueError):
+        ns["_azyah_parse_ref_sizes"]("500x768")
+    ns["_AZ_REF_SIZES"] = sizes
+    ns["_AZ_REF_RNG"].seed(0)
+    picks = [ns["_azyah_pick_ref_size"]() for _ in range(4000)]
+    share = {s: picks.count(s) / len(picks) for s in set(picks)}
+    assert abs(share[(576, 768)] - 0.5) < 0.03 and abs(share[(432, 576)] - 0.25) < 0.03 and abs(share[(288, 512)] - 0.25) < 0.03
+    photo = Image.new("RGB", (300, 400), (20, 40, 60))
+    ex = [{"instance_images": torch.zeros(3, 512, 288), "instance_prompt": "p", "cond_images": torch.zeros(3, 512, 288),
+           "cond_image_2_raw": photo} for _ in range(4)]
+    seen = set()
+    for _ in range(30):
+        b = ns["collate_fn"](ex)
+        w, h = (int(v) for v in b["cond_2_size"].split("x"))
+        assert b["cond_2_pixel_values"].shape == (4, 3, h, w)                       # the whole batch at one size
+        assert b["cond_2_pixel_values"][0, :, h // 2, w // 2].tolist() != [1.0, 1.0, 1.0]   # photo, padded with white
+        seen.add((w, h))
+    assert seen == {(576, 768), (432, 576), (288, 512)}
+    fixed = [{**e, "cond_images_2": torch.zeros(3, 768, 576)} for e in ex]
+    for e in fixed:
+        e.pop("cond_image_2_raw")
+    b = ns["collate_fn"](fixed)
+    assert "cond_2_size" not in b and b["cond_2_pixel_values"].shape == (4, 3, 768, 576)  # one size: as before
+
+
+def test_fx5_script_trains_and_tests_the_mixed_garment_photo_sizes():
+    sh = (ROOT / "training/fluxrt_lora/fx5.sh").read_text()
+    for s in ("AZ_REF_SIZES=${AZ_REF_SIZES:-} AZ_INIT_LORA=$INIT bash", 'grep -h "^REF_SIZES"',
+              'render "$s" "fx5_r${sz%%x*}" "$OUT/pytorch_lora_weights.safetensors" "$sz"',
+              '--baseline "fav2_$t"', '--json "$R/$s/garment_report_$t.json"', 'PANELS+=("fx5_r${sz%%x*}=fxreal5, photo $sz")'):
+        assert s in sh, s
+    rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
+    assert rt.index("flux2-klein-fx5.patch") < rt.index("flux2-klein-refsizes.patch")
+    assert '${AZ_REF_SIZES:+--cond_2_sizes="$AZ_REF_SIZES"}' in rt
+    out = subprocess.run(["bash", "-c", 'REF_SIZE=576x768; AZ_REF_SIZES="576x768:2,432x576:1,288x512:1"; EXTRA_SIZES=""\n'
+                          + sh[sh.index('for spec in $(echo "${AZ_REF_SIZES:-}"'):sh.index('GUARD=/workspace/fx5_started')]
+                          + 'echo "[$EXTRA_SIZES]"'], capture_output=True, text=True)
+    assert out.stdout.strip() == "[ 432x576 288x512]", out.stdout + out.stderr
