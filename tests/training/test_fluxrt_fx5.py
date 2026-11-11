@@ -185,3 +185,162 @@ def test_fx5_script_continues_favourite2_with_dresses_first():
     rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
     assert "flux2-klein-initlora.patch" in rt and '--init_lora_weights="$AZ_INIT_LORA"' in rt
     assert rt.index("flux2-klein-fx3.patch") < rt.index("flux2-klein-initlora.patch")
+
+
+# ---------------------------------------------------------------- owner additions (2026-11-11)
+PATCHES_ALL = PATCHES + ("flux2-klein-fx5.patch",)
+
+
+def test_colour_and_texture_terms_patch_applies_last_and_behaves(tmp_path):
+    import importlib
+    local = Path("/home/user/repos/diffusers")
+    if not (local / "examples" / "dreambooth" / TRAINER).exists():
+        pytest.skip("diffusers checkout not present")
+    r = subprocess.run(["git", "-C", str(local), "show", f"HEAD:examples/dreambooth/{TRAINER}"], capture_output=True, text=True)
+    repo = tmp_path / "d"
+    (repo / "examples" / "dreambooth").mkdir(parents=True)
+    (repo / "examples" / "dreambooth" / TRAINER).write_text(r.stdout)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for name in PATCHES_ALL:
+        rr = subprocess.run(["git", "-C", str(repo), "apply", str(ROOT / "training" / "patches" / name)], capture_output=True, text=True)
+        assert rr.returncode == 0, f"{name}: {rr.stderr}"
+    src = (repo / "examples" / "dreambooth" / TRAINER).read_text()
+    compile(src, TRAINER, "exec")
+    for s in ('"--colour_weight"', '"--texture_weight"', '_az_logs["colour"]', '_az_logs["texture"]'):
+        assert s in src, s
+    torch = pytest.importorskip("torch")
+    start = src.index("                if (args.colour_weight > 0 or args.texture_weight > 0) and loss_mask is not None:")
+    end = src.index('                        _az_logs["texture"] = _texture.detach().item()') + len('                        _az_logs["texture"] = _texture.detach().item()')
+    block = "\n".join(line[16:] for line in src[start:end].splitlines())
+
+    class Args:
+        colour_weight, texture_weight = 1.0, 1.0
+
+    def run(pred_shift=0.0, pred_scale=1.0):
+        g = torch.Generator().manual_seed(0)
+        x0 = torch.randn(2, 8, 6, 6, generator=g)
+        noise = torch.randn(2, 8, 6, 6, generator=g)
+        sig = torch.tensor([0.3, 0.6]).reshape(2, 1, 1, 1)
+        noisy = (1 - sig) * x0 + sig * noise
+        m = torch.zeros(2, 1, 6, 6)
+        m[..., 1:5, 1:5] = 1.0
+        mu = (x0 * m).sum((-2, -1), keepdim=True) / m.sum((-2, -1), keepdim=True)   # the garment's own average
+        x0_hat = (x0 - mu) * pred_scale + mu + pred_shift
+        pred = (noisy - x0_hat) / sig                       # so that noisy - sig * pred == x0_hat
+        ns = {"args": Args, "sigmas": sig, "noisy_model_input": noisy, "model_pred": pred, "model_input": x0,
+              "m": m, "loss_mask": m, "loss": torch.tensor(0.0), "_az_logs": {}, "torch": torch}
+        exec(compile(block + "\n", "fx5_block", "exec"), ns)
+        return ns["_az_logs"]
+
+    perfect = run()
+    assert perfect["colour"] < 1e-5 and perfect["texture"] < 1e-5          # right answer: no penalty
+    off_colour = run(pred_shift=0.5)
+    assert off_colour["colour"] > 0.4 and off_colour["texture"] < 1e-5      # colour off, contrast right
+    flat = run(pred_scale=0.5)
+    assert flat["texture"] > 0.1 and flat["colour"] < 1e-5                  # dull fabric: contrast term fires
+
+
+def test_dress_share_builds_dresses_first_then_fills_tops_to_the_share(tmp_path):
+    import io
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image
+    from fluxrt_lora import build_real
+
+    def jb(img):
+        b = io.BytesIO(); img.save(b, format="JPEG"); return {"bytes": b.getvalue(), "path": "x.jpg"}
+    t = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    rows = {"cloth": [], "image": [], "agnostic": []}
+    for i in range(40):
+        person = Image.new("RGB", (768, 1024), (200, 30 + i, 40))
+        agn = person.copy(); agn.paste((128, 128, 128), (200, 300, 560, 700))
+        rows["cloth"].append(jb(Image.new("RGB", (300, 400), (i * 5, 90, 200))))
+        rows["image"].append(jb(person)); rows["agnostic"].append(jb(agn))
+    (tmp_path / "viton").mkdir()
+    pq.write_table(pa.table({k: pa.array(v, type=t) for k, v in rows.items()}), tmp_path / "viton" / "a.parquet")
+    motion = tmp_path / "motion"
+    for c in range(5):                                   # 5 dress clips: a pair + 2 singles each = 20 dress rows
+        d = motion / f"vivid_train_{c:06d}"
+        d.mkdir(parents=True)
+        for tag in ("a", "b", "s1", "s2"):
+            Image.new("RGB", (432, 768), (90 + c, 60, 70)).save(d / f"{tag}_target.png")
+            mk = Image.new("L", (432, 768), 0); mk.paste(255, (120, 200, 320, 700)); mk.save(d / f"{tag}_mask.png")
+        Image.new("RGB", (100, 140), (10 * c, 20, 30)).save(d / "ref.jpg")
+        (d / "meta.json").write_text(json.dumps({"category": "dress", "split": "train", "garment_description": f"dress {c}"}))
+
+    class FakeRedress:
+        def __init__(self, *a, **k): pass
+        def __call__(self, person, garment, seed, category="tops", prompt=None):
+            return Image.new("RGB", (432, 768), (0, 255, 0))
+
+    class FakeDino:
+        def __call__(self, a, b): return 0.5
+
+    old = build_real.Redresser, build_real.DinoSim
+    build_real.Redresser, build_real.DinoSim = FakeRedress, FakeDino
+    try:
+        s = build_real.main(["--out", str(tmp_path / "data"), "--viton-dir", str(tmp_path / "viton"), "--klein", "x",
+                             "--test-out", str(tmp_path / "pairs"), "--viton-n", "35", "--holdout", "2", "--test-items", "0",
+                             "--motion", str(motion), "--dress-outfit-frac", "0.5", "--dress-share", "0.57",
+                             "--nochange-frac", "0.2"])
+    finally:
+        build_real.Redresser, build_real.DinoSim = old
+    assert s["dress_rows"] == 20 and s["motion_pairs_kept"] == 5 and s["motion_singles_kept"] == 10
+    assert s["other_quota"] == round(20 * 0.43 / 0.57) == s["other_rows"]            # tops filled exactly to 43%
+    assert abs(s["dress_share"] - 0.57) < 0.02 and s["samples"] == 20 + s["other_quota"]
+    assert s["described"] == 20                                                       # captions carry the dress text
+    keys = []
+    for f in sorted((tmp_path / "data" / "data").glob("*.parquet")):
+        keys += pq.read_table(f, columns=["key"]).column("key").to_pylist()
+    assert keys[0].startswith("vivid_motion_") and keys[-1].startswith("viton_hd_")   # dresses first, then tops
+
+
+def test_garment_report_scores_the_five_priorities():
+    from eval import garment_report as gr
+    assert np.allclose(gr.srgb_to_lab(np.array([255, 255, 255])), [100, 0, 0], atol=0.05)
+    assert abs(gr.srgb_to_lab(np.array([255, 0, 0]))[0] - 53.24) < 0.1
+    H, W, T = 64, 40, 8
+    ref = np.full((80, 60, 3), 255, np.uint8)
+    ref[10:70, 15:45] = (120, 20, 120)                                               # a purple garment on white
+    ref[30:40, 15:45] = (240, 240, 240)                                              # a light trim band
+    ref_mask = gr.ref_garment_mask(ref, None)
+    assert ref_mask[50, 30] and not ref_mask[2, 2]
+    assert ref_mask[35, 30]                                                          # the light trim is garment, not background
+    big = np.asarray(__import__("PIL.Image", fromlist=["Image"]).fromarray(ref).resize((600, 800), 0))
+    assert gr.ref_garment_mask(big, None)[350, 300] and not gr.ref_garment_mask(big, None)[10, 10]
+    cams, cats_cam, good, cats_good, bad, cats_bad = [], [], [], [], [], []
+    rng = np.random.default_rng(0)
+    for t in range(T):
+        x = 8 + t                                                                    # the person walks right
+        cam = np.full((H, W, 3), 200, np.uint8)
+        cc = np.zeros((H, W), np.uint8)
+        cc[5:60, x:x + 16] = gr.CLOTHES
+        cc[2:6, x + 4:x + 12] = gr.FACE
+        cams.append(cam); cats_cam.append(cc)
+        g = cam.copy(); g[5:60, x:x + 16] = (120, 20, 120); g[25:32, x:x + 16] = (240, 240, 240)
+        good.append(g); cats_good.append(cc.copy())
+        jx = x + (5 if t % 2 else -5)                                                 # jumps around, wrong colour
+        b = cam.copy(); b[5:60, jx:jx + 16] = (60 + 20 * (t % 2), 60, 160)
+        cb = np.zeros((H, W), np.uint8); cb[5:60, max(0, jx):jx + 16] = gr.CLOTHES; cb[2:6, x + 4:x + 12] = gr.FACE
+        bad.append(b); cats_bad.append(cb)
+    rg = gr.clip_metrics(cams, good, cats_cam, cats_good, ref, ref_mask, "dresses")
+    rb = gr.clip_metrics(cams, bad, cats_cam, cats_bad, ref, ref_mask, "dresses")
+    assert rg["colour_de"] < rb["colour_de"] and rg["follow_px"] < rb["follow_px"]
+    assert rg["jitter"] < rb["jitter"] and rg["flicker_de"] < rb["flicker_de"] and rg["fabric"] < rb["fabric"]
+    card = gr.scorecard({"clip1": {"fav2": rb, "fx5": rg}}, ["fav2", "fx5"], "fav2")
+    got = {(r["priority"], r["metric"]): (r["better"], r["worse"]) for r in card}
+    assert got[("COLOUR", "colour_de")] == (1, 0) and got[("MOVEMENT", "follow_px")] == (1, 0)
+    assert got[("CONSISTENCY", "jitter")] == (1, 0) and got[("CONSISTENCY", "flicker_de")] == (1, 0)
+    top = gr.band_mask(np.ones((10, 4), bool), np.ones((10, 4), bool), "tops")
+    assert top[:5].all() and not top[6:].any()                                     # a top: trousers do not count
+
+
+def test_fx5_script_runs_the_five_priority_report_and_57_percent_dresses():
+    sh = (ROOT / "training/fluxrt_lora/fx5.sh").read_text()
+    for s in ('--dress-share "${AZ_DRESS_SHARE:-0.57}"', "AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5}",
+              "AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3}", "eval.garment_report seg", "eval.garment_report score",
+              '--baseline "fav2_$TAG"', "eval.stability_report", "AZ_PAIR_COLUMN=pair"):
+        assert s in sh, s
+    rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
+    assert rt.index("flux2-klein-initlora.patch") < rt.index("flux2-klein-fx5.patch")
+    assert '--colour_weight="$AZ_COLOUR_WEIGHT"' in rt and '--texture_weight="$AZ_TEXTURE_WEIGHT"' in rt

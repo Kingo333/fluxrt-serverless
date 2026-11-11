@@ -382,6 +382,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--motion", help="data_tools.vivid_motion output (fxreal5): dress frames where the dress moves")
     ap.add_argument("--dress-outfit-frac", type=float, default=0.0,
                     help="fxreal5: share of motion clips whose INPUT is a top and trousers (the live case) instead of another dress")
+    ap.add_argument("--dress-share", type=float, default=0.0,
+                    help="fxreal5: build dresses first, then tops/bottoms until dresses are this share of all rows "
+                         "(0.57 = dresses ~35%% more than tops and bottoms together); 0 = the old order, no quota")
     ap.add_argument("--other-live-max", type=int, default=-1,
                     help="cap on non-dress ViViD live stills (-1 = no cap); fxreal5 keeps dresses the bulk")
     ap.add_argument("--per-file", type=int, default=500)
@@ -401,7 +404,7 @@ def main(argv=None) -> dict:
                                  "longer_tried": 0, "longer_kept": 0, "longer_pairs": 0,
                                  "vivid_live_dress": 0, "vivid_live_other_capped": 0, "described": 0,
                                  "motion_clips_tried": 0, "motion_pairs_kept": 0, "motion_singles_kept": 0,
-                                 "motion_outfit_kept": 0}
+                                 "motion_outfit_kept": 0, "pair_clips_kept_dress": 0}
     used = set()
 
     def flush(final=False):
@@ -410,7 +413,10 @@ def main(argv=None) -> dict:
             write_parquet(rows, out / "data" / f"train-{files:05d}.parquet")
             files, rows = files + 1, []
 
-    def add(key, caption, person, garment, target, mask, pair="", jitter="auto"):
+    counts = {"dress": 0, "other": 0}
+
+    def add(key, caption, person, garment, target, mask, pair="", jitter="auto", dress=False):
+        counts["dress" if dress else "other"] += 1
         g = garment.copy()
         if max(g.size) > 1024:
             g.thumbnail((1024, 1024), Image.LANCZOS)
@@ -423,214 +429,253 @@ def main(argv=None) -> dict:
                      "mask": _png(_cover(mask.convert("L"), w, h))})
         flush()
 
-    # 1. ViViD live-way stills (no GPU): real frame pasted back outside the garment area
-    for key, cat, p, g, t in vivid_live_items([Path(d) for d in a.vivid_stills]):
-        mpath = p.parent / "garment_mask.png"
-        if not mpath.exists():
-            stats["vivid_no_mask"] += 1
-            continue
-        if cat != "dress" and a.other_live_max >= 0 and stats["vivid_live"] - stats["vivid_live_dress"] >= a.other_live_max:
-            stats["vivid_live_other_capped"] += 1
-            continue
-        mask = Image.open(mpath).convert("L")
-        real = _cover(Image.open(t).convert("RGB"), *mask.size)
-        live = _cover(Image.open(p).convert("RGB"), *mask.size)
-        soft = soft_mask(mask)
-        if outside_diff(live, real, soft) > a.max_outside_diff:
-            stats["vivid_misaligned"] += 1
-            continue
-        desc = meta_description(p.parent)
-        stats["described"] += int(bool(desc))
-        add(key, caption_for(cat, desc), paste_back(live, real, soft), Image.open(g).convert("RGB"), real, soft)
-        used.add("vivid")
-        stats["vivid_live"] += 1
-        stats["vivid_live_dress"] += int(cat == "dress")
-    print(json.dumps({"vivid_live": stats["vivid_live"]}), flush=True)
-
-    # 2. VITON-HD: held-out eval pairs, then re-dressed training examples
+    # Shared by the sections below (created up front so the dress-first order can run them in any order).
     index = viton_rows(Path(a.viton_dir))
     holdout = list(range(max(0, len(index) - a.holdout), len(index)))
     train_pool = list(range(0, max(0, len(index) - a.holdout)))
     cache: dict = {}
     bank = ClothBank(index)
-    for k, i in enumerate(holdout[: a.test_items]):
-        d = test_out / f"viton_{i:05d}"
-        if (d / "meta.json").exists():
-            continue
-        j = holdout[(k + len(holdout) // 2) % len(holdout)]
-        _, img, _ = load_viton(index[i], cache)
-        cloth_j = bank(j)
-        d.mkdir(parents=True, exist_ok=True)
-        img.crop(portrait_box(*img.size)).save(d / "person.png")
-        cloth_j.save(d / "ref.png")
-        (d / "meta.json").write_text(json.dumps({"category": "tops", "split": "test", "source": "viton_hd",
-                                                 "person_row": i, "garment_row": j}))
-        stats["test_pairs"] += 1
-
-    picks = sorted(rng.sample(train_pool, min(a.viton_n, len(train_pool))))
-    n_nochange = int(round(a.nochange_frac * len(picks)))
-    nochange = set(rng.sample(picks, n_nochange)) if n_nochange else set()
     redress = Redresser(a.klein, (gw, gh), a.steps)
     dino = DinoSim()
-    caption = compact_prompt("upper")
-    for n, i in enumerate(picks):
-        cloth_i, img, agn = load_viton(index[i], cache)
-        box = portrait_box(*img.size)
-        real = img.crop(box).resize((gw, gh), Image.LANCZOS)
-        if i in nochange:
-            same_mask = soft_mask(agnostic_mask(img, agn).crop(box).resize((gw, gh)))
-            add(f"viton_hd_{i:05d}_same", caption, real, cloth_i, real, same_mask)
-            stats["nochange"] += 1
-            used.add("viton_hd")
-            continue
-        stats["viton_tried"] += 1
-        mask = agnostic_mask(img, agn).crop(box).resize((gw, gh))
-        j = pick_other(i, train_pool, rng)
-        cloth_j = bank(j)
-        longer = a.longer_frac > 0 and rng.random() < a.longer_frac
-        gen = redress(real, cloth_j, seed=a.seed * 100003 + i, **({"prompt": LONGER_PROMPT} if longer else {}))
-        soft = soft_mask(mask)
-        inp = paste_back(gen, real, soft)
-        tag = ""
-        if longer:
-            stats["longer_tried"] += 1
-            whole, band = extend_down(mask, a.longer_ext)
-            inp_long = paste_back(gen, real, soft_mask(whole))
-            if changed_enough(inp_long, real, band, a.longer_min_change):
-                inp, soft, mask, tag = inp_long, soft_mask(whole), whole, "_long"
-        bb = bbox_of(mask)
-        sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
-        if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
-            stats["viton_unchanged"] += 1
-            continue
-        add(f"viton_hd_{i:05d}{tag}", caption, inp, cloth_i, real, soft)
-        used.add("viton_hd")
-        stats["viton_kept"] += 1
-        stats["longer_kept"] += int(bool(tag))
-        if (n + 1) % 100 == 0:
-            print(json.dumps({"progress": n + 1, **stats}), flush=True)
-
-    # 3. ViViD same-clip pairs (fxreal3): two nearby real frames, both re-dressed with the SAME other
-    #    garment and seed and pasted back; kept or dropped together. The training patch keeps the two
-    #    in one batch and asks their garment colour to differ only as much as the real frames do.
     pairs = list(vivid_pair_items(Path(a.vivid_pairs))) if a.vivid_pairs else []
     by_cat: dict = {}
     for clip, cat, ref, _ in pairs:
         by_cat.setdefault(cat, []).append(ref)
-    for clip, cat, ref, frames in pairs:
-        stats["pair_clips_tried"] += 1
-        others = [r for r in by_cat.get(cat, []) if r != ref]
-        if not others:
-            continue
-        other = Image.open(rng.choice(others)).convert("RGB")
-        seed = a.seed * 100003 + 7919 + stats["pair_clips_tried"]
-        built = []
-        longer = cat == "upper" and a.longer_frac > 0 and rng.random() < a.longer_frac
-        for tpath, mpath in frames:
-            real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
-            mask = Image.open(mpath).convert("L").resize((gw, gh))
-            gen = redress(real, other, seed=seed, category=cat, **({"prompt": LONGER_PROMPT} if longer else {}))
+    motion = list(motion_items(Path(a.motion))) if a.motion else []
+    dress_refs = [m[2] for m in motion]
+
+    # 1. ViViD live-way stills (no GPU): real frame pasted back outside the garment area
+    def live_section(which="all", stop_at=None):
+        for key, cat, p, g, t in vivid_live_items([Path(d) for d in a.vivid_stills]):
+            is_dress = cat == "dress"
+            if (which == "dress" and not is_dress) or (which == "other" and is_dress):
+                continue
+            if not is_dress and stop_at is not None and counts["other"] >= stop_at:
+                break
+            mpath = p.parent / "garment_mask.png"
+            if not mpath.exists():
+                stats["vivid_no_mask"] += 1
+                continue
+            if not is_dress and a.other_live_max >= 0 and stats["vivid_live"] - stats["vivid_live_dress"] >= a.other_live_max:
+                stats["vivid_live_other_capped"] += 1
+                continue
+            mask = Image.open(mpath).convert("L")
+            real = _cover(Image.open(t).convert("RGB"), *mask.size)
+            live = _cover(Image.open(p).convert("RGB"), *mask.size)
+            soft = soft_mask(mask)
+            if outside_diff(live, real, soft) > a.max_outside_diff:
+                stats["vivid_misaligned"] += 1
+                continue
+            desc = meta_description(p.parent)
+            stats["described"] += int(bool(desc))
+            add(key, caption_for(cat, desc), paste_back(live, real, soft), Image.open(g).convert("RGB"), real, soft,
+                dress=is_dress)
+            used.add("vivid")
+            stats["vivid_live"] += 1
+            stats["vivid_live_dress"] += int(is_dress)
+        print(json.dumps({"vivid_live": stats["vivid_live"], "vivid_live_dress": stats["vivid_live_dress"]}), flush=True)
+
+    # 2. VITON-HD: held-out eval pairs, then re-dressed training examples (tops)
+    def viton_section(stop_at=None):
+        for k, i in enumerate(holdout[: a.test_items]):
+            d = test_out / f"viton_{i:05d}"
+            if (d / "meta.json").exists():
+                continue
+            j = holdout[(k + len(holdout) // 2) % len(holdout)]
+            _, img, _ = load_viton(index[i], cache)
+            cloth_j = bank(j)
+            d.mkdir(parents=True, exist_ok=True)
+            img.crop(portrait_box(*img.size)).save(d / "person.png")
+            cloth_j.save(d / "ref.png")
+            (d / "meta.json").write_text(json.dumps({"category": "tops", "split": "test", "source": "viton_hd",
+                                                     "person_row": i, "garment_row": j}))
+            stats["test_pairs"] += 1
+
+        picks = sorted(rng.sample(train_pool, min(a.viton_n, len(train_pool))))
+        n_nochange = int(round(a.nochange_frac * len(picks)))
+        nochange = set(rng.sample(picks, n_nochange)) if n_nochange else set()
+        caption = compact_prompt("upper")
+        for n, i in enumerate(picks):
+            if stop_at is not None and counts["other"] >= stop_at:
+                break
+            cloth_i, img, agn = load_viton(index[i], cache)
+            box = portrait_box(*img.size)
+            real = img.crop(box).resize((gw, gh), Image.LANCZOS)
+            if i in nochange:
+                same_mask = soft_mask(agnostic_mask(img, agn).crop(box).resize((gw, gh)))
+                add(f"viton_hd_{i:05d}_same", caption, real, cloth_i, real, same_mask)
+                stats["nochange"] += 1
+                used.add("viton_hd")
+                continue
+            stats["viton_tried"] += 1
+            mask = agnostic_mask(img, agn).crop(box).resize((gw, gh))
+            j = pick_other(i, train_pool, rng)
+            cloth_j = bank(j)
+            longer = a.longer_frac > 0 and rng.random() < a.longer_frac
+            gen = redress(real, cloth_j, seed=a.seed * 100003 + i, **({"prompt": LONGER_PROMPT} if longer else {}))
+            soft = soft_mask(mask)
+            inp = paste_back(gen, real, soft)
+            tag = ""
             if longer:
+                stats["longer_tried"] += 1
                 whole, band = extend_down(mask, a.longer_ext)
-                soft = soft_mask(whole, grow=13)
-                inp = paste_back(gen, real, soft)
-                if not changed_enough(inp, real, band, a.longer_min_change):
-                    break
-            else:
-                soft = soft_mask(mask, grow=13)
-                inp = paste_back(gen, real, soft)
+                inp_long = paste_back(gen, real, soft_mask(whole))
+                if changed_enough(inp_long, real, band, a.longer_min_change):
+                    inp, soft, mask, tag = inp_long, soft_mask(whole), whole, "_long"
             bb = bbox_of(mask)
             sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
             if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
+                stats["viton_unchanged"] += 1
+                continue
+            add(f"viton_hd_{i:05d}{tag}", caption, inp, cloth_i, real, soft)
+            used.add("viton_hd")
+            stats["viton_kept"] += 1
+            stats["longer_kept"] += int(bool(tag))
+            if (n + 1) % 100 == 0:
+                print(json.dumps({"progress": n + 1, **stats}), flush=True)
+
+    # 3. ViViD same-clip pairs (fxreal3): two nearby real frames, both re-dressed with the SAME other
+    #    garment and seed and pasted back; kept or dropped together. The training patch keeps the two
+    #    in one batch and asks their garment colour to differ only as much as the real frames do.
+    def pairs_section(which="all", stop_at=None):
+        for clip, cat, ref, frames in pairs:
+            is_dress = cat == "dress"
+            if (which == "dress" and not is_dress) or (which == "other" and is_dress):
+                continue
+            if not is_dress and stop_at is not None and counts["other"] + 2 > stop_at:
                 break
-            built.append((inp, real, soft))
-        if len(built) != 2:
-            continue
-        jf = jitter_factors(rng, a.photo_aug)
-        garment = Image.open(ref).convert("RGB")
-        for tag, (inp, real, soft) in zip("ab", built):
-            add(f"vivid_pair_{clip}_{tag}", compact_prompt(cat), inp, garment, real, soft, pair=clip, jitter=jf)
-        used.add("vivid")
-        stats["pair_clips_kept"] += 1
-        stats["pair_clips_kept_dress"] = stats.get("pair_clips_kept_dress", 0) + int(cat == "dress")
-        stats["longer_pairs"] += int(longer)
-    print(json.dumps({"pair_clips_kept": stats["pair_clips_kept"], "pair_clips_tried": stats["pair_clips_tried"]}),
-          flush=True)
+            stats["pair_clips_tried"] += 1
+            others = [r for r in by_cat.get(cat, []) if r != ref]
+            if not others:
+                continue
+            other = Image.open(rng.choice(others)).convert("RGB")
+            seed = a.seed * 100003 + 7919 + stats["pair_clips_tried"]
+            built = []
+            longer = cat == "upper" and a.longer_frac > 0 and rng.random() < a.longer_frac
+            for tpath, mpath in frames:
+                real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
+                mask = Image.open(mpath).convert("L").resize((gw, gh))
+                gen = redress(real, other, seed=seed, category=cat, **({"prompt": LONGER_PROMPT} if longer else {}))
+                if longer:
+                    whole, band = extend_down(mask, a.longer_ext)
+                    soft = soft_mask(whole, grow=13)
+                    inp = paste_back(gen, real, soft)
+                    if not changed_enough(inp, real, band, a.longer_min_change):
+                        break
+                else:
+                    soft = soft_mask(mask, grow=13)
+                    inp = paste_back(gen, real, soft)
+                bb = bbox_of(mask)
+                sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
+                if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
+                    break
+                built.append((inp, real, soft))
+            if len(built) != 2:
+                continue
+            jf = jitter_factors(rng, a.photo_aug)
+            garment = Image.open(ref).convert("RGB")
+            for tag, (inp, real, soft) in zip("ab", built):
+                add(f"vivid_pair_{clip}_{tag}", compact_prompt(cat), inp, garment, real, soft, pair=clip, jitter=jf,
+                    dress=is_dress)
+            used.add("vivid")
+            stats["pair_clips_kept"] += 1
+            stats["pair_clips_kept_dress"] += int(is_dress)
+            stats["longer_pairs"] += int(longer)
+        print(json.dumps({"pair_clips_kept": stats["pair_clips_kept"], "pair_clips_tried": stats["pair_clips_tried"]}),
+              flush=True)
 
     # 4. fxreal5: dress frames where the dress MOVES (data_tools.vivid_motion). The pair (a, b) is re-dressed
     #    with the same garment and seed (pair term); singles add more poses of the same dress. A share of
     #    clips get a top-and-trousers INPUT (the live case: someone in a T-shirt and trousers tries an abaya),
     #    the rest another dress. The answer is always the real frame.
-    motion = list(motion_items(Path(a.motion))) if a.motion else []
-    dress_refs = [m[2] for m in motion]
-    for clip, cat, ref, desc, pair, singles in motion:
-        stats["motion_clips_tried"] += 1
-        outfit = a.dress_outfit_frac > 0 and rng.random() < a.dress_outfit_frac
-        if outfit:
-            other = bank(rng.choice(train_pool))
-        else:
-            others = [r for r in dress_refs if r != ref]
-            if not others:
-                continue
-            other = Image.open(rng.choice(others)).convert("RGB")
-        seed = a.seed * 100003 + 15485 + stats["motion_clips_tried"]
-        garment = Image.open(ref).convert("RGB")
-        caption = caption_for(cat, desc)
-
-        def make(tpath, mpath):
-            real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
-            mask = Image.open(mpath).convert("L").resize((gw, gh))
+    def motion_section():
+        for clip, cat, ref, desc, pair, singles in motion:
+            stats["motion_clips_tried"] += 1
+            outfit = a.dress_outfit_frac > 0 and rng.random() < a.dress_outfit_frac
             if outfit:
-                whole, band = outfit_area(mask)
-                gen = redress(real, other, seed=seed, prompt=OUTFIT_PROMPT)
-                soft = soft_mask(whole, grow=13)
-                inp = paste_back(gen, real, soft)
-                if band.getbbox() and not changed_enough(inp, real, band, a.longer_min_change):
-                    return None
-                area = whole
+                other = bank(rng.choice(train_pool))
             else:
-                gen = redress(real, other, seed=seed, category=cat)
-                soft = soft_mask(mask, grow=13)
-                inp = paste_back(gen, real, soft)
-                area = mask
-            bb = bbox_of(mask)
-            sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
-            if not bb or sim > a.max_sim or not changed_enough(inp, real, area):
-                return None
-            return inp, real, soft
+                others = [r for r in dress_refs if r != ref]
+                if not others:
+                    continue
+                other = Image.open(rng.choice(others)).convert("RGB")
+            seed = a.seed * 100003 + 15485 + stats["motion_clips_tried"]
+            garment = Image.open(ref).convert("RGB")
+            caption = caption_for(cat, desc)
 
-        built = [make(*f) for f in pair]
-        if all(built):
-            jf = jitter_factors(rng, a.photo_aug)
-            for tag, (inp, real, soft) in zip("ab", built):
-                add(f"vivid_motion_{clip}_{tag}", caption, inp, garment, real, soft, pair=f"m_{clip}", jitter=jf)
-            stats["motion_pairs_kept"] += 1
-            stats["motion_outfit_kept"] += int(outfit)
-            stats["described"] += 2 * int(bool(desc))
-        for k, f in enumerate(singles, 1):
-            got = make(*f)
-            if got:
-                add(f"vivid_motion_{clip}_s{k}", caption, *got)
-                stats["motion_singles_kept"] += 1
-                stats["described"] += int(bool(desc))
-        used.add("vivid")
-        if stats["motion_clips_tried"] % 50 == 0:
-            print(json.dumps({"motion_progress": stats["motion_clips_tried"], "pairs": stats["motion_pairs_kept"],
-                              "singles": stats["motion_singles_kept"]}), flush=True)
-    if motion:
-        print(json.dumps({k: stats[k] for k in ("motion_clips_tried", "motion_pairs_kept", "motion_singles_kept",
-                                                 "motion_outfit_kept")}), flush=True)
+            def make(tpath, mpath):
+                real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
+                mask = Image.open(mpath).convert("L").resize((gw, gh))
+                if outfit:
+                    whole, band = outfit_area(mask)
+                    gen = redress(real, other, seed=seed, prompt=OUTFIT_PROMPT)
+                    soft = soft_mask(whole, grow=13)
+                    inp = paste_back(gen, real, soft)
+                    if band.getbbox() and not changed_enough(inp, real, band, a.longer_min_change):
+                        return None
+                    area = whole
+                else:
+                    gen = redress(real, other, seed=seed, category=cat)
+                    soft = soft_mask(mask, grow=13)
+                    inp = paste_back(gen, real, soft)
+                    area = mask
+                bb = bbox_of(mask)
+                sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
+                if not bb or sim > a.max_sim or not changed_enough(inp, real, area):
+                    return None
+                return inp, real, soft
+
+            built = [make(*f) for f in pair]
+            if all(built):
+                jf = jitter_factors(rng, a.photo_aug)
+                for tag, (inp, real, soft) in zip("ab", built):
+                    add(f"vivid_motion_{clip}_{tag}", caption, inp, garment, real, soft, pair=f"m_{clip}", jitter=jf,
+                        dress=True)
+                stats["motion_pairs_kept"] += 1
+                stats["motion_outfit_kept"] += int(outfit)
+                stats["described"] += 2 * int(bool(desc))
+            for k, f in enumerate(singles, 1):
+                got = make(*f)
+                if got:
+                    inp, real, soft = got
+                    add(f"vivid_motion_{clip}_s{k}", caption, inp, garment, real, soft, dress=True)
+                    stats["motion_singles_kept"] += 1
+                    stats["described"] += int(bool(desc))
+            used.add("vivid")
+            if stats["motion_clips_tried"] % 50 == 0:
+                print(json.dumps({"motion_progress": stats["motion_clips_tried"], "pairs": stats["motion_pairs_kept"],
+                                  "singles": stats["motion_singles_kept"]}), flush=True)
+        if motion:
+            print(json.dumps({k: stats[k] for k in ("motion_clips_tried", "motion_pairs_kept", "motion_singles_kept",
+                                                     "motion_outfit_kept")}), flush=True)
+
+    if a.dress_share > 0:
+        # fxreal5 (owner, 2026-11-11): dresses first, then tops and bottoms up to the share the owner set
+        # (0.57 = dresses about 35% more than tops and bottoms together). Of the tops-and-bottoms quota, ViViD
+        # stills fill up to 40%, fxreal3's pairs up to 65% (cumulative), VITON-HD the rest, so the
+        # longer-to-shorter tops (fxreal4's item-5 fix) stay in.
+        live_section("dress")
+        pairs_section("dress")
+        motion_section()
+        quota = int(round(counts["dress"] * (1.0 - a.dress_share) / a.dress_share))
+        stats["other_quota"] = quota
+        print(json.dumps({"dress_rows": counts["dress"], "other_quota": quota}), flush=True)
+        live_section("other", stop_at=int(0.4 * quota))
+        pairs_section("other", stop_at=int(0.65 * quota))
+        viton_section(stop_at=quota)
+    else:
+        live_section()
+        viton_section()
+        pairs_section()
+        motion_section()
     flush(final=True)
 
     sel = selection_for(used)
     sel["owner_accepted_risk"] = "2026-11-08: research-licence real data accepted for R&D; contact rights holders before commercial use"
     (out / "selection.json").write_text(json.dumps(sel, indent=2) + "\n")
-    total = (stats["vivid_live"] + stats["viton_kept"] + stats["nochange"] + 2 * stats["pair_clips_kept"]
-             + 2 * stats["motion_pairs_kept"] + stats["motion_singles_kept"])
-    dress_rows = (stats["vivid_live_dress"] + 2 * stats.get("pair_clips_kept_dress", 0)
-                  + 2 * stats["motion_pairs_kept"] + stats["motion_singles_kept"])
-    stats["dress_rows"] = dress_rows
-    stats["dress_share"] = round(dress_rows / total, 3) if total else 0.0
+    total = counts["dress"] + counts["other"]
+    stats["dress_rows"], stats["other_rows"] = counts["dress"], counts["other"]
+    stats["dress_share"] = round(counts["dress"] / total, 3) if total else 0.0
     summary = {"samples": total, "files": files, "size": [w, h], "dataset_name": str(out / "data"), **stats}
     (out / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)

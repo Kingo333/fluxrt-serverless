@@ -81,6 +81,9 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx3.patch"
 # fxreal5: start from an existing LoRA (--init_lora_weights; off unless AZ_INIT_LORA is set).
 curl -fsSL "$RAW/patches/flux2-klein-initlora.patch" -o "$AZ_ROOT/flux2-klein-initlora.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-initlora.patch"
+# fxreal5: garment colour and fabric-contrast terms (--colour_weight/--texture_weight; off unless set).
+curl -fsSL "$RAW/patches/flux2-klein-fx5.patch" -o "$AZ_ROOT/flux2-klein-fx5.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx5.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -132,6 +135,8 @@ cd "$SRC/examples/dreambooth"
   ${AZ_PAIR_COLUMN:+--pair_column="$AZ_PAIR_COLUMN" --pair_weight="${AZ_PAIR_WEIGHT:-1.0}"} \
   ${AZ_DETAIL_WEIGHT:+--detail_weight="$AZ_DETAIL_WEIGHT"} \
   ${AZ_INIT_LORA:+--init_lora_weights="$AZ_INIT_LORA"} \
+  ${AZ_COLOUR_WEIGHT:+--colour_weight="$AZ_COLOUR_WEIGHT"} \
+  ${AZ_TEXTURE_WEIGHT:+--texture_weight="$AZ_TEXTURE_WEIGHT"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

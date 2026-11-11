@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # FluxRT LoRA "fxreal5" (owner, 2026-11-11): dresses and abayas. CONTINUES favourite #2 (blend05s065, the exact
 # fxreal3+fxreal4 merge at strength 0.65 that runs live) instead of starting from scratch:
-#   - dresses are the bulk of the data (~2/3): every ViViD dress train clip, at the frames where the dress MOVES
-#     most (data_tools.vivid_motion: a pair for the steady-colour term + 2 more poses per clip), plus the dress
-#     stills and dress pairs we already had; half the clips get a T-shirt-and-trousers INPUT (the live case),
-#     half another dress; captions carry ViViD's garment description where staging has one
-#   - ~1/3 tops and bottoms kept (VITON-HD, capped ViViD stills, fxreal3's pairs) so shirts and trousers stay good
-#   - extra weight on the garment area (3x, was 2x) and on fine edges/texture (detail 0.05, was 0.03)
+#   - the owner's five priorities: COLOUR (garment colour term), DETAIL (edge term 0.05, garment area 3x, bigger
+#     garment photo), FABRIC (garment contrast term: shine, sheen, print contrast), MOVEMENT (frames where the
+#     dress moves most, several poses per dress) and CONSISTENCY (same-clip pairs with the steady-colour term)
+#   - mix (owner): dresses 57% / tops and bottoms 43% (dresses ~35% more than tops and bottoms together):
+#     build_real.py --dress-share builds the dresses first (every ViViD dress train clip at the frames where the
+#     dress MOVES most, plus the dress stills and dress pairs we already had; half the clips with a
+#     T-shirt-and-trousers INPUT, the live case) and then fills tops and bottoms to 43% (ViViD stills, fxreal3's
+#     pairs, VITON-HD incl. fxreal4's longer-to-shorter tops); captions carry ViViD's garment description
 #   - rank 64 (= favourite #2), learning rate halved (5e-5), 1,500 steps, saves every 250
 #   - garment photo size AZ_REF_SIZE: the live FLUXRT_REF_WIDTH x HEIGHT (384x512 today; 576x768 if Option A won)
 # Then renders on 10 NEW held-out dress clips (dress10, auto-described), the owner's Step B set (set2, his own
 # descriptions; two long black maxi dresses) and his 5 cases (regression): original / favourite #2 / fxreal5
-# (final and step 1000) at the same garment size, the face/skin/background gate, the steadiness table, and one
+# (final and step 1000) at the same garment size, the face/skin/background gate, the steadiness table, the
+# five-priority garment report (colour, detail, fabric, movement, consistency: eval.garment_report) and one
 # LABELLED video per set: garment | camera | favourite #2 (today) | fxreal5.
 # Needs a GPU with >= 30 GB (RTX PRO 6000 recommended) and the azyah-vton-train volume at /workspace.
-# Never touches the live endpoint or the azyah-joyai volume. Approved cost: about $8-12.
+# Never touches the live endpoint or the azyah-joyai volume. About 2-3 h on an RTX PRO 6000 ($2.49/h): about $6-8, cap $12.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx5.sh -o /workspace/fx5.sh
 #   AZ_REF=<SHA> AZ_REF_SIZE=384x512 AZ_NO_STOP=1 nohup bash /workspace/fx5.sh > /workspace/fx5.log 2>&1 &
@@ -76,20 +79,21 @@ echo "motion clips on disk: $(ls -d "$S"/vivid_dress_motion/*/ 2>/dev/null | wc 
 
 DATA="$D/fluxrt_lora/$EXP"
 if [ ! -f "$DATA/dataset_summary.json" ]; then
-  echo "== 4. build the dataset: dresses first, ~1/3 tops and bottoms kept ($(mins))"
+  echo "== 4. build the dataset: dresses first (${AZ_DRESS_SHARE:-0.57} of the rows), then tops and bottoms ($(mins))"
   timeout -s INT 150m "$PY" "$T/fluxrt_lora/build_real.py" --out "$DATA" --viton-dir "$D/raw/viton_hd" \
     --klein "$C/FLUX.2-klein-4B" --vivid-stills "$S/vivid_dress_stills" "$S/vivid_upper_stills" "$S/vivid_lower_stills" \
     --vivid-pairs "$S/vivid_pairs" --motion "$S/vivid_dress_motion" --dress-outfit-frac "${AZ_OUTFIT:-0.5}" \
-    --other-live-max "${AZ_OTHER_LIVE_MAX:-250}" --test-out "$AZ_ROOT/eval/fx5_unused_test_pairs" --test-items 0 \
-    --viton-n "${AZ_VITON_N:-500}" --holdout 300 --nochange-frac "${AZ_NOCHANGE:-0.2}" --photo-aug 0.3 \
+    --dress-share "${AZ_DRESS_SHARE:-0.57}" --other-live-max "${AZ_OTHER_LIVE_MAX:--1}" \
+    --test-out "$AZ_ROOT/eval/fx5_unused_test_pairs" --test-items 0 \
+    --viton-n "${AZ_VITON_N:-1500}" --holdout 300 --nochange-frac "${AZ_NOCHANGE:-0.2}" --photo-aug 0.3 \
     --longer-frac "${AZ_LONGER:-0.25}" --longer-ext 0.2
   echo "BUILD_EXIT=$?"
 fi
 cat "$DATA/dataset_summary.json" || { echo NO_DATASET; exit 1; }
 "$PY" -c "
 import json; s = json.load(open('$DATA/dataset_summary.json'))
-print(f\"DRESS_SHARE {s.get('dress_share')} ({s.get('dress_rows')} dress rows of {s.get('samples')}); described rows {s.get('described')}\")
-if (s.get('dress_share') or 0) < 0.45: print('WARNING_LOW_DRESS_SHARE: fewer dress rows than planned; the run continues')"
+print(f\"DRESS_SHARE {s.get('dress_share')} ({s.get('dress_rows')} dress rows, {s.get('other_rows')} tops/bottoms rows, of {s.get('samples')}); described rows {s.get('described')}\")
+if abs((s.get('dress_share') or 0) - ${AZ_DRESS_SHARE:-0.57}) > 0.05: print('WARNING_DRESS_SHARE_OFF_TARGET: not enough rows of one kind; the run continues')"
 
 echo "== 4b. face counts 2x: add the face to every sample's weight mask ($(mins))"
 ( cd "$T" && "$MP" -m data_tools.face_weight "$DATA" --model "$SEG" ) || { echo "FACE_WEIGHT_FAILED"; exit 1; }
@@ -103,6 +107,7 @@ if [ ! -f "$OUT/pytorch_lora_weights.safetensors" ]; then
     AZ_MAX_STEPS=${AZ_MAX_STEPS:-1500} AZ_BATCH=4 AZ_LORA_RANK=64 AZ_LR=${AZ_LR:-5e-5} \
     AZ_CKPT_INTERVAL=250 AZ_CKPT_LIMIT=8 AZ_MASK_COLUMN=mask AZ_MASK_WEIGHT=${AZ_MASK_WEIGHT:-3.0} \
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
+    AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
     AZ_INIT_LORA=$INIT bash"
   echo "TRAIN_EXIT=$?"
 fi
@@ -110,7 +115,7 @@ grep -h "LoRA initialised from" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/
 ls -la "$OUT" | tail -12
 [ -f "$OUT/pytorch_lora_weights.safetensors" ] || { echo LORA_MISSING; exit 1; }
 cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true
-grep -oE "(loss|detail|pair)=[0-9.e+-]+" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -6
+grep -oE "(loss|detail|pair|colour|texture)=[0-9.e+-]+" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -10
 echo "train done after $(mins)"
 
 echo "== 6. eval sets: 10 new held-out dress clips (auto-described), the owner's set2, his 5 cases ($(mins))"
@@ -165,13 +170,22 @@ Path(sys.argv[1], "fx5_gate_summary.json").write_text(json.dumps(res, indent=2))
 PYEOF
 ) || true
 
+echo "== 8b. the owner's five priorities vs favourite #2: colour, detail, fabric, movement, consistency ($(mins))"
+for s in $SETS; do
+  ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models $CANDS --model "$SEG" ) > "$E/garment_seg_fx5_$s.log" 2>&1 \
+    || echo "GARMENT_SEG_${s}_EXIT=$?"
+  echo "-- $s"
+  ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models $CANDS --baseline "fav2_$TAG" --out "$E/garment_fx5_$s.md" ) \
+    2>&1 | grep -E "^PRIORITY|DINO" || echo "GARMENT_SCORE_${s}_EXIT=$?"
+done
+
 echo "== 9. labelled videos: garment | camera | favourite #2 (today) | fxreal5 ($(mins))"
 for s in $SETS; do
   ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols 4 --no-legend \
       --panels "fav2_$TAG=favourite #2 (today)" "fx5_$TAG=fxreal5" ) || echo "VIDEO_${s}_EXIT=$?"
   [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx5_${s}_${TAG}.mp4"
 done
-( cd "$E" && tar cf "$AZ_ROOT/eval/fx5_review.tar" dress10.json preserve_fx5_*.md stability_fx5_*.md results/fx5_gate_summary.json \
-    render_fx5_*.log 2>/dev/null )
+( cd "$E" && tar cf "$AZ_ROOT/eval/fx5_review.tar" dress10.json preserve_fx5_*.md stability_fx5_*.md garment_fx5_*.md \
+    results/fx5_gate_summary.json results/*/garment_report.json render_fx5_*.log 2>/dev/null )
 echo "FX5_DONE after $(mins): videos $(ls "$E"/fx5_*_"$TAG".mp4 2>/dev/null | tr '\n' ' ')"
 echo "LoRA $OUT/pytorch_lora_weights.safetensors (+ selection.json); reports $AZ_ROOT/eval/fx5_review.tar"
