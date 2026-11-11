@@ -142,6 +142,10 @@ def test_clean_reference_dress_drops_above_chin_and_others():
     flat[10:50, 10:40] = sg.CLOTHES
     assert sg.clean_reference_dress(rgb, flat) is None
     assert sg.is_dress_category("Dresses") and sg.is_dress_category("dress") and not sg.is_dress_category("tops")
+    assert sg.is_dress_category("abaya") and sg.is_dress_category("Abayas") and sg.is_dress_category("kaftan")
+    assert not sg.is_dress_category("modestwear")                     # could be a hijab: the app's type decides
+    assert sg.is_dress_category("modestwear", "dresses") and not sg.is_dress_category("modestwear", "accessories")
+    assert not sg.is_dress_category("dresses", "tops")                # the app's try-on type wins when sent
 
 
 def test_cache_mask_shoes_is_full_and_top_skips_static_background():

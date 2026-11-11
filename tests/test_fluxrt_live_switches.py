@@ -211,7 +211,12 @@ def test_dress_photo_sent_again_keeps_the_current_category(monkeypatch):
         assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
         ws.send_json({"type": "set_reference_image", "image_b64": photo, "category": "tops"})
         assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
-    assert calls == [False, True, True, False]
+        # an abaya filed as "modestwear": the app's try-on type says dress; a hijab filed the same way does not
+        ws.send_json({"type": "set_reference_image", "image_b64": photo, "category": "modestwear", "garment_type": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_prompt", "prompt": "hijab", "category": "modestwear", "garment_type": "accessories"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+    assert calls == [False, True, True, False, True, False]
     time.sleep(0.2)
 
 

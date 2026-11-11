@@ -751,7 +751,8 @@ async def api_predict(
 
         if isinstance(ref_b64, str) and ref_b64:
             try:
-                ref = b64_to_reference_rgb(ref_b64, STATE.get("segmenter"))
+                dress = REF_CLEAN_DRESS and is_dress_category(payload.get("category"), payload.get("garment_type"))
+                ref = b64_to_reference_rgb(ref_b64, STATE.get("segmenter"), dress=dress)
                 proc.set_reference_image(ref)
             except Exception as e:
                 log.warning("set_reference_image failed: %s", e)
@@ -870,12 +871,13 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     ref_raw: Optional[Image.Image] = None
     ref_dress = False
     ref_category: Optional[str] = None
+    ref_type: Optional[str] = None  # the app's try-on type ("dresses" for an abaya filed as "modestwear")
 
-    def dress_rule(category) -> bool:
-        return REF_CLEAN_DRESS and segmenter is not None and is_dress_category(category)
+    def dress_rule() -> bool:
+        return REF_CLEAN_DRESS and segmenter is not None and is_dress_category(ref_category, ref_type)
 
     async def receiver():
-        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count, ref_raw, ref_dress, ref_category
+        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count, ref_raw, ref_dress, ref_category, ref_type
         try:
             while not stop_event.is_set():
                 raw = await websocket.receive_text()
@@ -893,8 +895,8 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         # composite and cache-mask rules depend on it.
                         category = data.get("category")
                         live.set_category(category)
-                        ref_category = category
-                        want_dress = dress_rule(category)
+                        ref_category, ref_type = category, data.get("garment_type")
+                        want_dress = dress_rule()
                         if ref_raw is not None and want_dress != ref_dress:
                             try:
                                 proc.set_reference_image(reference_array(ref_raw, segmenter, dress=want_dress))
@@ -917,9 +919,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 elif msg_type == "set_reference_image":
                     try:
                         ref_raw = decode_reference(data["image_b64"])
-                        if data.get("category"):
-                            ref_category = data.get("category")
-                        ref_dress = dress_rule(ref_category)
+                        if data.get("category") or data.get("garment_type"):
+                            ref_category, ref_type = data.get("category"), data.get("garment_type")
+                        ref_dress = dress_rule()
                         proc.set_reference_image(reference_array(ref_raw, segmenter, dress=ref_dress))
                         live.garment_changed()
                         await websocket.send_json({"type": "ack", "name": "set_reference_image"})

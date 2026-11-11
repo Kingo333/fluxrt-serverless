@@ -41,7 +41,10 @@ _SHOES = {"shoes", "footwear", "shoe"}
 _BAGS = {"bags", "bag"}
 _ACCESSORIES = {"accessories", "accessory"}
 # Dresses: the app files abayas, kaftans and gowns under "dresses" (buildTryOnPrompt.ts).
+# The app's try-on type for dresses, and the words its prompt builder maps to it (buildTryOnPrompt.ts
+# KEYWORD_MAP) for an app that sends only the stored category (e.g. an event item filed as "abaya").
 _DRESSES = {"dresses", "dress"}
+_DRESS_WORDS = ("dress", "gown", "kaftan", "caftan", "abaya", "jalabiya", "jumpsuit", "romper")
 
 # A frame counts as "no person" when almost everything is background.
 NO_PERSON_BACKGROUND_FRAC = 0.97
@@ -164,8 +167,13 @@ def clean_reference(rgb: np.ndarray, cat: np.ndarray, feather_px: int = 2) -> Op
     return composite(white, rgb, garment, feather_px)
 
 
-def is_dress_category(category) -> bool:
-    return str(category or "").strip().lower() in _DRESSES
+def is_dress_category(category, garment_type=None) -> bool:
+    """garment_type: the app's try-on type ("dresses" for an abaya filed as "modestwear"); it decides when
+    sent. Otherwise the stored category: "dresses"/"dress" or a dress word (abaya, kaftan, gown, ...)."""
+    if garment_type:
+        return str(garment_type).strip().lower() in _DRESSES
+    c = str(category or "").strip().lower()
+    return c in _DRESSES or any(w in c for w in _DRESS_WORDS)
 
 
 def clean_reference_dress(rgb: np.ndarray, cat: np.ndarray, feather_px: int = 2) -> Optional[np.ndarray]:
