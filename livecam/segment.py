@@ -40,6 +40,8 @@ _GARMENT = {"tops", "bottoms", "dresses", "outerwear", "upper", "lower", "dress"
 _SHOES = {"shoes", "footwear", "shoe"}
 _BAGS = {"bags", "bag"}
 _ACCESSORIES = {"accessories", "accessory"}
+# Dresses: the app files abayas, kaftans and gowns under "dresses" (buildTryOnPrompt.ts).
+_DRESSES = {"dresses", "dress"}
 
 # A frame counts as "no person" when almost everything is background.
 NO_PERSON_BACKGROUND_FRAC = 0.97
@@ -156,6 +158,33 @@ def clean_reference(rgb: np.ndarray, cat: np.ndarray, feather_px: int = 2) -> Op
     if fraction(cat, (FACE, BODY_SKIN, HAIR)) < REF_PERSON_MIN_FRAC:
         return None
     garment = np.isin(cat, (CLOTHES, OTHERS))
+    if garment.mean() < REF_CLOTHES_MIN_FRAC:
+        return None
+    white = np.full_like(rgb, 255)
+    return composite(white, rgb, garment, feather_px)
+
+
+def is_dress_category(category) -> bool:
+    return str(category or "").strip().lower() in _DRESSES
+
+
+def clean_reference_dress(rgb: np.ndarray, cat: np.ndarray, feather_px: int = 2) -> Optional[np.ndarray]:
+    """Dress / abaya on-model photo -> clothes only on white, nothing above the chin (owner, 2026-11-11).
+
+    On-model abaya photos often show a hijab, scarf or jewellery the shopper is not trying on, and
+    the model copied them onto the shopper. Here the garment is the clothes class only (no 'others':
+    necklaces, earrings, bracelets, bags) and every row above the bottom of the face is dropped
+    (the top of a hijab or scarf). None = leave it to clean_reference (no person on the photo, or
+    too little garment left to be safe).
+    """
+    if cat.shape != rgb.shape[:2]:
+        return None
+    if fraction(cat, (FACE, BODY_SKIN, HAIR)) < REF_PERSON_MIN_FRAC:
+        return None
+    garment = cat == CLOTHES
+    face_rows = np.nonzero((cat == FACE).any(axis=1))[0]
+    if face_rows.size:
+        garment[: int(face_rows.max()) + 1] = False
     if garment.mean() < REF_CLOTHES_MIN_FRAC:
         return None
     white = np.full_like(rgb, 255)
