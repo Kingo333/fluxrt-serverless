@@ -403,12 +403,20 @@ def test_preserve_check_sees_a_hijab_turned_into_hair():
     assert pc.head_zone(tight)[1] is not None
 
 
-def test_hijab_set_keeps_only_clips_with_a_head_covering(tmp_path, monkeypatch):
-    import av
-    from PIL import Image
+def test_hijab_set_checks_frames_and_cleans_the_dress_photo():
     from eval import hijab_set as hs
     assert hs.best_window([False, True, True, True, False], 3) == (1, 1.0)
     assert hs.frame_ok(_person_cat(512, 288)) and not hs.frame_ok(_person_cat(512, 288, hijab=False))
+    photo = np.full((400, 300, 3), 20, np.uint8)
+    cleaned = hs.clean_dress_photo(photo, _person_cat(400, 300))
+    assert (cleaned[10, 150] == 255).all() and cleaned[300, 150][0] == 20           # above the chin cut, dress kept
+    assert hs.clean_dress_photo(photo, np.full((400, 300), 4, np.uint8)) is None    # no person: used as sent
+
+
+def test_hijab_set_keeps_only_clips_with_a_head_covering(tmp_path, monkeypatch):
+    av = pytest.importorskip("av")
+    from PIL import Image
+    from eval import hijab_set as hs
 
     class FakeSeg:
         def __init__(self, path):
