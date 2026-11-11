@@ -99,3 +99,20 @@ noise (only ~12% of updates in FluxRT's live band), on synthetic Glance answers.
   tone or background change/steadiness on ANY clip (the bar is today's #43, not perfection).
 - **Run:** `fx2.sh` on one RTX 5090 (data ~40 min, training ~60 min, renders ~35 min, gate ~10 min),
   then reports, grids, the gate and a blind A/B package (`eval/fx2_review.tar`), and it stops its Pod.
+
+## fxreal5 (2026-11-11): dresses and abayas, continuing favourite #2
+
+`fx5.sh` continues the live favourite #2 (`outputs/fluxrt_lora/blend05s065`, rank 64, strength 0.65 baked in)
+instead of training from scratch (`patches/flux2-klein-initlora.patch`, `--init_lora_weights`, `AZ_INIT_LORA`):
+
+- **Dresses first (~2/3 of the rows):** `data_tools/vivid_motion.py` takes every ViViD dress train clip and keeps
+  the two frames (3-8 apart) where the clothes area changes most (a step, a turn, a swinging hem) plus 2 more
+  poses per clip; `build_real.py --motion` re-dresses them (half with a T-shirt and trousers, the live case,
+  `--dress-outfit-frac`; half with another dress) and pastes the real frame back outside the garment area.
+  The dress stills and dress pairs from fxreal3/4 stay in; captions carry ViViD's garment description.
+- **~1/3 tops and bottoms kept** (VITON-HD `--viton-n 500`, ViViD stills capped by `--other-live-max`,
+  fxreal3's pairs) so shirts and trousers do not regress.
+- **Loss:** garment area 3x (was 2x), detail term 0.05 (was 0.03), pair term 1.0, face 2x; LR 5e-5, 1,500 steps.
+- **Garment photo size:** `AZ_REF_SIZE` = the live `FLUXRT_REF_WIDTH x HEIGHT` (384x512, or 576x768 if Option A won).
+- **Eval:** 10 new held-out dress clips (`step_a pick --categories dress --auto-describe`), the owner's set2 and
+  his 5 cases; original / favourite #2 / fxreal5 at the same garment size; gate, steadiness, labelled videos.

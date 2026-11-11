@@ -1,0 +1,42 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index 3edc2e2..985eb0e 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -423,6 +423,16 @@ def parse_args(input_args=None):
+         help="LoRA alpha to be used for additional scaling.",
+     )
+     parser.add_argument("--lora_dropout", type=float, default=0.0, help="Dropout probability for LoRA layers")
++    parser.add_argument(
++        "--init_lora_weights",
++        type=str,
++        default=None,
++        help=(
++            "Azyah fxreal5: start the LoRA from an existing LoRA (a folder with pytorch_lora_weights.safetensors) "
++            "instead of random weights. Its rank and target layers must match --rank and the trained layers. "
++            "A newer checkpoint of the same run (--resume_from_checkpoint) still takes over."
++        ),
++    )
+ 
+     parser.add_argument(
+         "--output_dir",
+@@ -1400,6 +1410,20 @@ def main(args):
+         target_modules=target_modules,
+     )
+     transformer.add_adapter(transformer_lora_config)
++    if args.init_lora_weights:
++        # Azyah fxreal5: continue from an existing LoRA (e.g. favourite #2's exact merge, its strength baked in).
++        _init_sd = Flux2KleinPipeline.lora_state_dict(args.init_lora_weights)
++        _init_sd = {k[len("transformer."):]: v for k, v in _init_sd.items() if k.startswith("transformer.")}
++        _init_sd = convert_unet_state_dict_to_peft(_init_sd)
++        _res = set_peft_model_state_dict(transformer, _init_sd, adapter_name="default")
++        _unexpected = list(getattr(_res, "unexpected_keys", None) or [])
++        _missing = [k for k in (getattr(_res, "missing_keys", None) or []) if "lora_" in k]
++        if not _init_sd or _unexpected or _missing:
++            raise ValueError(
++                f"--init_lora_weights {args.init_lora_weights} does not fit this LoRA: {len(_init_sd)} tensors, "
++                f"{len(_unexpected)} unexpected, {len(_missing)} LoRA weights missing (check --rank and the layers)"
++            )
++        logger.info(f"LoRA initialised from {args.init_lora_weights} ({len(_init_sd)} tensors)")
+ 
+     def unwrap_model(model):
+         model = accelerator.unwrap_model(model)

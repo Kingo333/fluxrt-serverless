@@ -41,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data_tools.fluxrt_prompt import compact_prompt  # noqa: E402
+from data_tools.vivid_motion import motion_items  # noqa: E402
 from fluxrt_lora.make_dataset import _cover, _jpeg, selection_for  # noqa: E402
 
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
@@ -163,6 +164,29 @@ def extend_down(mask, frac: float = 0.2, widen: float = 0.06):
 LONGER_PROMPT = ("Virtual try-on. The person in the camera frame wears the garment from the reference image, but "
                  "made longer: a long tunic-length version that covers the hips and reaches the upper thighs, worn "
                  "over the trousers or skirt. Keep the person's face, hair, body, pose and the background unchanged.")
+
+
+OUTFIT_PROMPT = ("Virtual try-on. The person in the camera frame wears the top from the reference image with plain, "
+                 "full-length dark trousers instead of the dress. Keep the person's face, hair, body, pose and the "
+                 "background unchanged.")
+
+
+def caption_for(category, description) -> str:
+    """The app's compact prompt, with the garment description when staging has one (fxreal5)."""
+    return compact_prompt(category, None, description or None)
+
+
+def meta_description(folder: Path):
+    try:
+        return json.loads((Path(folder) / "meta.json").read_text()).get("garment_description") or None
+    except Exception:  # noqa: BLE001 - no meta, no description
+        return None
+
+
+def outfit_area(mask, widen: float = 0.06):
+    """fxreal5 'top and trousers -> dress': the dress area plus everything below its hem to the bottom of
+    the picture (the legs), where the re-dresser draws trousers. Returns (whole, below-hem band)."""
+    return extend_down(mask, 1.0, widen)
 
 
 def outside_diff(inp, target, mask) -> float:
@@ -355,6 +379,11 @@ def main(argv=None) -> dict:
     ap.add_argument("--longer-ext", type=float, default=0.2, help="how far below the hem the longer garment may reach")
     ap.add_argument("--longer-min-change", type=float, default=0.06,
                     help="the band below the hem must change at least this much (0-1) or the sample stays a normal one")
+    ap.add_argument("--motion", help="data_tools.vivid_motion output (fxreal5): dress frames where the dress moves")
+    ap.add_argument("--dress-outfit-frac", type=float, default=0.0,
+                    help="fxreal5: share of motion clips whose INPUT is a top and trousers (the live case) instead of another dress")
+    ap.add_argument("--other-live-max", type=int, default=-1,
+                    help="cap on non-dress ViViD live stills (-1 = no cap); fxreal5 keeps dresses the bulk")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -369,7 +398,10 @@ def main(argv=None) -> dict:
     rows, files, stats = [], 0, {"viton_tried": 0, "viton_kept": 0, "viton_unchanged": 0, "nochange": 0,
                                  "vivid_live": 0, "vivid_no_mask": 0, "vivid_misaligned": 0, "test_pairs": 0,
                                  "pair_clips_tried": 0, "pair_clips_kept": 0, "photo_aug": 0,
-                                 "longer_tried": 0, "longer_kept": 0, "longer_pairs": 0}
+                                 "longer_tried": 0, "longer_kept": 0, "longer_pairs": 0,
+                                 "vivid_live_dress": 0, "vivid_live_other_capped": 0, "described": 0,
+                                 "motion_clips_tried": 0, "motion_pairs_kept": 0, "motion_singles_kept": 0,
+                                 "motion_outfit_kept": 0}
     used = set()
 
     def flush(final=False):
@@ -397,6 +429,9 @@ def main(argv=None) -> dict:
         if not mpath.exists():
             stats["vivid_no_mask"] += 1
             continue
+        if cat != "dress" and a.other_live_max >= 0 and stats["vivid_live"] - stats["vivid_live_dress"] >= a.other_live_max:
+            stats["vivid_live_other_capped"] += 1
+            continue
         mask = Image.open(mpath).convert("L")
         real = _cover(Image.open(t).convert("RGB"), *mask.size)
         live = _cover(Image.open(p).convert("RGB"), *mask.size)
@@ -404,9 +439,12 @@ def main(argv=None) -> dict:
         if outside_diff(live, real, soft) > a.max_outside_diff:
             stats["vivid_misaligned"] += 1
             continue
-        add(key, compact_prompt(cat), paste_back(live, real, soft), Image.open(g).convert("RGB"), real, soft)
+        desc = meta_description(p.parent)
+        stats["described"] += int(bool(desc))
+        add(key, caption_for(cat, desc), paste_back(live, real, soft), Image.open(g).convert("RGB"), real, soft)
         used.add("vivid")
         stats["vivid_live"] += 1
+        stats["vivid_live_dress"] += int(cat == "dress")
     print(json.dumps({"vivid_live": stats["vivid_live"]}), flush=True)
 
     # 2. VITON-HD: held-out eval pairs, then re-dressed training examples
@@ -514,15 +552,85 @@ def main(argv=None) -> dict:
             add(f"vivid_pair_{clip}_{tag}", compact_prompt(cat), inp, garment, real, soft, pair=clip, jitter=jf)
         used.add("vivid")
         stats["pair_clips_kept"] += 1
+        stats["pair_clips_kept_dress"] = stats.get("pair_clips_kept_dress", 0) + int(cat == "dress")
         stats["longer_pairs"] += int(longer)
     print(json.dumps({"pair_clips_kept": stats["pair_clips_kept"], "pair_clips_tried": stats["pair_clips_tried"]}),
           flush=True)
+
+    # 4. fxreal5: dress frames where the dress MOVES (data_tools.vivid_motion). The pair (a, b) is re-dressed
+    #    with the same garment and seed (pair term); singles add more poses of the same dress. A share of
+    #    clips get a top-and-trousers INPUT (the live case: someone in a T-shirt and trousers tries an abaya),
+    #    the rest another dress. The answer is always the real frame.
+    motion = list(motion_items(Path(a.motion))) if a.motion else []
+    dress_refs = [m[2] for m in motion]
+    for clip, cat, ref, desc, pair, singles in motion:
+        stats["motion_clips_tried"] += 1
+        outfit = a.dress_outfit_frac > 0 and rng.random() < a.dress_outfit_frac
+        if outfit:
+            other = bank(rng.choice(train_pool))
+        else:
+            others = [r for r in dress_refs if r != ref]
+            if not others:
+                continue
+            other = Image.open(rng.choice(others)).convert("RGB")
+        seed = a.seed * 100003 + 15485 + stats["motion_clips_tried"]
+        garment = Image.open(ref).convert("RGB")
+        caption = caption_for(cat, desc)
+
+        def make(tpath, mpath):
+            real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
+            mask = Image.open(mpath).convert("L").resize((gw, gh))
+            if outfit:
+                whole, band = outfit_area(mask)
+                gen = redress(real, other, seed=seed, prompt=OUTFIT_PROMPT)
+                soft = soft_mask(whole, grow=13)
+                inp = paste_back(gen, real, soft)
+                if band.getbbox() and not changed_enough(inp, real, band, a.longer_min_change):
+                    return None
+                area = whole
+            else:
+                gen = redress(real, other, seed=seed, category=cat)
+                soft = soft_mask(mask, grow=13)
+                inp = paste_back(gen, real, soft)
+                area = mask
+            bb = bbox_of(mask)
+            sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
+            if not bb or sim > a.max_sim or not changed_enough(inp, real, area):
+                return None
+            return inp, real, soft
+
+        built = [make(*f) for f in pair]
+        if all(built):
+            jf = jitter_factors(rng, a.photo_aug)
+            for tag, (inp, real, soft) in zip("ab", built):
+                add(f"vivid_motion_{clip}_{tag}", caption, inp, garment, real, soft, pair=f"m_{clip}", jitter=jf)
+            stats["motion_pairs_kept"] += 1
+            stats["motion_outfit_kept"] += int(outfit)
+            stats["described"] += 2 * int(bool(desc))
+        for k, f in enumerate(singles, 1):
+            got = make(*f)
+            if got:
+                add(f"vivid_motion_{clip}_s{k}", caption, *got)
+                stats["motion_singles_kept"] += 1
+                stats["described"] += int(bool(desc))
+        used.add("vivid")
+        if stats["motion_clips_tried"] % 50 == 0:
+            print(json.dumps({"motion_progress": stats["motion_clips_tried"], "pairs": stats["motion_pairs_kept"],
+                              "singles": stats["motion_singles_kept"]}), flush=True)
+    if motion:
+        print(json.dumps({k: stats[k] for k in ("motion_clips_tried", "motion_pairs_kept", "motion_singles_kept",
+                                                 "motion_outfit_kept")}), flush=True)
     flush(final=True)
 
     sel = selection_for(used)
     sel["owner_accepted_risk"] = "2026-11-08: research-licence real data accepted for R&D; contact rights holders before commercial use"
     (out / "selection.json").write_text(json.dumps(sel, indent=2) + "\n")
-    total = stats["vivid_live"] + stats["viton_kept"] + stats["nochange"] + 2 * stats["pair_clips_kept"]
+    total = (stats["vivid_live"] + stats["viton_kept"] + stats["nochange"] + 2 * stats["pair_clips_kept"]
+             + 2 * stats["motion_pairs_kept"] + stats["motion_singles_kept"])
+    dress_rows = (stats["vivid_live_dress"] + 2 * stats.get("pair_clips_kept_dress", 0)
+                  + 2 * stats["motion_pairs_kept"] + stats["motion_singles_kept"])
+    stats["dress_rows"] = dress_rows
+    stats["dress_share"] = round(dress_rows / total, 3) if total else 0.0
     summary = {"samples": total, "files": files, "size": [w, h], "dataset_name": str(out / "data"), **stats}
     (out / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)

@@ -175,25 +175,38 @@ def used_clip_ids(root: Path) -> tuple[set, set]:
     return ids, shas
 
 
-def pick_set(root: Path, name: str, n: int = 10, seed: int = 11) -> list[dict]:
-    """A new set of n held-out clips (tops, dresses, bottoms in turn), each with another held-out clip's
-    garment of the same type; descriptions are left for the owner (NAME_descriptions.json)."""
+def pick_set(root: Path, name: str, n: int = 10, seed: int = 11, categories=None, auto_describe: bool = False) -> list[dict]:
+    """A new set of n held-out clips (tops, dresses, bottoms in turn, or only `categories`), each with another
+    held-out clip's garment of the same type; descriptions are left for the owner (NAME_descriptions.json),
+    or with auto_describe taken from the garment clip's ViViD garment_description (fxreal5 dress set)."""
     from data_tools.fluxrt_prompt import compact_prompt
     ids, shas = used_clip_ids(root)
-    cats = tuple(("upper", "dress", "lower")[i % 3] for i in range(n))
+    order = tuple(categories) if categories else ("upper", "dress", "lower")
+    cats = tuple(order[i % len(order)] for i in range(n))
     picked = pick_new_clips(held_out_clips(root / "data/staging/vivid"), ids, shas, categories=cats, seed=seed)
     items = []
     for k, pair in enumerate(picked, 1):
         pname, pmeta, pdir = pair["person"]
         dname, dmeta, ddir = pair["donor"]
         cat = APP_CATEGORY.get(dmeta.get("category", "upper"), "tops")
-        items.append({"key": f"{k}_{name}_{pname}", "case": name, "video": str(pdir / "target.mp4"),
-                      "ref": str(ddir / "ref.jpg"), "category": cat, "name": None, "description": None,
-                      "garment_from": dname, "prompt": compact_prompt(cat, None, None), "needs_description": True})
+        desc = (dmeta.get("garment_description") or None) if auto_describe else None
+        item = {"key": f"{k}_{name}_{pname}", "case": name, "video": str(pdir / "target.mp4"),
+                "ref": str(ddir / "ref.jpg"), "category": cat, "name": None, "description": desc,
+                "garment_from": dname, "prompt": compact_prompt(cat, None, desc)}
+        if auto_describe:
+            item["description_by"] = "vivid" if desc else "none"
+        else:
+            item["needs_description"] = True
+        items.append(item)
     out = root / "eval/fxa"
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{name}.json").write_text(json.dumps(items, indent=2))
     tmpl = out / f"{name}_descriptions.json"
+    if auto_describe:
+        print(f"\n{len(items)} new clips (none used before), described from ViViD's garment text:\n")
+        for i, it in enumerate(items, 1):
+            print(f"[{i}] {it['category']:8s} {it['ref']}\n    PROMPT: {it['prompt']}")
+        return items
     if not tmpl.exists():
         tmpl.write_text(json.dumps({str(i): "" for i in range(1, len(items) + 1)}, indent=1))
     print(f"\n{len(items)} new clips (none used before). Look at each garment photo and describe it in {tmpl}:\n")
@@ -305,6 +318,8 @@ def main(argv=None):
         if name == "pick":
             p.add_argument("--n", type=int, default=10)
             p.add_argument("--seed", type=int, default=11)
+            p.add_argument("--categories", nargs="+", help="only these ViViD categories, in turn (e.g. dress)")
+            p.add_argument("--auto-describe", action="store_true", help="use ViViD's garment text; no owner step")
         if name == "video":
             p.add_argument("--panels", nargs="+", default=DEFAULT_PANELS, help="file name=label, in order")
             p.add_argument("--repeats", type=int, default=2)
@@ -317,7 +332,7 @@ def main(argv=None):
     if a.cmd == "reuse":
         return reuse_renders(root)
     if a.cmd == "pick":
-        return pick_set(root, a.set, a.n, a.seed)
+        return pick_set(root, a.set, a.n, a.seed, a.categories, a.auto_describe)
     if a.cmd == "apply":
         return apply_descriptions(root, a.set)
     return labelled_video(root, parse_panels(a.panels), a.repeats, a.cols, set_name=a.set, legend=not a.no_legend)
