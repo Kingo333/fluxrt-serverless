@@ -126,6 +126,28 @@ def test_clean_reference_only_for_on_model_photos():
     assert sg.clean_reference(rgb, tiny) is None
 
 
+def test_clean_reference_dress_drops_above_chin_and_others():
+    rgb = np.full((H, W, 3), 90, dtype=np.uint8)
+    cat = scene()                                   # face rows 4-11, hair 2-4, clothes 24-39
+    cat[0:2, 14:34] = sg.CLOTHES                    # a hijab top above the face
+    cat[16:24, 14:34] = sg.CLOTHES                  # the garment's neckline below the chin
+    cat[28:30, 20:28] = sg.OTHERS                   # a necklace on the chest
+    out = sg.clean_reference_dress(rgb, cat, feather_px=0)
+    assert tuple(out[0, 24]) == (255, 255, 255)     # hijab above the chin: gone
+    assert tuple(out[29, 24]) == (255, 255, 255)    # necklace: gone
+    assert tuple(out[20, 24]) == (90, 90, 90) and tuple(out[35, 24]) == (90, 90, 90)
+    general = sg.clean_reference(rgb, cat, feather_px=0)
+    assert tuple(general[0, 24]) == (90, 90, 90) and tuple(general[29, 24]) == (90, 90, 90)
+    flat = np.zeros((H, W), dtype=np.uint8)
+    flat[10:50, 10:40] = sg.CLOTHES
+    assert sg.clean_reference_dress(rgb, flat) is None
+    assert sg.is_dress_category("Dresses") and sg.is_dress_category("dress") and not sg.is_dress_category("tops")
+    assert sg.is_dress_category("abaya") and sg.is_dress_category("Abayas") and sg.is_dress_category("kaftan")
+    assert not sg.is_dress_category("modestwear")                     # could be a hijab: the app's type decides
+    assert sg.is_dress_category("modestwear", "dresses") and not sg.is_dress_category("modestwear", "accessories")
+    assert not sg.is_dress_category("dresses", "tops")                # the app's try-on type wins when sent
+
+
 def test_cache_mask_shoes_is_full_and_top_skips_static_background():
     frame = np.full((H, W, 3), 128, dtype=np.uint8)
     b = sg.CacheMaskBuilder(H, W, cell=16, dilate=0, refresh=1000)

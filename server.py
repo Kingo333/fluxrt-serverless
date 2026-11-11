@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 
 from livecam.pacing import FrameChangeDetector
-from livecam.segment import face_paste_available
+from livecam.segment import face_paste_available, is_dress_category
 from livecam.session import LiveSession
 from session_token import SessionClock, SessionToken, parse_and_verify
 
@@ -147,6 +147,11 @@ COMPOSITE_OUT_SEG_EVERY = max(1, _env_num("FLUXRT_COMPOSITE_OUT_SEG_EVERY", 1, i
 SEG_MODEL = os.getenv("FLUXRT_SEG_MODEL", "/opt/models/selfie_multiclass_256x256.tflite")
 # F1d: cut the garment out of on-model product photos before it goes to FluxRT.
 REF_CLEAN = _env_bool("FLUXRT_REF_CLEAN")
+# Dresses (abayas, kaftans, gowns) are cleaned harder: clothes only, nothing above the chin, so a hijab,
+# scarf or necklace on the product photo is not drawn on the shopper. Only the garment PHOTO is cleaned,
+# never the camera frames. On by default with FLUXRT_REF_CLEAN; FLUXRT_REF_CLEAN_DRESS=1 also turns it on
+# by itself (dress photos cleaned, every other photo used as sent); =0 keeps the general rule for dresses.
+REF_CLEAN_DRESS = _env_bool("FLUXRT_REF_CLEAN_DRESS", "true" if REF_CLEAN else "false")
 # F2a: FluxRT spatial-cache mask from the segmentation ("seg") instead of its own motion rule ("auto").
 CACHE_MASK = os.getenv("FLUXRT_CACHE_MASK", "auto").strip().lower() or "auto"
 if CACHE_MASK not in ("auto", "seg"):
@@ -180,7 +185,7 @@ except ValueError:
     MU_OVERRIDE = None
 # F2d: ask the app for frames at model size x scale (sharp real pixels for the composite).
 INPUT_SCALE = max(1, _env_num("FLUXRT_INPUT_SCALE", 1, int))
-SEG_NEEDED = COMPOSITE or REF_CLEAN or FACE_PASTE or CACHE_MASK == "seg"
+SEG_NEEDED = COMPOSITE or REF_CLEAN or REF_CLEAN_DRESS or FACE_PASTE or CACHE_MASK == "seg"
 DEFAULT_PROMPT = os.getenv("DEFAULT_PROMPT", "Transform this live camera frame into a realistic fashion try-on preview.")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "900"))
 
@@ -252,7 +257,15 @@ def b64_to_bgr(b64_str: str) -> np.ndarray:
     return arr[:, :, ::-1].copy()
 
 
-def b64_to_reference_rgb(b64_str: str, segmenter=None) -> np.ndarray:
+def decode_reference(b64_str: str) -> Image.Image:
+    return Image.open(io.BytesIO(base64.b64decode(_strip_data_url(b64_str)))).convert("RGB")
+
+
+def b64_to_reference_rgb(b64_str: str, segmenter=None, dress: bool = False) -> np.ndarray:
+    return reference_array(decode_reference(b64_str), segmenter, dress)
+
+
+def reference_array(img: Image.Image, segmenter=None, dress: bool = False) -> np.ndarray:
     """Garment image for FluxRT's set_reference_image.
 
     FluxRT wants RGB here (camera frames are BGR). The image is padded with
@@ -262,15 +275,22 @@ def b64_to_reference_rgb(b64_str: str, segmenter=None) -> np.ndarray:
     FLUXRT_REF_CLEAN=1 (with a segmenter): an on-model product photo is cut
     down to the garment on white first, so FluxRT never sees a second person.
     Flat-lay photos and tiny garments are left untouched (livecam.segment.clean_reference).
+    dress=True (a dress or abaya, with FLUXRT_REF_CLEAN_DRESS, which also works without FLUXRT_REF_CLEAN):
+    clothes only, nothing above the chin (livecam.segment.clean_reference_dress), so no hijab, scarf or
+    jewellery from the photo. If that rule does not apply (no person on the photo), the general rule runs
+    when FLUXRT_REF_CLEAN is on, else the photo is used as sent.
     """
-    raw = base64.b64decode(_strip_data_url(b64_str))
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    if REF_CLEAN and segmenter is not None:
-        from livecam.segment import clean_reference
+    want_dress = dress and REF_CLEAN_DRESS
+    if (REF_CLEAN or want_dress) and segmenter is not None:
+        from livecam.segment import clean_reference, clean_reference_dress
         try:
             arr = np.asarray(img)
-            cleaned = clean_reference(arr, segmenter(arr))
+            cat = segmenter(arr)
+            cleaned = clean_reference_dress(arr, cat) if want_dress else None
             if cleaned is not None:
+                img = Image.fromarray(cleaned)
+                log.info("reference cleaned for a dress: clothes only, nothing above the chin")
+            elif REF_CLEAN and (cleaned := clean_reference(arr, cat)) is not None:
                 img = Image.fromarray(cleaned)
                 log.info("reference cleaned: garment cut out of an on-model photo")
             else:
@@ -560,6 +580,7 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "output_poll_hz": OUTPUT_POLL_HZ if OUTPUT_PACING else None,
         "composite": COMPOSITE and segmenter_loaded,
         "ref_clean": REF_CLEAN and segmenter_loaded,
+        "ref_clean_dress": REF_CLEAN_DRESS and segmenter_loaded,
         "cache_mask": CACHE_MASK if (CACHE_MASK == "auto" or segmenter_loaded) else "auto",
         "anchor": ANCHOR,
         "anchor_refresh_s": ANCHOR_REFRESH_S if ANCHOR else None,
@@ -730,7 +751,8 @@ async def api_predict(
 
         if isinstance(ref_b64, str) and ref_b64:
             try:
-                ref = b64_to_reference_rgb(ref_b64, STATE.get("segmenter"))
+                dress = REF_CLEAN_DRESS and is_dress_category(payload.get("category"), payload.get("garment_type"))
+                ref = b64_to_reference_rgb(ref_b64, STATE.get("segmenter"), dress=dress)
                 proc.set_reference_image(ref)
             except Exception as e:
                 log.warning("set_reference_image failed: %s", e)
@@ -842,9 +864,20 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     # Pacing: the poller publishes only once a camera frame has been fed, so the app never
     # sees FluxRT's initial (black / warm-up) output.
     inputs_written: int = 0
+    # The garment photo as sent, and whether it was cleaned with the dress rule. The app sends
+    # the photo before set_prompt names its category, so a dress is re-cleaned at set_prompt; a photo
+    # sent again without a new set_prompt (the app skips a repeated prompt) keeps the current category,
+    # and a set_reference_image that carries its own category uses that.
+    ref_raw: Optional[Image.Image] = None
+    ref_dress = False
+    ref_category: Optional[str] = None
+    ref_type: Optional[str] = None  # the app's try-on type ("dresses" for an abaya filed as "modestwear")
+
+    def dress_rule() -> bool:
+        return REF_CLEAN_DRESS and segmenter is not None and is_dress_category(ref_category, ref_type)
 
     async def receiver():
-        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count
+        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count, ref_raw, ref_dress, ref_category, ref_type
         try:
             while not stop_event.is_set():
                 raw = await websocket.receive_text()
@@ -860,7 +893,16 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     try:
                         # The app also sends the item's category (tops, shoes, ...); the
                         # composite and cache-mask rules depend on it.
-                        live.set_category(data.get("category"))
+                        category = data.get("category")
+                        live.set_category(category)
+                        ref_category, ref_type = category, data.get("garment_type")
+                        want_dress = dress_rule()
+                        if ref_raw is not None and want_dress != ref_dress:
+                            try:
+                                proc.set_reference_image(reference_array(ref_raw, segmenter, dress=want_dress))
+                                ref_dress = want_dress
+                            except Exception as e:  # noqa: BLE001 - never block a garment on the cleaner
+                                log.warning("dress re-clean skipped: %s", e)
                         proc.set_prompt(str(data.get("prompt", "")))
                         live.garment_changed()
                         await websocket.send_json({"type": "ack", "name": "set_prompt"})
@@ -876,8 +918,11 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
 
                 elif msg_type == "set_reference_image":
                     try:
-                        ref = b64_to_reference_rgb(data["image_b64"], segmenter)
-                        proc.set_reference_image(ref)
+                        ref_raw = decode_reference(data["image_b64"])
+                        if data.get("category") or data.get("garment_type"):
+                            ref_category, ref_type = data.get("category"), data.get("garment_type")
+                        ref_dress = dress_rule()
+                        proc.set_reference_image(reference_array(ref_raw, segmenter, dress=ref_dress))
                         live.garment_changed()
                         await websocket.send_json({"type": "ack", "name": "set_reference_image"})
                     except Exception as e:

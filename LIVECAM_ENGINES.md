@@ -3,6 +3,12 @@
 One image, `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>`, holds both engines.
 The `LIVECAM_ENGINE` environment variable picks which one a worker runs.
 
+**Thin builds.** When only FluxRT app files changed (`server.py`, `bootstrap.py`, `session_token.py`,
+`livecam/`), run the `build-livecam-dual` workflow on the branch with `base_commit` = the commit of an existing
+image (e.g. the live one). The new `livecam-dual-v1-<sha>` is that image plus the app files
+(`Dockerfile.livecam-patch`): no apt, PPA or pip step, every package unchanged, a few minutes instead of ~25.
+The workflow refuses if anything else that goes into the image changed; main always gets a full build.
+
 | | FluxRT (Standard, default) | JoyAI-Video-Edit (Premium HD) |
 |---|---|---|
 | `LIVECAM_ENGINE` | `fluxrt` (or unset) | `joyai` |
@@ -56,6 +62,7 @@ workers restart (minutes, no code change). `/ping` shows what they resolved to u
 | `FLUXRT_OUTPUT_PACING` | `false` | `1` | Reads FluxRT's output on its own clock (`FLUXRT_OUTPUT_POLL_HZ`, default 30) so its x4 interpolated frames reach the app, instead of only when a camera frame arrives. Adds `playback_buffer`/`playback_fps` to the `ready` hints so the app enables its jitter buffer. Both sender modes consume the frames unchanged. | unset |
 | `FLUXRT_COMPOSITE` | `false` | `1` | Keeps the camera frame's face, hair and background and takes only the clothing from FluxRT (MediaPipe multiclass selfie segmenter, baked into the image). Rules by the item's category from the app: garments keep face/hair/background minus the new clothing (no face in view: background only); shoes keep face/hair only; bags face only; accessories, unknown category, no person or a failed segmentation = pass-through. `FLUXRT_COMPOSITE_FEATHER` (3 px edge), `FLUXRT_COMPOSITE_LAG_MS` (unset = one processing time), `FLUXRT_COMPOSITE_OUT_SEG_EVERY` (1). | unset |
 | `FLUXRT_REF_CLEAN` | `false` | `1` | Cuts the garment out of an on-model product photo (keeps it on white) before FluxRT sees it. Flat-lay photos, photos without a person and garments under 5% of the photo are left untouched. | unset |
+| `FLUXRT_REF_CLEAN_DRESS` | same as `FLUXRT_REF_CLEAN` | `1` turns it on by itself (only dress photos are cleaned; every other photo is used as sent); `0` turns it off | Dresses (the app's `dresses`: abayas, kaftans, gowns) are cleaned harder: clothes only and nothing above the chin, so a hijab, scarf or necklace on the product photo is not drawn on the shopper. Only the garment photo is changed, never the camera frames, so the shopper's own hijab is not touched. The app sends the photo before `set_prompt` names the category, so the photo is re-cleaned when a dress's `set_prompt` arrives; a photo sent again for the same item keeps the current category. A dress is the app's `garment_type` `dresses` when the app sends it (an abaya filed as "modestwear" included), else a stored category of dress/dresses or with a dress word (abaya, kaftan, gown, jalabiya, jumpsuit). | `0` |
 | `FLUXRT_CACHE_MASK` | `auto` | `seg` | Drives FluxRT's spatial cache from the segmentation: the person/garment and anything that moved are recomputed every frame, static background cells reuse the cache; everything is recomputed on the first frame, every `FLUXRT_CACHE_MASK_REFRESH` (48) frames, after a prompt/garment change, and always for shoes/bags/accessories/unknown categories (identical to today for them). `FLUXRT_CACHE_MASK_DILATE` (2 cells). | `auto` |
 | `FLUXRT_ANCHOR` | `false` | `1` | `FLUXRT_ANCHOR_DELAY_S` (1.5) after a garment is set, keeps one generated frame and passes it as a third reference every frame, so the garment rendering stays consistent (needs the FluxRT patch in this image; about 20-30% more per frame). Cleared on every garment swap. | unset |
 | `FLUXRT_ANCHOR_REFRESH_S` | `0` | e.g. `4` | With `FLUXRT_ANCHOR=1`: replaces the anchor with the latest generated frame every N seconds (minimum 2), so the outfit stays steady but follows new poses. Never refreshes on a frame with nobody in it (looks again a second later). Each refresh recomputes one whole frame. `0` = one anchor per garment, as before. | unset |

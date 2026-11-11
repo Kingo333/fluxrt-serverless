@@ -19,7 +19,7 @@ SWITCHES = ("FLUXRT_OUTPUT_PACING", "FLUXRT_OUTPUT_POLL_HZ", "FLUXRT_COMPOSITE",
             "FLUXRT_CACHE_MASK", "FLUXRT_ANCHOR", "FLUXRT_MU", "FLUXRT_ANCHOR_REFRESH_S", "FLUXRT_FACE_PASTE",
             "FLUXRT_FACE_PASTE_FEATHER", "FLUXRT_FACE_PASTE_SHRINK", "FLUXRT_FACE_PASTE_MIN_OVERLAP", "FLUXRT_INPUT_SCALE", "FLUXRT_SEG_MODEL",
             "ENABLE_PLAYBACK_SCHEDULER", "PLAYBACK_TARGET_FPS", "REPEAT_LAST_FRAME_WHEN_IDLE",
-            "FLUXRT_WIDTH", "FLUXRT_HEIGHT", "FLUXRT_CLIENT_HINTS", "FLUXRT_LORA_PATH")
+            "FLUXRT_WIDTH", "FLUXRT_HEIGHT", "FLUXRT_CLIENT_HINTS", "FLUXRT_LORA_PATH", "FLUXRT_REF_CLEAN_DRESS")
 
 
 def load(monkeypatch, **env):
@@ -42,7 +42,7 @@ def test_defaults_are_all_off(monkeypatch):
     assert s.CACHE_MASK == "auto" and s.MU_OVERRIDE is None and s.INPUT_SCALE == 1 and not s.SEG_NEEDED
     sw = s.live_switches(False)
     assert sw == {"output_pacing": False, "output_poll_hz": None, "composite": False, "ref_clean": False,
-                  "cache_mask": "auto", "anchor": False, "anchor_refresh_s": None, "face_paste": False, "mu": None,
+                  "ref_clean_dress": False, "cache_mask": "auto", "anchor": False, "anchor_refresh_s": None, "face_paste": False, "mu": None,
                   "input_scale": 1, "segmenter_loaded": False}
 
 
@@ -118,6 +118,106 @@ def test_reference_clean_needs_switch_and_segmenter(monkeypatch):
     assert (arr[20, 192] == 255).all() and arr[400, 192][0] > 190    # face cut to white, garment kept
     arr = s.b64_to_reference_rgb(png_b64(384, 512, (200, 0, 0)), None)
     assert arr[20, 192][0] > 190                                     # no segmenter: untouched
+
+
+def _abaya_seg(rgb):
+    """An on-model abaya photo: hijab top above the chin, face, a necklace, the abaya below."""
+    from livecam import segment as sg
+    cat = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    h = rgb.shape[0]
+    cat[: h // 8, :] = sg.CLOTHES                                   # hijab over the head
+    cat[h // 8: h // 4, :] = sg.FACE
+    cat[h // 4:, :] = sg.CLOTHES                                    # the abaya
+    cat[h // 4 + 10: h // 4 + 30, :] = sg.OTHERS                    # a necklace on the chest
+    return cat
+
+
+def test_dress_reference_drops_hijab_top_and_jewellery(monkeypatch):
+    s = load(monkeypatch, FLUXRT_REF_CLEAN="1")
+    assert s.REF_CLEAN_DRESS and s.live_switches(True)["ref_clean_dress"] is True
+    b64 = png_b64(384, 512, (90, 40, 20))
+    general = s.b64_to_reference_rgb(b64, _abaya_seg)
+    dress = s.b64_to_reference_rgb(b64, _abaya_seg, dress=True)
+    assert general[30, 192][0] < 200 and general[150, 192][0] < 200    # general rule keeps hijab and necklace
+    assert (dress[30, 192] == 255).all() and (dress[150, 192] == 255).all()
+    assert dress[400, 192][0] < 200                                     # the abaya itself is kept
+    s = load(monkeypatch, FLUXRT_REF_CLEAN="1", FLUXRT_REF_CLEAN_DRESS="0")
+    assert not s.REF_CLEAN_DRESS
+    assert s.b64_to_reference_rgb(b64, _abaya_seg, dress=True)[30, 192][0] < 200
+    s = load(monkeypatch)                                              # cleaner off: nothing changes
+    assert not s.REF_CLEAN_DRESS
+
+
+def test_dress_category_recleans_the_reference_at_set_prompt(monkeypatch):
+    """The app sends the photo first and the category with set_prompt: a dress is re-cleaned then."""
+    from fastapi.testclient import TestClient
+    s = load(monkeypatch, FLUXRT_REF_CLEAN="1", FLUXRT_WIDTH="16", FLUXRT_HEIGHT="16")
+    proc = FakeProc()
+    calls = []
+    real = s.reference_array
+    monkeypatch.setattr(s, "reference_array", lambda img, seg=None, dress=False: calls.append(dress) or real(img, seg, dress))
+    s.STATE.update(status="ready", processor=proc, crop_fn=lambda f, h, w: f, segmenter=_abaya_seg)
+    monkeypatch.setattr(s, "start_warmup_background", lambda: None)
+    with TestClient(s.app).websocket_connect(f"/ws?token={token()}") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "set_reference_image", "image_b64": png_b64(384, 512, (90, 40, 20))})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_prompt", "prompt": "abaya", "category": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+        ws.send_json({"type": "set_prompt", "prompt": "abaya again", "category": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+        ws.send_json({"type": "set_prompt", "prompt": "a top", "category": "tops"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+    assert calls == [False, True, False]          # general, dress once, back to general for a top
+    assert len(proc.refs) == 3
+    time.sleep(0.2)
+
+
+def test_dress_cleaner_works_without_the_general_cleaner(monkeypatch):
+    """Owner's favourite profile keeps FLUXRT_REF_CLEAN off: FLUXRT_REF_CLEAN_DRESS=1 alone cleans only dress
+    photos; every other photo goes to FluxRT as sent."""
+    s = load(monkeypatch, FLUXRT_REF_CLEAN_DRESS="1")
+    assert s.REF_CLEAN_DRESS and not s.REF_CLEAN and s.SEG_NEEDED
+    sw = s.live_switches(True)
+    assert sw["ref_clean_dress"] is True and sw["ref_clean"] is False
+    b64 = png_b64(384, 512, (90, 40, 20))
+    dress = s.b64_to_reference_rgb(b64, _abaya_seg, dress=True)
+    assert (dress[30, 192] == 255).all() and (dress[150, 192] == 255).all() and dress[400, 192][0] < 200
+    other = s.b64_to_reference_rgb(b64, _abaya_seg)
+    assert other[30, 192][0] < 200 and other[150, 192][0] < 200       # not a dress: used as sent
+    s = load(monkeypatch)
+    assert not s.REF_CLEAN_DRESS and not s.SEG_NEEDED                 # default: nothing new switched on
+
+
+def test_dress_photo_sent_again_keeps_the_current_category(monkeypatch):
+    """The app skips a repeated set_prompt, so a photo sent again for the same abaya is still cleaned as a
+    dress; a set_reference_image that names its own category uses it."""
+    from fastapi.testclient import TestClient
+    s = load(monkeypatch, FLUXRT_REF_CLEAN_DRESS="1", FLUXRT_WIDTH="16", FLUXRT_HEIGHT="16")
+    proc = FakeProc()
+    calls = []
+    real = s.reference_array
+    monkeypatch.setattr(s, "reference_array", lambda img, seg=None, dress=False: calls.append(dress) or real(img, seg, dress))
+    s.STATE.update(status="ready", processor=proc, crop_fn=lambda f, h, w: f, segmenter=_abaya_seg)
+    monkeypatch.setattr(s, "start_warmup_background", lambda: None)
+    photo = png_b64(384, 512, (90, 40, 20))
+    with TestClient(s.app).websocket_connect(f"/ws?token={token()}") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "set_reference_image", "image_b64": photo})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_prompt", "prompt": "abaya", "category": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+        ws.send_json({"type": "set_reference_image", "image_b64": photo})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_reference_image", "image_b64": photo, "category": "tops"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        # an abaya filed as "modestwear": the app's try-on type says dress; a hijab filed the same way does not
+        ws.send_json({"type": "set_reference_image", "image_b64": photo, "category": "modestwear", "garment_type": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_prompt", "prompt": "hijab", "category": "modestwear", "garment_type": "accessories"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+    assert calls == [False, True, True, False, True, False]
+    time.sleep(0.2)
 
 
 def test_anchor_patch_applies_to_pinned_fluxrt(tmp_path):
