@@ -3,6 +3,12 @@
 One image, `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>`, holds both engines.
 The `LIVECAM_ENGINE` environment variable picks which one a worker runs.
 
+**Thin builds.** When only FluxRT app files changed (`server.py`, `bootstrap.py`, `session_token.py`,
+`livecam/`), run the `build-livecam-dual` workflow on the branch with `base_commit` = the commit of an existing
+image (e.g. the live one). The new `livecam-dual-v1-<sha>` is that image plus the app files
+(`Dockerfile.livecam-patch`): no apt, PPA or pip step, every package unchanged, a few minutes instead of ~25.
+The workflow refuses if anything else that goes into the image changed; main always gets a full build.
+
 | | FluxRT (Standard, default) | JoyAI-Video-Edit (Premium HD) |
 |---|---|---|
 | `LIVECAM_ENGINE` | `fluxrt` (or unset) | `joyai` |

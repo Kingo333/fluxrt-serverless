@@ -17,6 +17,14 @@ on:
       - fluxrt/patches/**
       - .github/workflows/build-livecam-dual.yml
   workflow_dispatch:
+    inputs:
+      base_commit:
+        description: >-
+          Thin build: the full commit of an existing livecam-dual-v1-<commit> image (e.g. the live one).
+          The new image is that image plus this branch's FluxRT app files, nothing reinstalled.
+          Leave empty for a full build.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -34,6 +42,29 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # A thin build compares this commit with the base image's commit, so it needs the history.
+          fetch-depth: ${{ inputs.base_commit && '0' || '1' }}
+
+      # Thin build (2026-11-11): a full rebuild re-runs apt, the deadsnakes PPA and pip with no cache, so an
+      # outside outage stops it (Launchpad's API timed out all afternoon on 2026-11-11) and every package is
+      # whatever is newest that day. A thin build keeps every package of the base image and only swaps the
+      # FluxRT app files, so it is only allowed when nothing else that goes into the image has changed.
+      - name: Thin build - check only the FluxRT app files changed
+        if: ${{ inputs.base_commit }}
+        run: |
+          set -euo pipefail
+          BASE="${{ inputs.base_commit }}"
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::base_commit must be a full 40-character commit"; exit 1; }
+          [ "${{ github.ref }}" != "refs/heads/main" ] || { echo "::error::main always gets a full build"; exit 1; }
+          git cat-file -e "$BASE^{commit}" || { echo "::error::$BASE is not in this repository's history"; exit 1; }
+          echo "Changed since $BASE:"
+          git diff --name-only "$BASE" HEAD | sed 's/^/  /'
+          OTHER=$(git diff --name-only "$BASE" HEAD | grep -vE '^(server\.py|bootstrap\.py|session_token\.py|livecam/.+|tests/.+|training/.+|docs/.+|[^/]+\.md|\.github/.+|Dockerfile\.livecam-patch)$' || true)
+          if [ -n "$OTHER" ]; then
+            echo "::error::A thin build only swaps the FluxRT app files, but these changed too; run a full build: $(echo $OTHER)"
+            exit 1
+          fi
 
       - name: Free disk space on runner
         run: |
@@ -71,6 +102,7 @@ jobs:
           echo "Image tag for this build: $SHA_TAG"
 
       - name: Build and push dual-engine image
+        if: ${{ !inputs.base_commit }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -87,3 +119,18 @@ jobs:
             MAX_JOBS=2
             EXT_PARALLEL=1
             NVCC_THREADS=1
+
+      - name: Build and push thin image (base image + FluxRT app files)
+        if: ${{ inputs.base_commit }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.livecam-patch
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          no-cache: true
+          build-args: |
+            BASE_IMAGE=ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-${{ inputs.base_commit }}
+          labels: |
+            org.opencontainers.image.base.name=ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-${{ inputs.base_commit }}

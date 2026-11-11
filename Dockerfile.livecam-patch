@@ -1,0 +1,19 @@
+# Thin build: an existing dual-engine image (BASE_IMAGE, e.g. the live livecam-dual-v1-<commit>) plus this
+# branch's FluxRT app files. Nothing is reinstalled: every system and Python package stays exactly as in the
+# base image, so an app change ships, and is judged, on its own.
+#
+# Built by .github/workflows/build-livecam-dual.yml when it is dispatched with base_commit; the workflow first
+# checks that nothing but these app files (plus docs, tests and CI) changed since that commit. Anything else
+# (Dockerfile.livecam, fluxrt/patches, joyai, requirements) needs a full build from Dockerfile.livecam.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# livecam/ is replaced as a whole, so a file deleted on the branch is gone from the image too.
+RUN rm -rf /app/livecam
+COPY server.py bootstrap.py session_token.py /app/
+COPY livecam /app/livecam
+
+# The same import check as the full build's FluxRT side.
+RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py /app/livecam/*.py \
+    && cd /app && SESSION_SIGNING_SECRET=build-check /usr/bin/python3.12 -c "import server; print('fluxrt server import ok')"
+# ENV, WORKDIR and CMD stay as in the base image.
