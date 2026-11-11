@@ -173,6 +173,48 @@ def test_dress_category_recleans_the_reference_at_set_prompt(monkeypatch):
     time.sleep(0.2)
 
 
+def test_dress_cleaner_works_without_the_general_cleaner(monkeypatch):
+    """Owner's favourite profile keeps FLUXRT_REF_CLEAN off: FLUXRT_REF_CLEAN_DRESS=1 alone cleans only dress
+    photos; every other photo goes to FluxRT as sent."""
+    s = load(monkeypatch, FLUXRT_REF_CLEAN_DRESS="1")
+    assert s.REF_CLEAN_DRESS and not s.REF_CLEAN and s.SEG_NEEDED
+    sw = s.live_switches(True)
+    assert sw["ref_clean_dress"] is True and sw["ref_clean"] is False
+    b64 = png_b64(384, 512, (90, 40, 20))
+    dress = s.b64_to_reference_rgb(b64, _abaya_seg, dress=True)
+    assert (dress[30, 192] == 255).all() and (dress[150, 192] == 255).all() and dress[400, 192][0] < 200
+    other = s.b64_to_reference_rgb(b64, _abaya_seg)
+    assert other[30, 192][0] < 200 and other[150, 192][0] < 200       # not a dress: used as sent
+    s = load(monkeypatch)
+    assert not s.REF_CLEAN_DRESS and not s.SEG_NEEDED                 # default: nothing new switched on
+
+
+def test_dress_photo_sent_again_keeps_the_current_category(monkeypatch):
+    """The app skips a repeated set_prompt, so a photo sent again for the same abaya is still cleaned as a
+    dress; a set_reference_image that names its own category uses it."""
+    from fastapi.testclient import TestClient
+    s = load(monkeypatch, FLUXRT_REF_CLEAN_DRESS="1", FLUXRT_WIDTH="16", FLUXRT_HEIGHT="16")
+    proc = FakeProc()
+    calls = []
+    real = s.reference_array
+    monkeypatch.setattr(s, "reference_array", lambda img, seg=None, dress=False: calls.append(dress) or real(img, seg, dress))
+    s.STATE.update(status="ready", processor=proc, crop_fn=lambda f, h, w: f, segmenter=_abaya_seg)
+    monkeypatch.setattr(s, "start_warmup_background", lambda: None)
+    photo = png_b64(384, 512, (90, 40, 20))
+    with TestClient(s.app).websocket_connect(f"/ws?token={token()}") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "set_reference_image", "image_b64": photo})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_prompt", "prompt": "abaya", "category": "dresses"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_prompt"}
+        ws.send_json({"type": "set_reference_image", "image_b64": photo})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+        ws.send_json({"type": "set_reference_image", "image_b64": photo, "category": "tops"})
+        assert ws.receive_json() == {"type": "ack", "name": "set_reference_image"}
+    assert calls == [False, True, True, False]
+    time.sleep(0.2)
+
+
 def test_anchor_patch_applies_to_pinned_fluxrt(tmp_path):
     patch_file = Path(__file__).resolve().parents[1] / "fluxrt" / "patches" / "fluxrt-anchor-reference.patch"
     text = patch_file.read_text()
