@@ -25,7 +25,8 @@ CATEGORY_CLAUSES = {'tops': 'Replace only the upper-body clothing with the exact
             'length, neckline, waist shape, silhouette, color, fabric appearance, print, pattern, logo, '
             'embroidery, and visible design details. Preserve the exact visible sleeve style and sleeve '
             'length from the reference image. Do not shorten the dress. Do not remove or add sleeves. Do not '
-            'turn the dress into a top and skirt.',
+            'turn the dress into a top and skirt. Preserve the person\'s own hijab or head covering exactly '
+            'as it appears in the camera frame.',
  'outerwear': "Apply the exact outerwear from the reference image over the person's existing outfit. "
               'Preserve the clothing underneath where visible. Preserve the outerwear length, collar, '
               'opening, buttons, zipper, color, fabric appearance, pattern, silhouette, and visible sleeve '
@@ -166,6 +167,10 @@ COMPACT_PLACEMENT = {
     "bags": "The person carries it naturally; the outfit stays as it is",
     "accessories": "The person wears it naturally; the outfit stays as it is",
 }
+# What stays. For a dress or abaya the shopper's own hijab or head covering is named too (owner, 2026-11-11;
+# azyah-shopping #29), so fxreal5 trains with the wording live FluxRT gets.
+COMPACT_KEEP = "Keep the person's face, hair, body, pose and the background unchanged."
+COMPACT_KEEP_DRESS = "Keep the person's face, hair, hijab or head covering, body, pose and the background unchanged."
 COMPACT_SLEEVES = {
     "sleeveless": ", and keep it sleeveless",
     "short_sleeve": ", with short sleeves",
@@ -198,5 +203,5 @@ def compact_prompt(category=None, name=None, description=None, hint=None) -> str
         parts.append(f"{COMPACT_PLACEMENT[cat]}.")
     sleeves = COMPACT_SLEEVES[infer_sleeve_length(category, name, description, hint)] if cat in SLEEVE_CATEGORIES else ""
     parts.append(f"Keep its exact colour, print, pattern, logo, fabric and fit{sleeves}.")
-    parts.append("Keep the person's face, hair, body, pose and the background unchanged.")
+    parts.append(COMPACT_KEEP_DRESS if cat == "dresses" else COMPACT_KEEP)
     return " ".join(parts)

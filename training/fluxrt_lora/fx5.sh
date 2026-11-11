@@ -10,9 +10,13 @@
 #     T-shirt-and-trousers INPUT, the live case) and then fills tops and bottoms to 43% (ViViD stills, fxreal3's
 #     pairs, VITON-HD incl. fxreal4's longer-to-shorter tops); captions carry ViViD's garment description
 #   - rank 64 (= favourite #2), learning rate halved (5e-5), 1,500 steps, saves every 250
-#   - garment photo size AZ_REF_SIZE: the live FLUXRT_REF_WIDTH x HEIGHT (384x512 today; 576x768 if Option A won)
+#   - garment photo size AZ_REF_SIZE: the live FLUXRT_REF_WIDTH x HEIGHT. Favourite #2 was trained and served at
+#     288x512; Option A (Release #52, 2026-11-11) serves 576x768. Train at 576x768 only if the owner keeps it.
+#   - the live dress prompt names the shopper's own hijab or head covering (data_tools.fluxrt_prompt, = the app)
 # Then renders on 10 NEW held-out dress clips (dress10, auto-described), the owner's Step B set (set2, his own
-# descriptions; two long black maxi dresses) and his 5 cases (regression): original / favourite #2 / fxreal5
+# descriptions; two long black maxi dresses), his 5 cases (regression) and the HIJAB set (hijab-wearing people
+# trying on a dress: own clips from eval/own_clips plus checked free stock clips, eval.hijab_set; her hijab
+# must stay, measured by the gate's head / head_lost numbers): original / favourite #2 / fxreal5
 # (final and step 1000) at the same garment size, the face/skin/background gate, the steadiness table, the
 # five-priority garment report (colour, detail, fabric, movement, consistency: eval.garment_report) and one
 # LABELLED video per set: garment | camera | favourite #2 (today) | fxreal5.
@@ -20,13 +24,14 @@
 # Never touches the live endpoint or the azyah-joyai volume. About 2-3 h on an RTX PRO 6000 ($2.49/h): about $6-8, cap $12.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx5.sh -o /workspace/fx5.sh
-#   AZ_REF=<SHA> AZ_REF_SIZE=384x512 AZ_NO_STOP=1 nohup bash /workspace/fx5.sh > /workspace/fx5.log 2>&1 &
+#   AZ_REF=<SHA> AZ_REF_SIZE=576x768 AZ_NO_STOP=1 nohup bash /workspace/fx5.sh > /workspace/fx5.log 2>&1 &
+#   (AZ_REF_SIZE=288x512 if the owner goes back to the old garment photo size)
 set -uo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
 export AZ_REF AZ_ROOT=/workspace/azyah-vton
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 EXP="${AZ_EXP:-fxreal5}"
-REF_SIZE="${AZ_REF_SIZE:-384x512}"
+REF_SIZE="${AZ_REF_SIZE:-288x512}"
 case "$REF_SIZE" in *x*) ;; *) echo "BAD_AZ_REF_SIZE: $REF_SIZE (e.g. 384x512 or 576x768)"; exit 1 ;; esac
 TAG="r${REF_SIZE%%x*}"
 GUARD=/workspace/fx5_started
@@ -122,8 +127,13 @@ echo "== 6. eval sets: 10 new held-out dress clips (auto-described), the owner's
 [ -f "$E/dress10.json" ] || ( cd "$T" && "$PY" -m eval.step_a pick "$AZ_ROOT" --set dress10 --n 10 --categories dress --auto-describe ) \
   || echo "PICK_EXIT=$?"
 [ -f "$E/cases5.json" ] || cp "$E2/cases5/clip_list.json" "$E/cases5.json" 2>/dev/null || echo "(no cases5 clip list)"
+echo "== 6b. hijab set: hijab-wearing people trying on a dress; her own hijab must stay ($(mins))"
+[ -s "$E/hijab.json" ] && [ "$(cat "$E/hijab.json")" != "[]" ] || ( cd "$T" && "$MP" -m eval.hijab_set "$AZ_ROOT" \
+    --out "$E/hijab.json" --own "$AZ_ROOT/eval/own_clips" --clips-dir "$AZ_ROOT/eval/hijab_clips" \
+    --refs-from "$E/set2.json" "$E/dress10.json" --n "${AZ_HIJAB_N:-3}" --model "$SEG" ) 2>&1 | grep -E "HIJAB_CLIPS|NO_HIJAB_CLIP|download failed|only .* of the best window" || echo "HIJAB_SET_EXIT=$?"
+[ "$(cat "$E/hijab.json" 2>/dev/null)" = "[]" ] && rm -f "$E/hijab.json"
 SETS=""
-for s in dress10 set2 cases5; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
+for s in dress10 set2 cases5 hijab; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
 echo "sets:$SETS"
 
 echo "== 7. renders at garment size $REF_SIZE: original, favourite #2, fxreal5 (final, step 1000) ($(mins))"
@@ -167,6 +177,19 @@ for s in sys.argv[2:]:
 for c, r in res.items():
     print(f"GATE {c}: {'PASS' if r['pass'] else 'FAIL'} ({r['clips']} clips)" + ("" if r["pass"] else f"; worse on {r['fails']}"))
 Path(sys.argv[1], "fx5_gate_summary.json").write_text(json.dumps(res, indent=2))
+f = Path(sys.argv[1], "hijab", "preserve_check.json")
+if f.exists():
+    for clip, sc in json.loads(f.read_text())["per_clip"].items():
+        base = next((m for m in sc if m.startswith("base_")), None)
+        if base is None or (sc[base].get("head_covered") or 0) < 0.5:
+            continue
+        pct = lambda v: "-" if v is None else f"{v * 100:.0f}%"
+        num = lambda v: "-" if v is None else f"{v:.1f}"
+        for m, v in sc.items():
+            if m != base:
+                print(f"HIJAB {clip} {m}: hijab turned into hair/face/skin {pct(v.get('head_lost'))} "
+                      f"(original FluxRT {pct(sc[base].get('head_lost'))}), hijab change {num(v.get('head'))} "
+                      f"(original {num(sc[base].get('head'))}) on a 0-255 scale")
 PYEOF
 ) || true
 
@@ -185,7 +208,7 @@ for s in $SETS; do
       --panels "fav2_$TAG=favourite #2 (today)" "fx5_$TAG=fxreal5" ) || echo "VIDEO_${s}_EXIT=$?"
   [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx5_${s}_${TAG}.mp4"
 done
-( cd "$E" && tar cf "$AZ_ROOT/eval/fx5_review.tar" dress10.json preserve_fx5_*.md stability_fx5_*.md garment_fx5_*.md \
+( cd "$E" && tar cf "$AZ_ROOT/eval/fx5_review.tar" dress10.json $( [ -f hijab.json ] && echo hijab.json ) preserve_fx5_*.md stability_fx5_*.md garment_fx5_*.md \
     results/fx5_gate_summary.json results/*/garment_report.json render_fx5_*.log 2>/dev/null )
 echo "FX5_DONE after $(mins): videos $(ls "$E"/fx5_*_"$TAG".mp4 2>/dev/null | tr '\n' ' ')"
 echo "LoRA $OUT/pytorch_lora_weights.safetensors (+ selection.json); reports $AZ_ROOT/eval/fx5_review.tar"

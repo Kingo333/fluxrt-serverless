@@ -8,8 +8,13 @@ The LoRA may only improve the garment. It FAILS if, on ANY clip, it is worse tha
   background mean change of the background vs the input (pixels that are background in the input
             and in both outputs, so a longer garment covering background is not counted)
   bg_flicker (videos) frame-to-frame jitter of the background, beyond the input's own
-"Worse" = candidate > base * 1.10 + a small margin (face 1.5, skin 2.0, background 1.0, flicker 0.5,
-on a 0-255 scale), so noise does not fail a clip. Areas come from MediaPipe's multiclass selfie
+  head      mean change of the person's own hair or head covering (hijab, scarf, cap): hair / clothes / other
+            pixels of the INPUT around and above the face, down to the chin (owner, 2026-11-11: a dress or
+            abaya must never change the shopper's hijab)
+  head_lost (people wearing a head covering) share of the input's covering that turned into hair, face or
+            skin in the output (0-1): the hijab removed or opened up
+"Worse" = candidate > base * 1.10 + a small margin (face 1.5, skin 2.0, background 1.0, flicker 0.5, head 2.0
+on a 0-255 scale; head_lost 0.05), so noise does not fail a clip. Areas come from MediaPipe's multiclass selfie
 segmenter; face, skin and background are compared only where they are that class in the input AND in
 every output (so a garment covering or uncovering skin is not counted as a skin change). Needs MediaPipe.
 Each RESULTS_DIR/<clip>/ has input.mp4|png and out_<model>.mp4|png (eval.generate_fluxrt).
@@ -21,8 +26,8 @@ import argparse
 import json
 from pathlib import Path
 
-BACKGROUND, HAIR, BODY_SKIN, FACE = 0, 1, 2, 3
-MARGIN = {"face": 1.5, "skin": 2.0, "background": 1.0, "bg_flicker": 0.5}
+BACKGROUND, HAIR, BODY_SKIN, FACE, CLOTHES, OTHERS = 0, 1, 2, 3, 4, 5
+MARGIN = {"face": 1.5, "skin": 2.0, "background": 1.0, "bg_flicker": 0.5, "head": 2.0, "head_lost": 0.05}
 RATIO = 1.10
 MAX_FRAMES = 49
 STRIDE = 4
@@ -72,6 +77,47 @@ def region_stats(inp, out, cat_in, bg_both, face_mask=None, skin_mask=None) -> d
     return r
 
 
+def head_zone(cat):
+    """(head, cover) masks of the INPUT frame, or (None, None) without a face: head = hair, clothes or other
+    pixels around and above the face down to the chin (the person's own hair or head covering); cover = the
+    clothes / other part of it when it outweighs the hair there, i.e. a hijab, scarf or cap, else None."""
+    import numpy as np
+    face = cat == FACE
+    if face.sum() < max(80, 0.002 * face.size):
+        return None, None
+    ys, xs = np.nonzero(face)
+    top, bot, left, right = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    fh, fw = bot - top + 1, right - left + 1
+    above = np.nonzero((cat[:top, left:right + 1] != BACKGROUND).any(axis=1))[0]
+    if above.size and (int(above.min()) == 0 or top - int(above.min()) > 1.5 * fh):
+        # the person runs off the top of the frame, or goes on far above this "face": the head is not in view
+        # (a hand, or chest skin in a coat's neckline, taken for a face), so there is no head to check
+        return None, None
+    zone = np.zeros_like(face)
+    zone[max(0, int(top - 0.9 * fh)): bot + 1, max(0, int(left - 0.6 * fw)): min(cat.shape[1], int(right + 0.6 * fw) + 1)] = True
+    head = zone & np.isin(cat, (HAIR, CLOTHES, OTHERS))
+    cover = zone & np.isin(cat, (CLOTHES, OTHERS))
+    if cover.sum() < 0.3 * face.sum() or cover.sum() <= (zone & (cat == HAIR)).sum():
+        cover = None
+    return (head if head.sum() > 50 else None), cover
+
+
+def head_stats(inp, out, cat_in, cat_out) -> dict:
+    """head (0-255 mean change on the input's hair / head covering), head_lost (0-1, covering pixels that became
+    hair, face or skin in the output; only when the input person wears one) and head_covered (1 or 0)."""
+    import numpy as np
+    head, cover = head_zone(cat_in)
+    r = {"head": None, "head_lost": None, "head_covered": None}
+    if head is not None:
+        d = np.abs(out.astype(np.float32) - inp.astype(np.float32)).mean(axis=2)
+        r["head"] = float(d[head].mean())
+        r["head_covered"] = 0.0
+    if cover is not None:
+        r["head_covered"] = 1.0
+        r["head_lost"] = float(np.isin(cat_out[cover], (HAIR, FACE, BODY_SKIN)).mean())
+    return r
+
+
 def worse(metric: str, cand: float | None, base: float | None) -> bool:
     if cand is None or base is None:
         return False
@@ -93,7 +139,8 @@ def clip_scores(d: Path, models: list[str], seg) -> dict:
     n = min([len(ins)] + [len(v) for v in outs.values()])
     if n == 0:
         return {}
-    acc = {m: {"face": [], "skin": [], "background": [], "bg_flicker": []} for m in models}
+    acc = {m: {"face": [], "skin": [], "background": [], "bg_flicker": [], "head": [], "head_lost": [], "head_covered": []}
+           for m in models}
     prev = {m: None for m in models}
     prev_in = None
     for k in range(n):
@@ -105,6 +152,9 @@ def clip_scores(d: Path, models: list[str], seg) -> dict:
         for m in models:
             fo = np.asarray(outs[m][k])
             for key, v in region_stats(fi, fo, cat_in, bg_both, face_both, skin_both).items():
+                if v is not None:
+                    acc[m][key].append(v)
+            for key, v in head_stats(fi, fo, cat_in, cats_out[m]).items():
                 if v is not None:
                     acc[m][key].append(v)
             if prev[m] is not None and prev_in is not None and bg_both.sum() > 200:
@@ -154,15 +204,25 @@ def main(argv=None) -> dict:
         worst = "; ".join(f"{f['clip']}: {', '.join(f['worse_on'])}" for f in v["fails"][:6]) or "-"
         lines.append(f"| {c} | {v['clips']} | {'PASS' if v['pass'] else 'FAIL'} | {worst} |")
     lines += ["", "## Numbers per clip (base -> candidate; lower = closer to the camera input)", "",
-              "| clip | candidate | face | skin | background | bg_flicker |", "|---|---|---|---|---|---|"]
+              "| clip | candidate | face | skin | background | bg_flicker | head | head_lost |", "|---|---|---|---|---|---|---|---|"]
     fmt = lambda v: "-" if v is None else f"{v:.1f}"  # noqa: E731
     for clip, sc in per_clip.items():
         for c in a.candidates:
             if c not in sc:
                 continue
             cells = [f"{fmt(sc[a.base].get(k))} -> {fmt(sc[c].get(k))}" + (" **worse**" if worse(k, sc[c].get(k), sc[a.base].get(k)) else "")
-                     for k in ("face", "skin", "background", "bg_flicker")]
+                     for k in ("face", "skin", "background", "bg_flicker", "head", "head_lost")]
             lines.append(f"| {clip} | {c} | " + " | ".join(cells) + " |")
+    covered = {clip: sc for clip, sc in per_clip.items() if (sc[a.base].get("head_covered") or 0) >= 0.5}
+    lines += ["", "## Head covering (clips where the camera person wears one: hijab, scarf, cap)", ""]
+    if covered:
+        lines += ["| clip | model | covering turned into hair/face/skin | head change (0-255) |", "|---|---|---|---|"]
+        for clip, sc in covered.items():
+            for m in [a.base] + [c for c in a.candidates if c in sc]:
+                lost = sc[m].get("head_lost")
+                lines.append(f"| {clip} | {m} | {'-' if lost is None else f'{lost * 100:.0f}%'} | {fmt(sc[m].get('head'))} |")
+    else:
+        lines.append("(no clip with a head covering)")
     text = "\n".join(lines) + "\n"
     if a.out:
         Path(a.out).write_text(text)

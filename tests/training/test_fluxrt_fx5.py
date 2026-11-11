@@ -363,3 +363,96 @@ def test_fx5_script_runs_the_five_priority_report_and_57_percent_dresses():
     rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
     assert rt.index("flux2-klein-initlora.patch") < rt.index("flux2-klein-fx5.patch")
     assert '--colour_weight="$AZ_COLOUR_WEIGHT"' in rt and '--texture_weight="$AZ_TEXTURE_WEIGHT"' in rt
+
+
+def _person_cat(h, w, hijab=True):
+    """A standing person: face, a hijab around and above it (or hair), clothes below; background elsewhere."""
+    cat = np.zeros((h, w), np.uint8)
+    cat[int(.27 * h):int(.95 * h), int(.3 * w):int(.7 * w)] = 4                      # clothes
+    cat[int(.08 * h):int(.27 * h), int(.33 * w):int(.67 * w)] = 4 if hijab else 1   # hijab, or hair
+    cat[int(.15 * h):int(.25 * h), int(.42 * w):int(.58 * w)] = 3                    # face
+    return cat
+
+
+def test_preserve_check_sees_a_hijab_turned_into_hair():
+    from eval import preserve_check as pc
+    cat_in = _person_cat(512, 288)
+    head, cover = pc.head_zone(cat_in)
+    assert head is not None and cover is not None and cover.sum() > 1000
+    hair_in = _person_cat(512, 288, hijab=False)
+    assert pc.head_zone(hair_in)[1] is None                                        # hair is not a covering
+    inp = np.full((512, 288, 3), 128, np.uint8)
+    kept = pc.head_stats(inp, inp.copy(), cat_in, cat_in)
+    assert kept["head_lost"] == 0.0 and kept["head"] == 0.0 and kept["head_covered"] == 1.0
+    out = inp.copy()
+    out[cover] = (40, 30, 20)                                                       # the hijab became dark hair
+    lost = pc.head_stats(inp, out, cat_in, hair_in)
+    assert lost["head_lost"] > 0.5 and lost["head"] > 50
+    assert pc.worse("head_lost", lost["head_lost"], kept["head_lost"]) and not pc.worse("head_lost", 0.02, 0.0)
+    assert pc.head_stats(inp, inp, hair_in, hair_in)["head_lost"] is None          # no covering: not judged
+    hand = np.zeros((512, 288), np.uint8)
+    hand[0:500, 90:200] = 4                                                         # a coat from the top of the frame
+    hand[250:280, 130:160] = 3                                                      # a hand taken for a face
+    assert pc.head_zone(hand) == (None, None)
+    neck = np.zeros((512, 288), np.uint8)
+    neck[0:500, 90:200] = 4                                                         # a coat, head out of the frame
+    neck[8:70, 130:160] = 3                                                         # chest skin taken for a face
+    assert pc.head_zone(neck) == (None, None)                                       # no head in view
+    tight = _person_cat(512, 288)
+    tight[: int(.11 * 512)] = 0                                                     # a hijab tight on the forehead
+    assert pc.head_zone(tight)[1] is not None
+
+
+def test_hijab_set_keeps_only_clips_with_a_head_covering(tmp_path, monkeypatch):
+    import av
+    from PIL import Image
+    from eval import hijab_set as hs
+    assert hs.best_window([False, True, True, True, False], 3) == (1, 1.0)
+    assert hs.frame_ok(_person_cat(512, 288)) and not hs.frame_ok(_person_cat(512, 288, hijab=False))
+
+    class FakeSeg:
+        def __init__(self, path):
+            pass
+
+        def __call__(self, img):
+            arr = np.asarray(img)
+            hijab = arr[..., 2].mean() > arr[..., 0].mean()                          # blue-ish clips "wear" a hijab
+            return _person_cat(img.height, img.width, hijab=hijab)[..., None]
+
+    monkeypatch.setattr("data_tools.clothes_mask.Segmenter", FakeSeg)
+    own = tmp_path / "own"
+    own.mkdir()
+    for name, rgb in (("blue", (40, 60, 160)), ("red", (160, 60, 40))):
+        with av.open(str(own / f"{name}.mp4"), "w") as c:
+            s = c.add_stream("libx264", rate=25)
+            s.width, s.height, s.pix_fmt = 360, 640, "yuv420p"
+            for _ in range(80):
+                for pkt in s.encode(av.VideoFrame.from_image(Image.new("RGB", (360, 640), rgb))):
+                    c.mux(pkt)
+            for pkt in s.encode():
+                c.mux(pkt)
+    photo = tmp_path / "abaya.jpg"
+    Image.new("RGB", (300, 400), (20, 20, 20)).save(photo)
+    set2 = tmp_path / "set2.json"
+    set2.write_text(json.dumps([{"key": "a", "ref": str(photo), "category": "dresses", "name": "Black maxi dress",
+                                 "description": "long black maxi dress"},
+                                {"key": "b", "ref": str(photo), "category": "tops"}]))
+    out = tmp_path / "hijab.json"
+    s = hs.main([str(tmp_path), "--out", str(out), "--own", str(own), "--clips-dir", str(tmp_path / "clips"),
+                 "--refs-from", str(set2), "--no-stock", "--model", "x"])
+    items = json.loads(out.read_text())
+    assert [it["key"] for it in items] == ["hijab1_own_blue"] and "own_red" in s["rejected"]
+    it = items[0]
+    assert it["category"] == "dresses" and it["name"] == "Black maxi dress" and it["case"] == "hijab"
+    with av.open(it["video"]) as c:
+        assert sum(1 for _ in c.decode(video=0)) == hs.WINDOW
+    ref = np.asarray(Image.open(it["ref"]))
+    assert s["refs"][0]["cleaned"] and (ref[10, 150] == 255).all()                 # above the chin: cut to white
+    assert ref[300, 150][0] < 60                                                   # the dress is kept
+
+
+def test_fx5_script_runs_the_hijab_set_at_the_live_photo_size():
+    sh = (ROOT / "training/fluxrt_lora/fx5.sh").read_text()
+    assert 'REF_SIZE="${AZ_REF_SIZE:-288x512}"' in sh
+    for s in ("eval.hijab_set", '--own "$AZ_ROOT/eval/own_clips"', "dress10 set2 cases5 hijab", "HIJAB "):
+        assert s in sh, s

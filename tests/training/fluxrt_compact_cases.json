@@ -1,0 +1,50 @@
+[
+ [
+  {
+   "category": "dresses",
+   "name": "Black Embroidered Abaya",
+   "description": "Long black abaya with gold piping."
+  },
+  "Virtual try-on. The person in the camera frame wears the Black Embroidered Abaya from the reference image: Long black abaya with gold piping. It is worn as a dress and replaces the current outfit, at its own length. Keep its exact colour, print, pattern, logo, fabric and fit. Keep the person's face, hair, hijab or head covering, body, pose and the background unchanged."
+ ],
+ [
+  {
+   "category": "modestwear",
+   "name": "Black Abaya"
+  },
+  "Virtual try-on. The person in the camera frame wears the Black Abaya from the reference image. It is worn as a dress and replaces the current outfit, at its own length. Keep its exact colour, print, pattern, logo, fabric and fit. Keep the person's face, hair, hijab or head covering, body, pose and the background unchanged."
+ ],
+ [
+  {
+   "category": "dresses",
+   "name": "Sleeveless midi dress"
+  },
+  "Virtual try-on. The person in the camera frame wears the Sleeveless midi dress from the reference image. It is worn as a dress and replaces the current outfit, at its own length. Keep its exact colour, print, pattern, logo, fabric and fit, and keep it sleeveless. Keep the person's face, hair, hijab or head covering, body, pose and the background unchanged."
+ ],
+ [
+  {
+   "category": "tops",
+   "name": "White Tee",
+   "description": "Heavyweight cotton tee in crisp white."
+  },
+  "Virtual try-on. The person in the camera frame wears the White Tee from the reference image: Heavyweight cotton tee in crisp white. It replaces the current top; the pants or skirt stay as they are. Keep its exact colour, print, pattern, logo, fabric and fit, with short sleeves. Keep the person's face, hair, body, pose and the background unchanged."
+ ],
+ [
+  {
+   "category": "bottoms",
+   "name": "Wide leg trousers"
+  },
+  "Virtual try-on. The person in the camera frame wears the Wide leg trousers from the reference image. It replaces the current pants or skirt; the top stays as it is. Keep its exact colour, print, pattern, logo, fabric and fit. Keep the person's face, hair, body, pose and the background unchanged."
+ ],
+ [
+  {
+   "category": "accessories",
+   "name": "Silk scarf"
+  },
+  "Virtual try-on. The person in the camera frame wears the Silk scarf from the reference image. The person wears it naturally; the outfit stays as it is. Keep its exact colour, print, pattern, logo, fabric and fit. Keep the person's face, hair, body, pose and the background unchanged."
+ ],
+ [
+  {},
+  "Virtual try-on. The person in the camera frame wears the item from the reference image. Keep its exact colour, print, pattern, logo, fabric and fit. Keep the person's face, hair, body, pose and the background unchanged."
+ ]
+]
