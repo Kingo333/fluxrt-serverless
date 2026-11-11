@@ -9,7 +9,7 @@ RESULTS_DIR/<item>/ holds input.mp4 (camera), out_<model>.mp4, ref.* (the garmen
 seg_ref.npz; `score` (numpy, PIL, av; DINOv2-small for detail when torch is there) reads them. The garment is
 the "clothes" class in the model's output, limited to the upper 55% of the person for tops and the lower 55%
 for bottoms (so the trousers do not count for a top); on the photo it is the clothes class when a model wears
-it, else everything that is not white. Frames where the camera shows almost no person are left out.
+it, else everything but the photo's backdrop. Frames where the camera shows almost no person are left out.
 
   COLOUR       colour_de    CIE76 distance between the median Lab colour of the garment and of the photo (lower)
   DETAIL       likeness     DINOv2 similarity of the garment cut-out and the photo's garment (motifs, trims,
@@ -99,38 +99,65 @@ def band_mask(clothes: np.ndarray, person: np.ndarray, category) -> np.ndarray:
     return out
 
 
-def border_background(rgb: np.ndarray, white: int = 248) -> np.ndarray:
-    """The photo's white background: (almost) pure white pixels connected to the picture's edge. White or cream
-    trims, piping and lace INSIDE the garment are not connected to the edge through pure white, so they stay."""
+def border_background(rgb: np.ndarray, tol: int = 40, step: int = 6) -> np.ndarray:
+    """The photo's backdrop: up to two backdrop colours are read off the picture's edge (an off-white or grey
+    studio backdrop, a letterbox bar), and the backdrop grows inwards from the edge through small colour steps
+    (at most `step` per pixel) while staying within `tol` of a backdrop colour. A light trim, piping or lace INSIDE
+    the garment is not reached through small steps, so it stays garment."""
     from collections import deque
-    cand = rgb.min(axis=-1) >= white
-    h, w = cand.shape
-    bg = np.zeros_like(cand)
-    q = deque((y, x) for y in range(h) for x in (0, w - 1) if cand[y, x])
-    q.extend((y, x) for x in range(w) for y in (0, h - 1) if cand[y, x])
-    for y, x in q:
-        bg[y, x] = True
+    px = rgb.astype(np.int16)
+    h, w = px.shape[:2]
+    ring = np.concatenate([px[0], px[-1], px[:, 0], px[:, -1]])
+    cols, rest = [], ring
+    for _ in range(2):
+        if len(rest) < 0.15 * len(ring):
+            break
+        c = np.median(rest, axis=0)
+        near = np.abs(rest - c).max(axis=1) <= 12
+        if near.sum() < 0.15 * len(ring):
+            break
+        cols.append(c)
+        rest = rest[~near]
+    bg = np.zeros((h, w), bool)
+    if not cols:
+        return bg
+    ok, seed = np.zeros((h, w), bool), np.zeros((h, w), bool)
+    for c in cols:
+        d = np.abs(px - c).max(axis=-1)
+        ok |= d <= tol
+        seed |= d <= 12
+    right = np.abs(px[:, 1:] - px[:, :-1]).max(axis=-1) <= step   # x -> x+1 is a small step
+    down = np.abs(px[1:] - px[:-1]).max(axis=-1) <= step           # y -> y+1 is a small step
+    q = deque()
+    for y, x in [(y, x) for y in range(h) for x in (0, w - 1)] + [(y, x) for x in range(w) for y in (0, h - 1)]:
+        if seed[y, x] and not bg[y, x]:
+            bg[y, x] = True
+            q.append((y, x))
     while q:
         y, x = q.popleft()
-        for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-            if 0 <= yy < h and 0 <= xx < w and cand[yy, xx] and not bg[yy, xx]:
+        for yy, xx, small in ((y, x + 1, x + 1 < w and right[y, x]), (y, x - 1, x > 0 and right[y, x - 1]),
+                              (y + 1, x, y + 1 < h and down[y, x]), (y - 1, x, y > 0 and down[y - 1, x])):
+            if small and ok[yy, xx] and not bg[yy, xx]:
                 bg[yy, xx] = True
                 q.append((yy, xx))
     return bg
 
 
 def ref_garment_mask(rgb: np.ndarray, cat) -> np.ndarray:
-    """Clothes when a model wears the garment on the photo, else everything but the white background."""
+    """Clothes when a model wears the garment on the photo, else everything but the photo's backdrop."""
     if cat is not None and cat.shape == rgb.shape[:2] and float(np.isin(cat, (FACE, BODY_SKIN, HAIR)).mean()) >= 0.005:
         return cat == CLOTHES
-    if max(rgb.shape[:2]) > 320:                       # flood fill on a smaller copy, then back to full size
-        from PIL import Image
-        small = np.asarray(Image.fromarray(rgb).resize((max(1, rgb.shape[1] * 320 // max(rgb.shape[:2])),
-                                                        max(1, rgb.shape[0] * 320 // max(rgb.shape[:2])))))
-        bg = np.asarray(Image.fromarray(border_background(small).astype(np.uint8) * 255).resize(
-            (rgb.shape[1], rgb.shape[0]), Image.NEAREST)) > 127
-        return ~bg
-    return ~border_background(rgb)
+    from PIL import Image
+    small = rgb
+    if max(rgb.shape[:2]) > 320:                       # work on a smaller copy, then back to full size
+        k = 320 / max(rgb.shape[:2])
+        small = np.asarray(Image.fromarray(rgb).resize((max(1, round(rgb.shape[1] * k)), max(1, round(rgb.shape[0] * k)))))
+    bg = border_background(small)
+    if (~bg).mean() < 0.03:                            # the backdrop leaked into a garment of almost its colour:
+        bg = border_background(small, tol=12, step=255)  # only the backdrop colour itself
+    if bg.shape != rgb.shape[:2]:
+        bg = np.asarray(Image.fromarray(bg.astype(np.uint8) * 255).resize((rgb.shape[1], rgb.shape[0]), Image.NEAREST)) > 127
+    return ~bg
 
 
 def _dilate(m: np.ndarray, r: int) -> np.ndarray:

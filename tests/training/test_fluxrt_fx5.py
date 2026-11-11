@@ -308,6 +308,25 @@ def test_garment_report_scores_the_five_priorities():
     assert ref_mask[35, 30]                                                          # the light trim is garment, not background
     big = np.asarray(__import__("PIL.Image", fromlist=["Image"]).fromarray(ref).resize((600, 800), 0))
     assert gr.ref_garment_mask(big, None)[350, 300] and not gr.ref_garment_mask(big, None)[10, 10]
+    # real product photos: an off-white backdrop with a black letterbox bar, a grey backdrop behind off-white
+    # trousers, and a soft gradient backdrop: the backdrop goes, the garment stays
+    yy, xx = np.mgrid[0:600, 0:360]
+    dress = np.zeros((600, 360, 3), np.uint8)
+    dress[:] = (242, 241, 238)
+    dress[560:] = 0
+    dress[(((yy - 300) / 220.0) ** 2 + ((xx - 180) / 90.0) ** 2) < 1] = (205, 25, 45)
+    m = gr.ref_garment_mask(dress, None)
+    assert m[300, 180] and not m[20, 20] and not m[590, 180] and 0.15 < m.mean() < 0.35
+    assert gr.delta_e(gr.median_lab(dress, m), gr.srgb_to_lab(np.array([205, 25, 45]))) < 1.0
+    trousers = np.full((600, 360, 3), 200, np.uint8)
+    trousers[100:550, 120:240] = (240, 238, 230)
+    m = gr.ref_garment_mask(trousers, None)
+    assert m[300, 180] and not m[50, 50] and abs(m.mean() - 450 * 120 / (600 * 360)) < 0.02
+    grad = (215 + 30 * (1 - np.hypot((yy - 300) / 300.0, (xx - 180) / 180.0) / np.sqrt(2)))[..., None].repeat(3, -1)
+    grad = grad.astype(np.uint8)
+    grad[150:450, 110:250] = (30, 40, 90)
+    m = gr.ref_garment_mask(grad, None)
+    assert m[300, 180] and not m[300, 40] and not m[100, 180] and abs(m.mean() - 300 * 140 / (600 * 360)) < 0.02
     cams, cats_cam, good, cats_good, bad, cats_bad = [], [], [], [], [], []
     rng = np.random.default_rng(0)
     for t in range(T):
