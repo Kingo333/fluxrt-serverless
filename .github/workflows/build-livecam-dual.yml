@@ -60,7 +60,7 @@ jobs:
           git cat-file -e "$BASE^{commit}" || { echo "::error::$BASE is not in this repository's history"; exit 1; }
           echo "Changed since $BASE:"
           git diff --name-only "$BASE" HEAD | sed 's/^/  /'
-          OTHER=$(git diff --name-only "$BASE" HEAD | grep -vE '^(server\.py|bootstrap\.py|session_token\.py|livecam/.+|tests/.+|training/.+|docs/.+|[^/]+\.md|\.github/.+|Dockerfile\.livecam-patch)$' || true)
+          OTHER=$(git diff --name-only "$BASE" HEAD | grep -vE '^(server\.py|bootstrap\.py|session_token\.py|livecam/.+|tests/.+|training/.+|docs/.+|[^/]+\.md|\.github/.+|Dockerfile\.livecam-patch|requirements-test\.txt)$' || true)
           if [ -n "$OTHER" ]; then
             echo "::error::A thin build only swaps the FluxRT app files, but these changed too; run a full build: $(echo $OTHER)"
             exit 1
