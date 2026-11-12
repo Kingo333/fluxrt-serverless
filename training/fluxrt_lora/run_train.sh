@@ -87,6 +87,10 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx5.patch"
 # fxreal5: several garment-photo sizes, one per batch (--cond_2_sizes; off unless AZ_REF_SIZES is set).
 curl -fsSL "$RAW/patches/flux2-klein-refsizes.patch" -o "$AZ_ROOT/flux2-klein-refsizes.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-refsizes.patch"
+# fxreal5 on 32 GB GPUs: the latent and caption caches live in CPU RAM (moved to the GPU per step), the text
+# encoder is freed after caching. Memory only: every step gets the same numbers.
+curl -fsSL "$RAW/patches/flux2-klein-cpucache.patch" -o "$AZ_ROOT/flux2-klein-cpucache.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-cpucache.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -117,6 +121,8 @@ nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu --form
 GPU_PID=$!
 trap 'kill $GPU_PID 2>/dev/null || true' EXIT
 cd "$SRC/examples/dreambooth"
+# Fewer fragmented GPU blocks when the garment-photo size changes between batches (memory only).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 "$VENV/bin/accelerate" launch --num_processes 1 --mixed_precision bf16 train_dreambooth_lora_flux2_klein_img2img.py \
   --pretrained_model_name_or_path="$KLEIN" \
   --dataset_name="$DATA/data" \

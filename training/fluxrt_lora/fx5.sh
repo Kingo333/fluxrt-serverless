@@ -69,7 +69,10 @@ VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head 
 [ "${VRAM:-0}" -ge 30000 ] || { echo "GPU_TOO_SMALL: ${VRAM} MiB; training needs >= 30 GB (RTX PRO 6000 or RTX 5090)"; exit 1; }
 df -h /workspace | tail -1
 FREE_GB=$(df -BG --output=avail /workspace | tail -1 | tr -dc '0-9')
-[ "${FREE_GB:-0}" -ge 30 ] || { echo "LOW_SPACE: ${FREE_GB} GB free on the volume"; exit 1; }
+NEED_GB=30  # a rerun with the dataset already built needs room only for checkpoints and renders
+[ -f "$AZ_ROOT/data/fluxrt_lora/$EXP/dataset_summary.json" ] && NEED_GB=15
+[ "${FREE_GB:-0}" -ge "$NEED_GB" ] || { echo "LOW_SPACE: ${FREE_GB} GB free on the volume (need $NEED_GB)"; exit 1; }
+free -g | head -2
 
 echo "== 1. code at $AZ_REF"
 git -C "$AZ_ROOT/azyah-code" fetch -q origin "$AZ_REF" && git -C "$AZ_ROOT/azyah-code" checkout -q "$AZ_REF" || { echo CODE_FAILED; exit 1; }
@@ -87,11 +90,15 @@ fi
 "$MP" -c "import pyarrow" 2>/dev/null || "$AZ_ROOT/venv-mp/bin/pip" install -q pyarrow
 "$MP" -c "import mediapipe, av, pyarrow" 2>/dev/null || { echo "NO_MEDIAPIPE"; exit 1; }
 
+if [ -f "$D/fluxrt_lora/$EXP/dataset_summary.json" ]; then
+  echo "== 3. dataset already built: skipping the motion frames ($(ls -d "$S"/vivid_dress_motion/*/ 2>/dev/null | wc -l) clips on disk)"
+else
 echo "== 3. dress frames where the dress moves: every ViViD dress train clip ($(mins))"
 ( cd "$T" && "$MP" -m data_tools.vivid_motion "$S/vivid" "$S/vivid_dress_motion" --category dress \
     --n "${AZ_MOTION_N:-0}" --singles "${AZ_SINGLES:-2}" --model "$SEG" ) || echo "MOTION_EXIT=$?"
 echo "motion clips on disk: $(ls -d "$S"/vivid_dress_motion/*/ 2>/dev/null | wc -l)"
 [ -d "$S/vivid_pairs" ] || ( cd "$T" && "$MP" -m data_tools.vivid_pairs "$S/vivid" "$S/vivid_pairs" --n 300 --model "$SEG" ) || echo "PAIRS_EXIT=$?"
+fi
 
 DATA="$D/fluxrt_lora/$EXP"
 if [ ! -f "$DATA/dataset_summary.json" ]; then
@@ -129,6 +136,7 @@ if [ ! -f "$OUT/pytorch_lora_weights.safetensors" ]; then
 fi
 grep -h "LoRA initialised from" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -1 || true
 grep -h "^REF_SIZES" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -1 || true
+grep -hE "^(CACHE_RAM|CACHE_CPU|NOT_ENOUGH_CPU_RAM)|OutOfMemoryError|CUDA out of memory" "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | tail -6 || true
 ls -la "$OUT" | tail -12
 [ -f "$OUT/pytorch_lora_weights.safetensors" ] || { echo LORA_MISSING; exit 1; }
 cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true

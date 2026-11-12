@@ -538,3 +538,62 @@ def test_fx5_script_trains_and_tests_the_mixed_garment_photo_sizes():
                           + sh[sh.index('for spec in $(echo "${AZ_REF_SIZES:-}"'):sh.index('GUARD=/workspace/fx5_started')]
                           + 'echo "[$EXTRA_SIZES]"'], capture_output=True, text=True)
     assert out.stdout.strip() == "[ 432x576 288x512]", out.stdout + out.stderr
+
+
+def test_cpu_cache_patch_keeps_the_same_numbers_off_the_gpu(tmp_path):
+    """fxreal5 on a 32 GB GPU ran out of memory while caching: the caches now live in CPU RAM, same values."""
+    local = Path("/home/user/repos/diffusers")
+    if not (local / "examples" / "dreambooth" / TRAINER).exists():
+        pytest.skip("diffusers checkout not present")
+    r = subprocess.run(["git", "-C", str(local), "show", f"HEAD:examples/dreambooth/{TRAINER}"], capture_output=True, text=True)
+    repo = tmp_path / "d"
+    (repo / "examples" / "dreambooth").mkdir(parents=True)
+    (repo / "examples" / "dreambooth" / TRAINER).write_text(r.stdout)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for name in PATCHES_REF + ("flux2-klein-cpucache.patch",):
+        rr = subprocess.run(["git", "-C", str(repo), "apply", str(ROOT / "training" / "patches" / name)], capture_output=True, text=True)
+        assert rr.returncode == 0, f"{name}: {rr.stderr}"
+    src = (repo / "examples" / "dreambooth" / TRAINER).read_text()
+    compile(src, TRAINER, "exec")
+    for s in ("prompt_embeds_cache = _AzRowCache(accelerator.device)", "_AzCpuLatent(vae.encode(batch[\"pixel_values\"])",
+              "_AzCpuLatent(vae.encode(batch[\"cond_2_pixel_values\"])", "text_encoding_pipeline = None",
+              "NOT_ENOUGH_CPU_RAM", 'print(f"CACHE_CPU text', "model_input = latents_cache[step].mode()",
+              "prompt_embeds = prompt_embeds_cache[step]"):
+        assert s in src, s
+    torch = pytest.importorskip("torch")
+    ns = {"torch": torch}
+    exec(compile(src[src.index("class _AzCpuLatent:"):src.index("def _azyah_pad_to(")], "cpucache_block", "exec"), ns)
+
+    class Dist:
+        def __init__(self, t):
+            self.parameters = torch.cat([t, t * 0 - 3.0], 1)
+
+        def mode(self):
+            return torch.chunk(self.parameters, 2, dim=1)[0]
+
+    lat = torch.randn(4, 32, 64, 36, dtype=torch.bfloat16)
+    cached = ns["_AzCpuLatent"](Dist(lat), "cpu")
+    assert torch.equal(cached.mode(), lat) and cached.value.shape == lat.shape     # only the mean is kept
+    rc = ns["_AzRowCache"]("cpu")
+    a, b, c = (torch.randn(5, 7, dtype=torch.bfloat16) for _ in range(3))
+    b2 = b.clone()
+    b2[0, 0] += 1                                                                    # same caption, different bits
+    batches = [(["a", "b"], torch.stack([a, b])), (["a", "c"], torch.stack([a, c])), (["b", "a"], torch.stack([b2, a]))]
+    for prompts, t in batches:
+        rc.add(prompts, t)
+    rc.repeat(1)
+    assert rc.distinct() == 4                                                        # a, b, c and the different b
+    for step, (_, t) in enumerate(batches + [batches[1]]):
+        assert torch.equal(rc[step], t)                                             # every step: the exact tensor
+    assert rc.steps[1][0] is rc.steps[0][0] and rc.steps[2][1] is rc.steps[0][0]    # equal rows are shared
+
+
+def test_rerun_skips_finished_data_prep_and_applies_the_cpu_cache():
+    rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
+    assert rt.index("flux2-klein-refsizes.patch") < rt.index("flux2-klein-cpucache.patch")
+    assert 'export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"' in rt
+    assert "--gradient_checkpointing" in rt and '--train_batch_size="$BATCH"' in rt
+    sh = (ROOT / "training/fluxrt_lora/fx5.sh").read_text()
+    for s in ('dataset already built: skipping the motion frames', 'if [ ! -f "$DATA/dataset_summary.json" ]; then',
+              'NEED_GB=15', "CACHE_RAM|CACHE_CPU|NOT_ENOUGH_CPU_RAM", "AZ_BATCH=4 AZ_LORA_RANK=64"):
+        assert s in sh, s
