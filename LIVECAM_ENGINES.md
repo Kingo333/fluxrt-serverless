@@ -87,6 +87,36 @@ is above the real output rate, it repeats the last frame, as today. Then `FLUXRT
 If the segmenter fails to load, `FLUXRT_COMPOSITE`, `FLUXRT_REF_CLEAN`, `FLUXRT_FACE_PASTE` and `FLUXRT_CACHE_MASK=seg`
 turn themselves off (logged, visible in `/ping`); the session runs as today.
 
+## WebRTC media path (2026-11-12, off by default)
+
+With `LIVECAM_WEBRTC=1` the app can carry camera frames and generated frames on a WebRTC connection
+instead of JPEGs on the WebSocket. The WebSocket stays open for control and for signalling: the app
+sends `webrtc_offer` (SDP plus its iceServers), the worker answers `webrtc_answer`, and `webrtc_state`
+reports connected / failed / closed. FluxRT is unchanged:
+- camera frames enter the same latest-frame-wins slot;
+- outputs leave from the same finished-output step (composite, face paste, sharpen), so the picture is the same before compression.
+
+While WebRTC is connected the worker sends no JPEG frames. If it drops, or the app sends `webrtc_close`, the JPEG path takes over again.
+
+- **No inbound ports needed.** RunPod serverless forwards only HTTP/WebSocket, so the worker reaches the app through a TURN relay.
+  - The provider is not wired in. The app forwards the iceServers it got from our backend: a self-hosted coturn with time-limited REST credentials, or Cloudflare Realtime TURN.
+  - aiortc uses one TURN URL. The worker first sends a STUN check over UDP to that relay. If it answers, it uses TURN over UDP; otherwise TURN over TLS on 443. The log line `livecam webrtc: outbound UDP to ...` says which.
+- **Codecs.** H.264 is preferred both ways, so phones and the kiosk use hardware video; VP8 is accepted. Encode and decode run on the CPU (aiortc + PyAV), never on the GPU.
+- **Packages.** aiortc 1.16.0 (pulls PyAV), listed in `livecam/requirements-webrtc.txt`.
+  - The thin build installs it.
+  - **Before main gets a full build, add the same install to `Dockerfile.livecam`.** It is left out for now because a changed `Dockerfile.livecam` blocks a thin build from the live image.
+  - Without the packages the worker logs why and stays on JPEG.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LIVECAM_WEBRTC` | `false` | `1` lets the app offer WebRTC (`ready` then has `webrtc: true`). Unset = exactly today. |
+| `LIVECAM_WEBRTC_MAX_KBPS` | `3000` | Ceiling of the generated-video bitrate. The output is 576x1024, so it needs about 2.5–4 Mbit/s to match today's JPEG detail. The app's bandwidth estimate moves the rate below this. |
+| `LIVECAM_WEBRTC_START_KBPS` | `2000` | Starting bitrate of the generated video. |
+| `LIVECAM_WEBRTC_STUN_HOST` | `stun.cloudflare.com` | Only used for the UDP check when the app's iceServers name no STUN or UDP TURN host. |
+
+`/ping` shows `webrtc` and `webrtc_max_kbps` under `live_switches`. Every `LIVECAM_LOG_EVERY` frames,
+`livecam webrtc:` logs the state, the TURN transport, frames in, the input size and frames out.
+
 ## Switch to JoyAI
 
 On the endpoint → **Edit endpoint**:

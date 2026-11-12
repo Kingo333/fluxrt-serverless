@@ -1,0 +1,2 @@
+# WebRTC media path (LIVECAM_WEBRTC, off by default). Pinned; pulls PyAV (FFmpeg with libx264/libvpx) as wheels.
+aiortc==1.16.0

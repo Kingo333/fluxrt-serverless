@@ -11,7 +11,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect, status
@@ -21,6 +21,7 @@ from PIL import Image
 from livecam.pacing import FrameChangeDetector
 from livecam.segment import face_paste_available, is_dress_category
 from livecam.session import LiveSession
+from livecam import webrtc as livecam_webrtc
 from session_token import SessionClock, SessionToken, parse_and_verify
 
 logging.basicConfig(
@@ -130,6 +131,19 @@ def _env_num(name: str, default, cast=float):
 # when a camera frame arrives.
 OUTPUT_PACING = _env_bool("FLUXRT_OUTPUT_PACING")
 OUTPUT_POLL_HZ = max(1.0, _env_num("FLUXRT_OUTPUT_POLL_HZ", 30))
+# WebRTC media path (2026-11-12, off by default). Camera frames come in, and generated frames go back,
+# on a WebRTC connection through Cloudflare's TURN relay; the WebSocket stays for control and
+# signalling. Needs livecam/requirements-webrtc.txt in the image; without it the worker logs why and
+# every session stays on WebSocket JPEG. See LIVECAM_ENGINES.md, "WebRTC media path".
+LIVECAM_WEBRTC = _env_bool("LIVECAM_WEBRTC")
+WEBRTC_MAX_KBPS = max(500, _env_num("LIVECAM_WEBRTC_MAX_KBPS", 3000, int))
+WEBRTC_START_KBPS = max(300, _env_num("LIVECAM_WEBRTC_START_KBPS", 2000, int))
+WEBRTC_ON = LIVECAM_WEBRTC and livecam_webrtc.available()
+if LIVECAM_WEBRTC and not WEBRTC_ON:
+    log.warning("LIVECAM_WEBRTC=1 but WebRTC is unavailable (%s); sessions stay on WebSocket JPEG",
+                livecam_webrtc.unavailable_reason())
+elif WEBRTC_ON:
+    livecam_webrtc.configure_bitrates(WEBRTC_MAX_KBPS, WEBRTC_START_KBPS)
 # F1c: keep the camera frame's face/hair/background, take the clothing from FluxRT.
 COMPOSITE = _env_bool("FLUXRT_COMPOSITE")
 COMPOSITE_FEATHER = max(0, _env_num("FLUXRT_COMPOSITE_FEATHER", 3, int))
@@ -322,6 +336,9 @@ def ready_message(deadline: float) -> Dict[str, Any]:
             # The app turns its jitter buffer on only when the worker paces its output.
             msg["playback_buffer"] = True
             msg["playback_fps"] = int(round(OUTPUT_POLL_HZ))
+    if WEBRTC_ON:
+        # The app may then offer a WebRTC connection (webrtc_offer); JPEG over this socket stays the fallback.
+        msg["webrtc"] = True
     return msg
 
 
@@ -333,13 +350,23 @@ def sharpen_rgb(img: Image.Image, amount: float) -> Image.Image:
     return img.filter(ImageFilter.UnsharpMask(radius=1, percent=int(round(100 * amount)), threshold=0))
 
 
-def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = OUTPUT_JPEG_QUALITY) -> str:
+def finished_rgb(bgr: np.ndarray) -> Image.Image:
+    """The output frame as the shopper sees it: RGB, sharpened when FLUXRT_SHARPEN is set."""
     rgb = bgr[:, :, ::-1]
     img = Image.fromarray(rgb.astype(np.uint8) if rgb.dtype != np.uint8 else rgb)
-    img = sharpen_rgb(img, SHARPEN)
+    return sharpen_rgb(img, SHARPEN)
+
+
+def bgr_to_b64_jpeg(bgr: np.ndarray, quality: int = OUTPUT_JPEG_QUALITY) -> str:
+    img = finished_rgb(bgr)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def bgr_to_rgb_frame(bgr: np.ndarray) -> np.ndarray:
+    """The same picture as bgr_to_b64_jpeg, uncompressed, for the WebRTC output track."""
+    return np.asarray(finished_rgb(bgr))
 
 
 def _download_model(repo_id: str, local_dir: Path, min_files: int, revision: Optional[str] = None) -> None:
@@ -588,6 +615,8 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "mu": MU_OVERRIDE,
         "input_scale": INPUT_SCALE,
         "segmenter_loaded": segmenter_loaded,
+        "webrtc": WEBRTC_ON,
+        "webrtc_max_kbps": WEBRTC_MAX_KBPS if WEBRTC_ON else None,
     }
 
 
@@ -850,7 +879,8 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     # ------------------------------------------------------------------
 
     pending_lock = asyncio.Lock()
-    pending_frame_b64: Optional[str] = None
+    # The newest camera frame not yet processed: base64 JPEG (WebSocket) or BGR array (WebRTC).
+    pending_frame: Optional[Union[str, np.ndarray]] = None
     pending_recv_ts: float = 0.0
     dropped_frame_count = 0
     stop_event = asyncio.Event()
@@ -876,8 +906,48 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
     def dress_rule() -> bool:
         return REF_CLEAN_DRESS and segmenter is not None and is_dress_category(ref_category, ref_type)
 
+    # WebRTC (LIVECAM_WEBRTC): while connected, camera frames come on the WebRTC track instead of
+    # "frame" messages and outputs go back on it; the WebSocket keeps control and signalling, and the
+    # JPEG path takes over again if the connection drops.
+    rtc: Optional["livecam_webrtc.RtcBridge"] = None
+    rtc_tasks: List[asyncio.Task] = []
+
+    def rtc_live() -> bool:
+        return rtc is not None and rtc.live
+
+    async def on_rtc_frame(bgr: np.ndarray, ts: float) -> None:
+        nonlocal pending_frame, pending_recv_ts, dropped_frame_count
+        async with pending_lock:
+            if pending_frame is not None:
+                dropped_frame_count += 1
+            pending_frame = bgr
+            pending_recv_ts = ts
+
+    async def on_rtc_state(state: str) -> None:
+        try:
+            await websocket.send_json({"type": "webrtc_state", "state": state, "turn": rtc.turn if rtc else "none"})
+        except Exception:  # noqa: BLE001 - the socket may already be closed
+            pass
+
+    async def start_rtc(offer_sdp: str, ice_servers: Any) -> None:
+        nonlocal rtc
+        old, rtc = rtc, None
+        if old is not None:
+            await old.close()
+        try:
+            bridge = livecam_webrtc.RtcBridge(on_rtc_frame, on_rtc_state)
+            answer = await bridge.accept_offer(offer_sdp, ice_servers)
+            rtc = bridge
+            await websocket.send_json({"type": "webrtc_answer", "sdp": answer, "turn": bridge.turn})
+        except Exception as e:  # noqa: BLE001 - the app stays on WebSocket frames
+            log.warning("livecam webrtc: offer failed: %s", e)
+            try:
+                await websocket.send_json({"type": "webrtc_failed", "message": str(e)[:200]})
+            except Exception:  # noqa: BLE001
+                pass
+
     async def receiver():
-        nonlocal pending_frame_b64, pending_recv_ts, dropped_frame_count, ref_raw, ref_dress, ref_category, ref_type
+        nonlocal pending_frame, pending_recv_ts, dropped_frame_count, ref_raw, ref_dress, ref_category, ref_type, rtc
         try:
             while not stop_event.is_set():
                 raw = await websocket.receive_text()
@@ -933,13 +1003,28 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     frame_b64 = data.get("frame_b64")
                     if isinstance(frame_b64, str) and frame_b64:
                         async with pending_lock:
-                            if pending_frame_b64 is not None:
+                            if pending_frame is not None:
                                 dropped_frame_count += 1
-                            pending_frame_b64 = frame_b64
+                            pending_frame = frame_b64
                             pending_recv_ts = time.time()
 
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong", "state": public_state()})
+
+                elif msg_type == "webrtc_offer":
+                    if not WEBRTC_ON:
+                        await websocket.send_json({"type": "webrtc_unavailable"})
+                    elif not isinstance(data.get("sdp"), str) or not data.get("sdp"):
+                        await websocket.send_json({"type": "webrtc_failed", "message": "missing_sdp"})
+                    else:
+                        # Answering gathers candidates (a TURN allocation): do it beside the receiver.
+                        rtc_tasks.append(asyncio.ensure_future(start_rtc(data["sdp"], data.get("ice_servers"))))
+
+                elif msg_type == "webrtc_close":
+                    old, rtc = rtc, None
+                    if old is not None:
+                        await old.close()
+                    await websocket.send_json({"type": "webrtc_state", "state": "closed", "turn": "none"})
 
                 else:
                     await websocket.send_json({"type": "error", "message": f"unknown_type:{msg_type}"})
@@ -951,24 +1036,25 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
             stop_event.set()
 
     async def processor_loop():
-        nonlocal pending_frame_b64, pending_recv_ts, latest_output_b64, latest_output_seq, latest_output_ts
+        nonlocal pending_frame, pending_recv_ts, latest_output_b64, latest_output_seq, latest_output_ts
         nonlocal inputs_written
         processed = 0
         try:
             while not stop_event.is_set():
                 async with pending_lock:
-                    frame_b64 = pending_frame_b64
+                    frame_in = pending_frame
                     recv_ts = pending_recv_ts
-                    pending_frame_b64 = None
+                    pending_frame = None
 
-                if frame_b64 is None:
+                if frame_in is None:
                     # No work; brief idle to avoid busy loop.
                     await asyncio.sleep(0.01)
                     continue
 
                 t_proc_start = time.time()
+                out_b64: Optional[str] = None
                 try:
-                    frame = b64_to_bgr(frame_b64)
+                    frame = b64_to_bgr(frame_in) if isinstance(frame_in, str) else frame_in
                     resized = live.prepare_input(frame, t_proc_start)
                     input_t.copy_from(resized)
                     inputs_written += 1
@@ -976,7 +1062,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         # As before: read whatever FluxRT has produced so far, once per camera frame.
                         output = output_t.to_numpy()
                         output = live.finish_output(output, time.time())
-                        out_b64 = bgr_to_b64_jpeg(output)
+                        if rtc_live():
+                            rtc.push_output(bgr_to_rgb_frame(output))  # WebRTC: no JPEG
+                        else:
+                            out_b64 = bgr_to_b64_jpeg(output)
                 except Exception as e:
                     try:
                         await websocket.send_json({"type": "error", "message": f"frame_failed:{e}"})
@@ -985,7 +1074,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     continue
                 t_proc_end = time.time()
 
-                if not OUTPUT_PACING:
+                if not OUTPUT_PACING and out_b64 is not None:
                     # Publish to sender hand-off (with pacing on, output_poller does this).
                     latest_output_b64 = out_b64
                     latest_output_seq += 1
@@ -1006,6 +1095,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         processed,
                         latest_output_seq,
                     )
+                    if rtc is not None:
+                        log.info("livecam webrtc: state=%s turn=%s frames_in=%d in_size=%s out_pushed=%d out_sent=%d",
+                                 rtc.state, rtc.turn, rtc.frames_in, rtc.last_in_size,
+                                 rtc.output.pushed, rtc.output.sent)
         except WebSocketDisconnect:
             log.info("livecam processor: websocket disconnected")
         except Exception as e:
@@ -1024,8 +1117,9 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         polled = published = 0
         window_start = time.time()
 
-        def finish(output: np.ndarray, now: float) -> str:
-            return bgr_to_b64_jpeg(live.finish_output(output, now))
+        def finish(output: np.ndarray, now: float, for_rtc: bool) -> Union[str, np.ndarray]:
+            done = live.finish_output(output, now)
+            return bgr_to_rgb_frame(done) if for_rtc else bgr_to_b64_jpeg(done)
 
         try:
             while not stop_event.is_set():
@@ -1036,11 +1130,16 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         polled += 1
                         if detector.changed(output):
                             # Composite + JPEG off the event loop (numpy/PIL release the GIL).
-                            out_b64 = await asyncio.to_thread(finish, output, t0)
-                            latest_output_b64 = out_b64
-                            latest_output_seq += 1
-                            latest_output_ts = time.time()
-                            output_event.set()
+                            for_rtc = rtc_live()
+                            result = await asyncio.to_thread(finish, output, t0, for_rtc)
+                            if for_rtc:
+                                if rtc is not None:
+                                    rtc.push_output(result)  # WebRTC: the frame goes out on the track
+                            else:
+                                latest_output_b64 = result
+                                latest_output_seq += 1
+                                latest_output_ts = time.time()
+                                output_event.set()
                             published += 1
                 except Exception as e:  # noqa: BLE001 - keep polling
                     log.warning("livecam output poller: %s", e)
@@ -1076,7 +1175,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         continue
                     output_event.clear()
 
-                    if latest_output_b64 is not None and latest_output_seq > last_sent_seq:
+                    if latest_output_b64 is not None and latest_output_seq > last_sent_seq and not rtc_live():
                         try:
                             await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
                             last_send_ts = time.time()
@@ -1107,7 +1206,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                     cadence_deadline = next_tick_ts
 
                     # Check if new frame available.
-                    have_new_frame = latest_output_b64 is not None and latest_output_seq > last_sent_seq
+                    have_new_frame = latest_output_b64 is not None and latest_output_seq > last_sent_seq and not rtc_live()
 
                     if have_new_frame:
                         freshness_deadline = latest_output_ts + max_jitter_s
@@ -1138,7 +1237,7 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                         except Exception as e:
                             log.warning("livecam sender: send failed: %s", e)
                             break
-                    elif REPEAT_LAST_FRAME_WHEN_IDLE and latest_output_b64 is not None:
+                    elif REPEAT_LAST_FRAME_WHEN_IDLE and latest_output_b64 is not None and not rtc_live():
                         try:
                             await websocket.send_json({"type": "frame", "frame_b64": latest_output_b64})
                             last_send_ts = time.time()
@@ -1206,9 +1305,11 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
         # after the session cap closes the socket); stop and wait for them so the
         # handler never returns with tasks still running.
         stop_event.set()
-        for t in tasks:
+        for t in tasks + rtc_tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, *rtc_tasks, return_exceptions=True)
+        if rtc is not None:
+            await rtc.close()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 # Thin build: an existing dual-engine image (BASE_IMAGE, e.g. the live livecam-dual-v1-<commit>) plus this
 # branch's FluxRT app files. Nothing is reinstalled: every system and Python package stays exactly as in the
-# base image, so an app change ships, and is judged, on its own.
+# base image, so an app change ships, and is judged, on its own. The one addition is the pinned WebRTC
+# package list (livecam/requirements-webrtc.txt, for LIVECAM_WEBRTC, off by default), installed with pip's
+# default only-if-needed rule, so a package already in the base image is kept when it satisfies aiortc.
 #
 # Built by .github/workflows/build-livecam-dual.yml when it is dispatched with base_commit; the workflow first
 # checks that nothing but these app files (plus docs, tests and CI) changed since that commit. Anything else
@@ -12,6 +14,8 @@ FROM ${BASE_IMAGE}
 RUN rm -rf /app/livecam
 COPY server.py bootstrap.py session_token.py /app/
 COPY livecam /app/livecam
+RUN /usr/bin/python3.12 -m pip install --no-cache-dir -r /app/livecam/requirements-webrtc.txt \
+    && cd /app && /usr/bin/python3.12 -c "from livecam import webrtc; assert webrtc.available(), webrtc.unavailable_reason(); print('webrtc ok')"
 
 # The same import check as the full build's FluxRT side.
 RUN /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py /app/livecam/*.py \
