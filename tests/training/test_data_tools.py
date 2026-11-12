@@ -312,3 +312,97 @@ def test_glance_per_config_subset_is_balanced(tmp_path):
         by[(m["config"], m["split"])] = by.get((m["config"], m["split"]), 0) + 1
     assert by == {("mens-upperwear", "train"): 2, ("mens-upperwear", "test"): 1, ("mens-lowerwear", "train"): 2}
     assert n == 5
+
+
+def test_vivid_zip_real_layout_pairs_by_product_id(tmp_path):
+    """ViViD.zip as released: <cat>/videos/N_detail.mp4 + <cat>/images/N_in_xl.jpg (+ masks we ignore)."""
+    import zipfile
+    from data_tools import convert_vivid, vivid_zip
+    zpath = tmp_path / "ViViD.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        for cat, ids in (("upper_body", ["1221886", "1221887"]), ("dresses", ["2000001"]), ("lower_body", ["3000001"])):
+            for i in ids:
+                z.writestr(f"ViViD/{cat}/videos/{i}_detail.mp4", b"MP4" + i.encode())
+                z.writestr(f"ViViD/{cat}/images/{i}_in_xl.jpg", png((10, 20, 30)))
+                z.writestr(f"ViViD/{cat}/cloth_mask/{i}_in_xl.jpg", b"mask")
+                z.writestr(f"ViViD/{cat}/agnostic_mask/{i}_detail.mp4", b"mask")
+        z.writestr("ViViD/upper_body/videos/9999999_detail.mp4", b"no garment photo")
+    report = vivid_zip.inspect(str(zpath))
+    assert report["videos"] == 5 and report["cloth_images"] == 4 and report["pairs_by_stem"] == 4
+    out = vivid_zip.extract(str(zpath), str(tmp_path / "sample"), sample=10)
+    assert out == {"pairs_available": 4, "extracted": 4}
+    assert (tmp_path / "sample" / "upper_body" / "cloth" / "1221886_in_xl.jpg").exists()
+    res = convert_vivid.convert(str(tmp_path / "sample"), str(tmp_path / "staging"), "stem")
+    assert res == {"pairs_found": 4, "staged": 4}
+    cats = sorted(json.loads(p.read_text())["category"] for p in (tmp_path / "staging").rglob("meta.json"))
+    assert cats == ["dress", "lower", "upper", "upper"]
+    # Also straight from an images/ layout on disk (no extract step).
+    import shutil
+    raw = tmp_path / "raw" / "upper_body"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "images").mkdir()
+    (raw / "videos" / "5_detail.mp4").write_bytes(b"v")
+    (raw / "images" / "5_in_xl.jpg").write_bytes(png((1, 2, 3)))
+    assert convert_vivid.inspect(str(tmp_path / "raw"))["videos_with_same_stem_cloth"] == 1
+    shutil.rmtree(tmp_path / "raw")
+def test_joyai_editor_gives_each_vae_role_its_own_device(monkeypatch):
+    """Regression (P8 trial): without per-role VAE devices the workers share one VAE cache."""
+    import sys
+    import types
+    from data_tools import pseudo_source
+    seen = {}
+
+    class FakeRuntime:
+        @classmethod
+        def load(cls, dit, **kw):
+            seen.update(kw, dit=dit)
+            return cls()
+
+    mod = types.ModuleType("xvideo.serving.joyomni_streaming")
+    mod.JoyOmniRuntime, mod.StreamingSettings = FakeRuntime, object
+    for name in ("xvideo", "xvideo.serving"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "xvideo.serving.joyomni_streaming", mod)
+    pseudo_source.JoyAIEditor("d.pth", "vae", "te", device="cuda:0")
+    for k in ("vae_encode_device", "vae_decode_device", "vae_pseudo_device", "postprocess_device"):
+        assert seen[k] == "cuda:0"
+
+
+def _mp4(path, n, color="red"):
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=96x160:r=24",
+                    "-frames:v", str(n), "-pix_fmt", "yuv420p", str(path)], check=True)
+    return path.read_bytes()
+
+
+def test_max_frames_caps_clip_edit_and_pack_matches_target(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    from data_tools import pack as pack_mod
+    from data_tools import pseudo_source
+    from data_tools.staging import stage_pair
+    stage = tmp_path / "staging"
+    stage_pair(stage, "vivid_train_000000", {"ref.jpg": png((200, 0, 0)), "target.mp4": _mp4(tmp_path / "t.mp4", 60)},
+               {"source": "vivid", "split": "train", "category": "dress", "task": "iv2v"})
+
+    class Editor:
+        name = "fake"
+        def edit(self, frames, prompt, size):
+            from PIL import Image
+            out = []
+            for f in frames:  # partial, visible edit (a stripe), so the quality filter passes
+                im = f.convert("RGB").copy()
+                im.paste((0, 0, 255), (0, 0, im.width, im.height // 5))
+                out.append(im)
+            return out
+
+    stats = pseudo_source.process(str(stage), Editor(), max_frames=25)
+    assert stats["done"] == 1
+    d = stage / "vivid_train_000000"
+    assert pack_mod._frame_count((d / "source.mp4").read_bytes()) == 25
+    assert json.loads((d / "meta.json").read_text())["pseudo_source"]["frames"] == 25
+    s = pack_mod._sample(d, json.loads((d / "meta.json").read_text()))
+    assert pack_mod._frame_count(s.files["0.mp4"]) == pack_mod._frame_count(s.files["1.mp4"]) == 25
+    assert pack_mod._frame_count((d / "target.mp4").read_bytes()) == 60  # staged original untouched

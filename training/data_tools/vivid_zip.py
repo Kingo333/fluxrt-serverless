@@ -18,14 +18,14 @@ import zipfile
 from collections import Counter
 from pathlib import PurePosixPath
 
-from .convert_vivid import _pattern
+from .convert_vivid import CLOTH_DIRS, _pattern, pair_id
 
 IMG = (".jpg", ".jpeg", ".png")
 
 
 def _index(names: list[str]):
     videos = [n for n in names if n.lower().endswith(".mp4") and "/videos/" in f"/{n}"]
-    cloths = [n for n in names if n.lower().endswith(IMG) and "/cloth/" in f"/{n}"]
+    cloths = [n for n in names if n.lower().endswith(IMG) and any(f"/{d}/" in f"/{n}" for d in CLOTH_DIRS)]
     return videos, cloths
 
 
@@ -33,13 +33,14 @@ def pairs_by_stem(names: list[str]) -> list[tuple[str, str]]:
     videos, cloths = _index(names)
     # pair within the same parent folder of videos/ and cloth/ (e.g. upper_body/videos, upper_body/cloth)
     by_key = {}
+    # ViViD.zip names them N_detail.mp4 and N_in_xl.jpg, so pair on the product number.
     for c in cloths:
         p = PurePosixPath(c)
-        by_key[(str(p.parent.parent), p.stem)] = c
+        by_key[(str(p.parent.parent), pair_id(p.stem))] = c
     out = []
     for v in videos:
         p = PurePosixPath(v)
-        c = by_key.get((str(p.parent.parent), p.stem))
+        c = by_key.get((str(p.parent.parent), pair_id(p.stem)))
         if c:
             out.append((v, c))
     return sorted(out)

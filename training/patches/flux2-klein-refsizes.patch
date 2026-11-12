@@ -1,0 +1,136 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index cacb229..ffb0ffd 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -342,6 +342,14 @@ def parse_args(input_args=None):
+         help="Azyah: WIDTHxHEIGHT for the second condition image. It is padded with white to this size, "
+         "never stretched, the same as the FluxRT worker does with the garment reference.",
+     )
++    parser.add_argument(
++        "--cond_2_sizes",
++        type=str,
++        default=None,
++        help="Azyah fxreal5: several garment-photo sizes with weights, e.g. '576x768:2,432x576:1,288x512:1'. Each "
++        "batch gets one of them (weighted, seeded), so the LoRA works at every live FLUXRT_REF size. Off: "
++        "--cond_2_size for every batch.",
++    )
+     parser.add_argument(
+         "--caption_column",
+         type=str,
+@@ -1014,7 +1022,10 @@ class DreamBoothDataset(Dataset):
+             if dest_image is not None:
+                 self.cond_pixel_values.append((dest_image, bucket_idx))
+             if self.cond_images_2:
+-                self.cond_2_pixel_values.append(_azyah_pad_to(self.cond_images_2[i], cond_2_w, cond_2_h))
++                # --cond_2_sizes: padded per batch in collate_fn, at that batch's size
++                self.cond_2_pixel_values.append(
++                    None if _AZ_REF_SIZES else _azyah_pad_to(self.cond_images_2[i], cond_2_w, cond_2_h)
++                )
+ 
+         self.num_instance_images = len(self.instance_images)
+         self._length = self.num_instance_images
+@@ -1031,7 +1042,11 @@ class DreamBoothDataset(Dataset):
+             dest_image, _ = self.cond_pixel_values[index % self.num_instance_images]
+             example["cond_images"] = dest_image
+         if self.cond_2_pixel_values:
+-            example["cond_images_2"] = self.cond_2_pixel_values[index % self.num_instance_images]
++            cond_2 = self.cond_2_pixel_values[index % self.num_instance_images]
++            if cond_2 is None:
++                example["cond_image_2_raw"] = self.cond_images_2[index % self.num_instance_images]
++            else:
++                example["cond_images_2"] = cond_2
+         if self.pair_ids:
+             example["pair_id"] = self.pair_ids[index % self.num_instance_images]
+         if self.loss_masks:
+@@ -1097,6 +1112,39 @@ class DreamBoothDataset(Dataset):
+         return (image, dest_image) if dest_image is not None else (image, None)
+ 
+ 
++# Azyah fxreal5: garment-photo sizes for --cond_2_sizes, as [(width, height, weight)]; None = one size.
++_AZ_REF_SIZES = None
++_AZ_REF_RNG = random.Random(0)
++
++
++def _azyah_parse_ref_sizes(spec):
++    sizes = []
++    for part in str(spec).split(","):
++        part = part.strip()
++        if not part:
++            continue
++        size, _, weight = part.partition(":")
++        w, h = (int(v) for v in size.lower().split("x"))
++        if w % 16 or h % 16:  # the FluxRT worker rounds FLUXRT_REF_WIDTH/HEIGHT to multiples of 16
++            raise ValueError(f"--cond_2_sizes: {size} is not a multiple of 16")
++        if float(weight or 1) <= 0:
++            raise ValueError(f"--cond_2_sizes: weight of {size} must be positive")
++        sizes.append((w, h, float(weight or 1)))
++    if not sizes:
++        raise ValueError("--cond_2_sizes is empty")
++    return sizes
++
++
++def _azyah_pick_ref_size():
++    total = sum(wt for _, _, wt in _AZ_REF_SIZES)
++    r = _AZ_REF_RNG.uniform(0, total)
++    for w, h, wt in _AZ_REF_SIZES:
++        r -= wt
++        if r <= 0:
++            return w, h
++    return _AZ_REF_SIZES[-1][0], _AZ_REF_SIZES[-1][1]
++
++
+ def _azyah_pad_to(image, width, height):
+     """Fit inside width x height and pad with white (no stretch, no crop, no flip)."""
+     image = exif_transpose(image)
+@@ -1130,6 +1178,12 @@ def collate_fn(examples):
+     if any("cond_images_2" in example for example in examples):
+         cond_2 = torch.stack([example["cond_images_2"] for example in examples])
+         batch["cond_2_pixel_values"] = cond_2.to(memory_format=torch.contiguous_format).float()
++    elif any("cond_image_2_raw" in example for example in examples):
++        # Azyah fxreal5: the whole batch shares one garment-photo size (the tokens are concatenated per batch)
++        w, h = _azyah_pick_ref_size()
++        cond_2 = torch.stack([_azyah_pad_to(example["cond_image_2_raw"], w, h) for example in examples])
++        batch["cond_2_pixel_values"] = cond_2.to(memory_format=torch.contiguous_format).float()
++        batch["cond_2_size"] = f"{w}x{h}"
+     return batch
+ 
+ 
+@@ -1238,6 +1292,10 @@ class PromptDataset(Dataset):
+ 
+ 
+ def main(args):
++    global _AZ_REF_SIZES
++    if args.cond_2_sizes:
++        _AZ_REF_SIZES = _azyah_parse_ref_sizes(args.cond_2_sizes)
++        _AZ_REF_RNG.seed(args.seed if args.seed is not None else 0)
+     if args.report_to == "wandb" and args.hub_token is not None:
+         raise ValueError(
+             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
+@@ -1725,6 +1783,7 @@ def main(args):
+         loss_mask_cache = []
+         pair_cache = []
+         _azyah_prompt_memo = {}
++        _az_ref_size_counts = {}
+         for batch in tqdm(train_dataloader, desc="Caching latents"):
+             with torch.no_grad():
+                 if args.cache_latents:
+@@ -1745,6 +1804,8 @@ def main(args):
+                     if "loss_mask" in batch:
+                         loss_mask_cache.append(batch["loss_mask"])
+                     pair_cache.append(batch.get("pair_ids"))
++                    if "cond_2_size" in batch:
++                        _az_ref_size_counts[batch["cond_2_size"]] = _az_ref_size_counts.get(batch["cond_2_size"], 0) + 1
+                 if train_dataset.custom_instance_prompts:
+                     # Azyah: our captions repeat (one FluxRT prompt per category), so identical
+                     # batches share one tensor instead of ~8 MB of GPU memory per sample.
+@@ -1760,6 +1821,10 @@ def main(args):
+                     prompt_embeds_cache.append(prompt_embeds)
+                     text_ids_cache.append(text_ids)
+ 
++        if _az_ref_size_counts:
++            logger.info(f"Azyah garment-photo sizes per batch: {_az_ref_size_counts}")
++            print(f"REF_SIZES {_az_ref_size_counts}", flush=True)
++
+     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+     if args.cache_latents:
+         vae = vae.to("cpu")

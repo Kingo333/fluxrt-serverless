@@ -20,6 +20,8 @@ import json
 import re
 
 PREFIXES = ("base_model.model.", "module.", "_orig_mod.", "model.")
+# Wrapper names that can appear anywhere in a key (activation checkpointing, FSDP, compile, PEFT).
+INNER = ("_checkpoint_wrapped_module.", "_fsdp_wrapped_module.", "_orig_mod.", "base_layer.")
 
 
 def _strip(k: str) -> str:
@@ -29,7 +31,14 @@ def _strip(k: str) -> str:
         for p in PREFIXES:
             if k.startswith(p):
                 k, changed = k[len(p):], True
+    for seg in INNER:
+        k = k.replace(seg, "")
     return k
+
+
+def _dense(v):
+    """DTensor / sharded values from FSDP saves -> plain tensors."""
+    return v.full_tensor() if hasattr(v, "full_tensor") else v
 
 
 def unwrap_backbone(ckpt: dict) -> dict:
@@ -41,34 +50,69 @@ def unwrap_backbone(ckpt: dict) -> dict:
     return {_strip(k): v for k, v in ckpt.items() if hasattr(v, "shape")}
 
 
-def merge(base: dict, lora: dict, r: int, alpha: float) -> tuple[dict, int]:
-    """base: {name: W}; lora: PEFT keys like '<path>.lora_A.weight' / '<path>.lora_B.weight'
-    (adapter name possibly inside: '<path>.lora_A.<adapter>.weight'). Returns merged copy and count."""
+def find_lora(ckpt: dict) -> dict:
+    """The LoRA tensors: ckpt["generator_lora"] (our Stage 1/2 saves), else any dict (top level or
+    one level down) whose keys contain '.lora_A'."""
+    if isinstance(ckpt.get("generator_lora"), dict) and ckpt["generator_lora"]:
+        return ckpt["generator_lora"]
+    for cand in [ckpt, *[v for v in ckpt.values() if isinstance(v, dict)]]:
+        if any(".lora_A" in str(k) for k in cand):
+            return {k: v for k, v in cand.items() if "lora_" in str(k) and hasattr(v, "shape")}
+    return {}
+
+
+def describe(ckpt: dict, n: int = 20) -> str:
+    """Key dump for when nothing matches: top-level layout and the first n keys of each dict."""
+    lines = [f"top-level keys: {[(k, type(v).__name__) for k, v in list(ckpt.items())[:30]]}"]
+    for k, v in ckpt.items():
+        if isinstance(v, dict) and v:
+            sample = list(v.items())[:n]
+            lines.append(f"[{k}] {len(v)} entries; first {len(sample)}:")
+            lines += [f"    {kk}  {tuple(getattr(vv, 'shape', ())) or type(vv).__name__}" for kk, vv in sample]
+    return "\n".join(lines)
+
+
+def merge(base: dict, lora: dict, r: int, alpha: float, fold=None) -> tuple[dict, int]:
+    """base: {name: W}; lora: PEFT keys '<path>.lora_A[.<adapter>...].weight' and the matching
+    '<path>.lora_B[...]'. W_merged = W + (alpha / r) * B @ A. Returns merged copy and count.
+
+    fold(w, b, a, scale) -> merged W. main() passes a torch fold that works one layer at a time
+    and returns bf16 right away, so the merge never holds fp32 copies of the 16.6B backbone
+    (the fp32 version ran a 94 GB Pod out of RAM). Without it (tests) it is plain numpy."""
     scale = alpha / r
-    pat = re.compile(r"^(?P<mod>.+)\.lora_A(?:\.[^.]+)?\.weight$")
+    norm = {_strip(k): _dense(v) for k, v in lora.items()}
     out = dict(base)
     merged = 0
-    for key, a in lora.items():
-        m = pat.match(_strip(key))
-        if not m:
+    for key, a in norm.items():
+        if ".lora_A." not in key or not key.endswith("weight"):
             continue
-        mod = m.group("mod")
-        b_key = next((k for k in lora if _strip(k) in (f"{mod}.lora_B.weight",) or
-                      re.fullmatch(rf"{re.escape(mod)}\.lora_B\.[^.]+\.weight", _strip(k))), None)
-        if b_key is None:
+        mod, rest = key.split(".lora_A.", 1)
+        b_key = f"{mod}.lora_B.{rest}"
+        if b_key not in norm:
             raise SystemExit(f"LoRA A without B for {mod}")
         w_key = f"{mod}.weight"
         if w_key not in out:
             raise SystemExit(f"LoRA targets {w_key}, which is not in the Stage 1 backbone")
-        w = out[w_key]
-        delta = (lora[b_key] @ a) * scale
-        if tuple(delta.shape) != tuple(w.shape):
-            raise SystemExit(f"shape mismatch for {w_key}: {tuple(w.shape)} vs delta {tuple(delta.shape)}")
-        out[w_key] = (w.astype("float32") if hasattr(w, "astype") else w.float()) + delta
+        w, b = out[w_key], norm[b_key]
+        delta_shape = (int(b.shape[0]), int(a.shape[1]))
+        if delta_shape != tuple(int(x) for x in w.shape):
+            raise SystemExit(f"shape mismatch for {w_key}: {tuple(w.shape)} vs delta {delta_shape}")
+        out[w_key] = fold(w, b, a, scale) if fold else w.astype("float32") + (b @ a) * scale
         merged += 1
     if merged == 0:
-        raise SystemExit("no LoRA layers found to merge")
+        raise SystemExit("no LoRA layers found to merge; first keys: " + ", ".join(list(norm)[:20]))
     return out, merged
+
+
+def torch_fold(device: str, dtype):
+    """One layer at a time: W (fp32 on `device`) += scale * B @ A, back to CPU in `dtype`."""
+    import torch
+
+    def fold(w, b, a, scale):
+        acc = w.to(device=device, dtype=torch.float32)
+        acc.addmm_(b.to(device=device, dtype=torch.float32), a.to(device=device, dtype=torch.float32), alpha=scale)
+        return acc.to(device="cpu", dtype=dtype)
+    return fold
 
 
 def check_keys(state: dict, serving_keys_json: str) -> list[str]:
@@ -91,23 +135,43 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--check-keys")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--device", help="where to fold each layer (default: cuda if available, else cpu)")
     a = ap.parse_args()
     import torch
     base = unwrap_backbone(torch.load(a.stage1, map_location="cpu", mmap=True, weights_only=True))
-    s2 = torch.load(a.stage2, map_location="cpu", weights_only=False)
-    if not s2.get("dmd_use_lora"):
-        raise SystemExit("Stage 2 checkpoint is not a LoRA checkpoint (dmd_use_lora missing)")
-    cfg = s2["generator_lora_config"]
-    merged, n = merge(base, s2["generator_lora"], int(cfg["r"]), float(cfg["lora_alpha"]))
+    # mmap: the training save also holds ~2 GB of optimizer state we never need in RAM.
+    s2 = torch.load(a.stage2, map_location="cpu", weights_only=False, mmap=True)
+    lora = find_lora(s2)
+    if not lora:
+        print(describe(s2))
+        raise SystemExit("no LoRA tensors in the checkpoint (layout printed above)")
+    cfg = s2.get("generator_lora_config") or {}
+    ranks = {int(v.shape[0]) for k, v in lora.items() if ".lora_A" in str(k)}
+    r = int(cfg.get("r") or (ranks.pop() if len(ranks) == 1 else 0))
+    if not r:
+        raise SystemExit(f"cannot tell the LoRA rank (config missing, ranks {sorted(ranks)})")
+    alpha = float(cfg.get("lora_alpha") or r)
+    print(f"LoRA tensors: {len(lora)}, r={r}, alpha={alpha}; first keys: {list(lora)[:3]}")
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
-    merged = {k: v.to(dt) if v.is_floating_point() else v for k, v in merged.items()}
+    device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtypes = sorted({str(v.dtype) for v in base.values()})
+    print(f"backbone: {len(base)} tensors, dtypes {dtypes}; merging on {device}, saving {a.dtype}")
+    try:
+        merged, n = merge(base, lora, r, alpha, fold=torch_fold(device, dt))
+    except SystemExit:
+        print(describe(s2))
+        raise
+    # Untouched tensors stay mmap-backed (no copy) when they are already in the target dtype.
+    merged = {k: v.to(dt) if v.is_floating_point() and v.dtype != dt else v for k, v in merged.items()}
     if a.check_keys:
         problems = check_keys(merged, a.check_keys)
         if problems:
             print("\n".join(problems))
             raise SystemExit(f"{len(problems)} layout problem(s): not saving")
     torch.save(merged, a.out)
-    print(f"merged {n} LoRA layers (r={cfg['r']}, alpha={cfg['lora_alpha']}) -> {a.out}")
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    print(f"merged {n} LoRA layers (r={r}, alpha={alpha}) -> {a.out}; peak RAM {peak:.1f} GB")
 
 
 if __name__ == "__main__":

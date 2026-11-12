@@ -29,8 +29,53 @@ def _as_jpeg(data: bytes) -> bytes:
         return out.getvalue()
 
 
-def _sample(d: Path, meta: dict) -> Sample | None:
-    ref, src, tgt = find(d, "ref"), find(d, "source"), find(d, "target")
+def _frame_count(data: bytes) -> int:
+    import av
+    with av.open(io.BytesIO(data)) as c:
+        return sum(1 for _ in c.decode(video=0))
+
+
+def _trim_video(data: bytes, n: int) -> bytes:
+    """First n frames, re-encoded at the same size and rate (crf 18)."""
+    import av
+    out = io.BytesIO()
+    with av.open(io.BytesIO(data)) as src, av.open(out, "w", format="mp4") as dst:
+        st = src.streams.video[0]
+        enc = dst.add_stream("libx264", rate=round(float(st.average_rate or 24)))
+        enc.width, enc.height, enc.pix_fmt = st.codec_context.width, st.codec_context.height, "yuv420p"
+        enc.options = {"crf": "18"}
+        for i, frame in enumerate(src.decode(video=0)):
+            if i >= n:
+                break
+            for pkt in enc.encode(frame.reformat(format="yuv420p")):
+                dst.mux(pkt)
+        for pkt in enc.encode():
+            dst.mux(pkt)
+    return out.getvalue()
+
+
+def _matched_target(src: bytes, tgt: bytes) -> bytes:
+    """The loader picks the same relative window in source and target, so they must be
+    the same length. A capped pseudo-source (--max-frames) gets a trimmed target copy;
+    the staged original is never changed."""
+    ns, nt = _frame_count(src), _frame_count(tgt)
+    return _trim_video(tgt, ns) if ns < nt else tgt
+
+
+def _source(d: Path, meta: dict, prefer_live: bool) -> tuple[Path | None, dict]:
+    """The input of a pair: live_source.* (live_source.py: fixed garment photo, steady) when
+    asked for and present, else the P8 source.*. Returns (path, extra metadata)."""
+    if prefer_live and (meta.get("live_source") or {}).get("ok"):
+        live = find(d, "live_source")
+        if live is not None:
+            ls = meta["live_source"]
+            return live, {"input": "live_source", "extra_item": ls.get("extra_item"), "ref_key": ls.get("ref_key")}
+    return find(d, "source"), {}
+
+
+def _sample(d: Path, meta: dict, prefer_live: bool = False) -> Sample | None:
+    src, src_extra = _source(d, meta, prefer_live)
+    ref, tgt = find(d, "ref"), find(d, "target")
     if not (ref and src and tgt):
         return None
     detailed = None
@@ -40,10 +85,11 @@ def _sample(d: Path, meta: dict) -> Sample | None:
                   captions={"caption_detailed": detailed},
                   source=meta["source"], split=meta["split"], garment_id=meta.get("garment_id"),
                   person_id=meta.get("person_id"), consent_id=meta.get("consent_id"),
-                  extra={k: meta[k] for k in ("config", "category", "pseudo_source") if k in meta})
+                  extra={**{k: meta[k] for k in ("config", "category", "pseudo_source") if k in meta}, **src_extra})
     if tgt.suffix == ".mp4":
-        return Sample(task="iv2v", files={"0.jpg": _as_jpeg(ref.read_bytes()), "0.mp4": src.read_bytes(),
-                                          "1.mp4": tgt.read_bytes()}, **common)
+        src_bytes = src.read_bytes()
+        return Sample(task="iv2v", files={"0.jpg": _as_jpeg(ref.read_bytes()), "0.mp4": src_bytes,
+                                          "1.mp4": _matched_target(src_bytes, tgt.read_bytes())}, **common)
     files = {"0.png": ref.read_bytes(), "1.png": src.read_bytes(), "2.png": tgt.read_bytes()}
     if any(p.suffix != ".png" for p in (ref, src, tgt)):
         files = {"0.jpg": _as_jpeg(ref.read_bytes()), "1.jpg": _as_jpeg(src.read_bytes()), "2.jpg": _as_jpeg(tgt.read_bytes())}
@@ -70,12 +116,18 @@ def _identity(s: Sample) -> Sample:
                   extra={**s.extra, "identity_pair": True}, captions=dict(s.captions))
 
 
-def pack(staging_dir: str, out_dir: str, name: str, per_shard: int = 500, identity_frac: float = 0.1) -> dict:
+def pack(staging_dir: str, out_dir: str, name: str, per_shard: int = 500, identity_frac: float = 0.1,
+         prefer_live_source: bool = False, only_live_source: bool = False, split: str | None = None) -> dict:
     buckets: dict[tuple, list[Sample]] = defaultdict(list)
     missing = 0
     identity = 0
     for d, meta in iter_pairs(Path(staging_dir)):
-        s = _sample(d, meta)
+        if split and meta.get("split") != split:
+            continue
+        if only_live_source and not ((meta.get("live_source") or {}).get("ok") and find(d, "live_source")):
+            missing += 1  # e.g. ViViD clips whose only input is the flickering P8 source.mp4
+            continue
+        s = _sample(d, meta, prefer_live_source or only_live_source)
         if s is None:
             missing += 1
             continue
@@ -100,8 +152,14 @@ def main() -> None:
     ap.add_argument("--per-shard", type=int, default=500)
     ap.add_argument("--identity-frac", type=float, default=0.1,
                     help="share of training pairs also added as clean-input 'no change' pairs (review R5)")
+    ap.add_argument("--prefer-live-source", action="store_true",
+                    help="use live_source.* (live_source.py, fixed garment photo) instead of source.* when present")
+    ap.add_argument("--only-live-source", action="store_true",
+                    help="pack only pairs that have an ok live_source.* (skip pairs whose input is the old source.*)")
+    ap.add_argument("--split", help="only this split (e.g. train)")
     a = ap.parse_args()
-    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac), indent=2))
+    print(json.dumps(pack(a.staging_dir, a.out_dir, a.name, a.per_shard, a.identity_frac, a.prefer_live_source,
+                          a.only_live_source, a.split), indent=2))
 
 
 if __name__ == "__main__":

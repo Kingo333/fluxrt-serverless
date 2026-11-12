@@ -18,7 +18,11 @@ fetch setup_training_pod.sh | bash
 if [ ! -f "$DONE" ]; then
   fetch run_smoke.sh | GPUS="${GPUS:-1}" HSDP="${HSDP:-${GPUS:-1}}" bash
   last=$(ls -t "$AZ_REPORTS"/smoke_*.log | grep -v _gpu | head -1)
-  if grep -qE "Traceback|CUDA out of memory|RuntimeError|Killed" "$last" || ! find "$AZ_OUT/stage1_smoke" -name "step_30.pth" | grep -q .; then
+  ck=$(find "$AZ_OUT/stage1_smoke" -name "step_30.pth" | head -1)
+  # The save must hold the LoRA weights, not only optimizer moments (exp1 bug, 2026-11-03).
+  n_lora=$([ -n "$ck" ] && "$AZ_ROOT/venv/bin/python" -c "import sys,torch; print(len(torch.load(sys.argv[1], map_location='cpu', weights_only=False, mmap=True).get('generator_lora') or {}))" "$ck" || echo 0)
+  echo "smoke step_30 adapter tensors: $n_lora"
+  if grep -qE "Traceback|CUDA out of memory|RuntimeError|Killed" "$last" || [ -z "$ck" ] || [ "$n_lora" -lt 2 ]; then
     echo "SMOKE FAILED: not starting exp1. Paste the summary above to Claude Code, then stop the Pod." >&2
     exit 1
   fi

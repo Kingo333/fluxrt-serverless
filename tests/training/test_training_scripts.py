@@ -141,3 +141,191 @@ def test_model_card_states_vivid_and_blocks_commercial_use():
     assert not com["trained_with_vivid"] and com["commercial_use_cleared"] and com["notice"] == ""
     card2, entry2 = mod.build(com, "dit.pth", "azyah-vton-candidate", "x", "n", "abc")
     assert "Not cleared" not in card2 and entry2["commercial_use_cleared"] is True
+
+
+def test_setup_applies_text_encoder_sdpa_patch():
+    """P9 smoke failed: upstream hard-codes flash_attention_2 for the text encoder and flash_attn isn't installed."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "training"
+    sh = (root / "scripts" / "setup_training_pod.sh").read_text()
+    assert "text-encoder-sdpa.patch" in sh
+    patch = (root / "patches" / "text-encoder-sdpa.patch").read_text()
+    assert 'AZ_TEXT_ENCODER_ATTN", "sdpa"' in patch and "-            attn_implementation=\"flash_attention_2\"," in patch
+
+
+def test_setup_applies_dataset_video_bytes_patch():
+    """P9 smoke #2: datasets 5.x decodes Video() columns with torchcodec, which isn't installed."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "training"
+    assert "dataset-video-bytes.patch" in (root / "scripts" / "setup_training_pod.sh").read_text()
+    patch = (root / "patches" / "dataset-video-bytes.patch").read_text()
+    assert patch.count("+                \"0.mp4\": datasets.Video(decode=False),") == 1
+    assert "datasets.Video(decode=False)" in patch and "__init__.py" in patch
+
+
+def test_stage1_lora_patch_keeps_base_frozen_and_asserts_size():
+    """P9 smoke #3: upstream setup_model_and_optimizer re-enabled grads on all 16.6B params -> AdamW OOM."""
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "training/src/train_t2v.py" in patch
+    assert "+    if getattr(cfg, \"stage1_lora\", False):" in patch
+    assert "+        dit.requires_grad_(True)" in patch  # only in the non-LoRA branch
+    assert "0 < trainable < 1_000_000_000" in patch
+
+
+def test_stage1_lora_resume_fills_missing_optimizer_state():
+    """P9 smoke #4: resume KeyError on a LoRA param with no AdamW state (last block's unused text branch)."""
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "+def _fill_missing_optim_state(model, optim_state: dict) -> int:" in patch
+    assert "added = _fill_missing_optim_state(model, state_dict[\"optimizer\"])" in patch
+
+
+def test_lora_merge_accepts_adapter_names_and_wrappers():
+    """P9e: merge found no layers in step_2000.pth; accept every PEFT/wrapper key form."""
+    np = pytest.importorskip("numpy")
+    mod = load("merge_lora")
+    rng = np.random.default_rng(1)
+    w = rng.standard_normal((6, 4)).astype("float32")
+    a = rng.standard_normal((2, 4)).astype("float32")
+    b = rng.standard_normal((6, 2)).astype("float32")
+    base = {"double_blocks.0.img_attn_qkv.weight": w}
+    for ka, kb in [
+        ("double_blocks.0.img_attn_qkv.lora_A.weight", "double_blocks.0.img_attn_qkv.lora_B.weight"),
+        ("double_blocks.0.img_attn_qkv.lora_A.generator.weight", "double_blocks.0.img_attn_qkv.lora_B.generator.weight"),
+        ("double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_A.generator.default.weight",
+         "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_B.generator.default.weight"),
+    ]:
+        merged, n = mod.merge(base, {ka: a, kb: b}, r=2, alpha=2)
+        assert n == 1 and np.allclose(merged["double_blocks.0.img_attn_qkv.weight"], w + b @ a)
+    nested = {"step": 2000, "model": {"double_blocks.0.img_attn_qkv.lora_A.weight": a,
+                                       "double_blocks.0.img_attn_qkv.lora_B.weight": b}}
+    assert len(mod.find_lora(nested)) == 2
+    assert len(mod.find_lora({"generator_lora": {"x.lora_A.weight": a}})) == 1
+    assert mod.find_lora({"step": 1, "optimizer": {"state": {}}}) == {}
+    assert "top-level keys" in mod.describe({"step": 1, "model": {"k": a}})
+
+
+def _patched_functions():
+    """Run the patch's _canonical/_collect_lora with a stand-in torch (no GPU torch in CI)."""
+    import types
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    lines, on = [], False
+    for line in patch.splitlines():
+        if line.startswith("+_WRAPPER_SEGMENTS"):
+            on = True
+        if on and line.startswith("+def _fill_missing_optim_state"):
+            on = False  # skip this one; resume fill is tested on the GPU smoke
+            skip = True
+        if on:
+            lines.append(line[1:])
+    body = "\n".join(lines)
+    start = patch.index("+def _canonical(")
+    end = patch.index("+def _is_stage1_lora(")
+    body += "\n" + "\n".join(l[1:] for l in patch[start:end].splitlines() if l.startswith("+"))
+    dist = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: False, get_world_size=lambda: 1)
+    ns = {"torch": types.SimpleNamespace(distributed=dist)}
+    exec(body, ns)
+    return ns
+
+
+class _T:
+    def __init__(self, shape):
+        self.shape = shape
+    def detach(self):
+        return self
+    def to(self, _):
+        return self
+    def clone(self):
+        return self
+
+
+def test_stage1_lora_save_collects_adapter_tensors():
+    """P9e found exp1's generator_lora EMPTY: PEFT's helper returned {} on the FSDP state dict."""
+    ns = _patched_functions()
+    full = {
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_A.generator.weight": _T((64, 4096)),
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.lora_B.generator.weight": _T((12288, 64)),
+        "double_blocks.0._checkpoint_wrapped_module.img_attn_qkv.base_layer.weight": _T((12288, 4096)),
+    }
+    out = ns["_collect_lora"](None, full, "generator")
+    assert set(out) == {"double_blocks.0.img_attn_qkv.lora_A.weight", "double_blocks.0.img_attn_qkv.lora_B.weight"}
+
+    class _Model:  # full state dict without lora keys -> trainable params
+        def named_parameters(self):
+            yield "double_blocks.0.img_attn_qkv.lora_A.generator.weight", type("P", (_T,), {"requires_grad": True})((64, 4096))
+            yield "double_blocks.0.img_attn_qkv.base_layer.weight", type("P", (_T,), {"requires_grad": False})((1, 1))
+    out = ns["_collect_lora"](_Model(), {}, "generator")
+    assert set(out) == {"double_blocks.0.img_attn_qkv.lora_A.weight"}
+
+
+def test_stage1_lora_save_and_resume_refuse_empty_adapters():
+    from pathlib import Path
+    patch = (Path(__file__).resolve().parents[2] / "training" / "patches" / "stage1-lora.patch").read_text()
+    assert "refusing to write a" in patch and "has NO adapter weights" in patch
+    assert "get_peft_model_state_dict(model, state_dict=full_state" not in patch
+    sh = (Path(__file__).resolve().parents[2] / "training" / "scripts" / "run_first_session.sh").read_text()
+    assert "generator_lora" in sh  # smoke pass also checks the saved adapter tensors
+
+
+def test_merge_lora_main_end_to_end_bf16(tmp_path, monkeypatch):
+    """P9e OOM: the merge must fold layer by layer and save bf16, reading a real training save
+    (generator_lora + config + optimizer state) with mmap."""
+    torch = pytest.importorskip("torch")
+    import sys
+    mod = load("merge_lora")
+    g = torch.Generator().manual_seed(0)
+    w = torch.randn(6, 4, generator=g).to(torch.bfloat16)
+    norm = torch.ones(4, dtype=torch.bfloat16)
+    a = torch.randn(2, 4, generator=g)
+    b = torch.randn(6, 2, generator=g)
+    torch.save({"double_blocks.0.img_attn_qkv.weight": w, "double_blocks.0.norm.weight": norm}, tmp_path / "base.pth")
+    torch.save({"step": 2000, "optimizer": {"state": {0: {"exp_avg": torch.zeros(3)}}},
+                "generator_lora": {"double_blocks.0.img_attn_qkv.lora_A.weight": a,
+                                   "double_blocks.0.img_attn_qkv.lora_B.weight": b},
+                "generator_lora_config": {"r": 2, "lora_alpha": 4}}, tmp_path / "step_2000.pth")
+    monkeypatch.setattr(sys, "argv", ["merge_lora", str(tmp_path / "base.pth"), str(tmp_path / "step_2000.pth"),
+                                      str(tmp_path / "out.pth"), "--device", "cpu"])
+    mod.main()
+    out = torch.load(tmp_path / "out.pth", weights_only=True)
+    assert out["double_blocks.0.img_attn_qkv.weight"].dtype == torch.bfloat16
+    want = (w.float() + 2.0 * (b @ a)).to(torch.bfloat16)
+    assert torch.allclose(out["double_blocks.0.img_attn_qkv.weight"].float(), want.float(), atol=1e-2)
+    assert torch.equal(out["double_blocks.0.norm.weight"], norm)
+
+
+def test_generate_vivid_fills_model_paths(tmp_path):
+    """P9e: generate_vivid ran without the JOYAI_* exports and tried checkpoints/vae on the Hub."""
+    import importlib.util as u
+    spec = u.spec_from_file_location("generate_vivid", SCRIPTS.parent / "eval" / "generate_vivid.py")
+    mod = u.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ck = tmp_path / "checkpoints"
+    (ck / "dit").mkdir(parents=True)
+    (ck / "dit" / "pretrain_editing_bid_version.pth").write_bytes(b"x")
+    (ck / "vae").mkdir()
+    env = {"AZ_ROOT": str(tmp_path)}
+    with pytest.raises(SystemExit, match="JOYAI_TEXT_ENCODER"):
+        mod.default_model_env(env)
+    (ck / "MiMo-VL-7B-RL-2508").mkdir()
+    got = mod.default_model_env(env)
+    assert got["JOYAI_VAE"] == str(ck / "vae")
+    env2 = {"AZ_ROOT": str(tmp_path), "JOYAI_VAE": str(ck / "dit")}
+    assert mod.default_model_env(env2)["JOYAI_VAE"] == str(ck / "dit")
+
+
+def test_generate_vivid_cross_pairs_same_category(tmp_path):
+    """--cross: real clip + another item's garment of the same category; lone categories skipped."""
+    import importlib.util as u
+    spec = u.spec_from_file_location("generate_vivid", SCRIPTS.parent / "eval" / "generate_vivid.py")
+    mod = u.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    items = []
+    for name, cat in [("a", "upper"), ("b", "lower"), ("c", "upper"), ("d", "dress")]:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "meta.json").write_text(json.dumps({"category": cat}))
+        items.append(d)
+    pairs = [(p.name, g.name) for p, g in mod.cross_pairs(items)]
+    assert pairs == [("a", "c"), ("c", "a")]

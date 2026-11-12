@@ -1,0 +1,223 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index a854304..3edc2e2 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -600,6 +600,26 @@ def parse_args(input_args=None):
+         ),
+     )
+     parser.add_argument("--mask_weight", type=float, default=2.0, help="Azyah: loss weight inside --mask_column.")
++    parser.add_argument(
++        "--pair_column",
++        type=str,
++        default=None,
++        help=(
++            "Azyah fxreal3: optional string column; two rows with the same non-empty value are nearby frames of "
++            "one video. They are batched together with the same noise level and noise, and --pair_weight asks "
++            "their predicted garment colour to differ only as much as the real frames do."
++        ),
++    )
++    parser.add_argument("--pair_weight", type=float, default=0.0, help="Azyah: weight of the same-clip colour term.")
++    parser.add_argument(
++        "--detail_weight",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal3: weight of an L1 term on the edges (spatial gradients) of the predicted clean latents "
++            "vs the answer, inside --mask_column, counted more at low noise. Fights the soft look of plain MSE."
++        ),
++    )
+     parser.add_argument(
+         "--time_shift_mu",
+         type=float,
+@@ -848,6 +868,12 @@ class DreamBoothDataset(Dataset):
+                     raise ValueError(f"`--cond_image_column_2` value '{args.cond_image_column_2}' not found in dataset columns.")
+                 cond_images_2 = dataset["train"][args.cond_image_column_2]
+                 assert len(instance_images) == len(cond_images_2)
++            pair_ids = None
++            if getattr(args, "pair_column", None):
++                if args.pair_column not in column_names:
++                    raise ValueError(f"`--pair_column` value '{args.pair_column}' not found in dataset columns.")
++                pair_ids = [p or "" for p in dataset["train"][args.pair_column]]
++                assert len(instance_images) == len(pair_ids)
+             loss_masks = None
+             if args.mask_column is not None:
+                 if args.mask_column not in column_names:
+@@ -884,6 +910,7 @@ class DreamBoothDataset(Dataset):
+         self.cond_images = []
+         self.cond_images_2 = []
+         self.loss_masks = []
++        self.pair_ids = []
+         for i, img in enumerate(instance_images):
+             self.instance_images.extend(itertools.repeat(img, repeats))
+             if args.dataset_name is not None and cond_images is not None:
+@@ -892,6 +919,8 @@ class DreamBoothDataset(Dataset):
+                 self.cond_images_2.extend(itertools.repeat(cond_images_2[i], repeats))
+             if args.dataset_name is not None and loss_masks is not None:
+                 self.loss_masks.extend(itertools.repeat(loss_masks[i], repeats))
++            if args.dataset_name is not None and pair_ids is not None:
++                self.pair_ids.extend(itertools.repeat(pair_ids[i], repeats))
+         cond_2_w, cond_2_h = (int(v) for v in args.cond_2_size.lower().split("x"))
+ 
+         self.pixel_values = []
+@@ -974,6 +1003,8 @@ class DreamBoothDataset(Dataset):
+             example["cond_images"] = dest_image
+         if self.cond_2_pixel_values:
+             example["cond_images_2"] = self.cond_2_pixel_values[index % self.num_instance_images]
++        if self.pair_ids:
++            example["pair_id"] = self.pair_ids[index % self.num_instance_images]
+         if self.loss_masks:
+             m = self.loss_masks[index % self.num_instance_images].convert("L")
+             h, w = instance_image.shape[-2:]
+@@ -1065,12 +1096,39 @@ def collate_fn(examples):
+         batch.update({"cond_pixel_values": cond_pixel_values})
+     if all("loss_mask" in example for example in examples):
+         batch["loss_mask"] = torch.stack([example["loss_mask"] for example in examples]).float()
++    if any("pair_id" in example for example in examples):
++        batch["pair_ids"] = [example.get("pair_id", "") for example in examples]
+     if any("cond_images_2" in example for example in examples):
+         cond_2 = torch.stack([example["cond_images_2"] for example in examples])
+         batch["cond_2_pixel_values"] = cond_2.to(memory_format=torch.contiguous_format).float()
+     return batch
+ 
+ 
++def _azyah_pair_batches(indices, pair_ids, batch_size):
++    """Azyah fxreal3: batches in which both rows of each pair sit together: one pair + singles per batch
++    while pairs and singles last, then what remains. Rows whose pair id appears once count as singles."""
++    groups = {}
++    for idx in indices:
++        pid = pair_ids[idx % len(pair_ids)]
++        if pid:
++            groups.setdefault(pid, []).append(idx)
++    pairs = [g[:2] for g in groups.values() if len(g) >= 2]
++    in_pair = {i for g in pairs for i in g}
++    singles = [i for i in indices if i not in in_pair]
++    random.shuffle(pairs)
++    batches = []
++    while pairs or singles:
++        batch = []
++        if pairs:
++            batch += pairs.pop()
++        while len(batch) + 2 <= batch_size and pairs and not singles:
++            batch += pairs.pop()
++        while len(batch) < batch_size and singles:
++            batch.append(singles.pop())
++        batches.append(batch)
++    return batches
++
++
+ class BucketBatchSampler(BatchSampler):
+     def __init__(
+         self,
+@@ -1098,9 +1156,18 @@ class BucketBatchSampler(BatchSampler):
+         self.batches = []
+ 
+         # Pre-generate batches for each bucket
++        pair_ids = getattr(self.dataset, "pair_ids", None) or []
+         for indices_in_bucket in self.bucket_indices:
+             # Shuffle indices within the bucket
+             random.shuffle(indices_in_bucket)
++            if pair_ids and self.batch_size >= 2:
++                # Azyah fxreal3: both frames of a pair go into the same batch (one pair + singles).
++                for batch in _azyah_pair_batches(indices_in_bucket, pair_ids, self.batch_size):
++                    if len(batch) < self.batch_size and self.drop_last:
++                        continue
++                    self.batches.append(batch)
++                    self.sampler_len += 1
++                continue
+             # Create batches
+             for i in range(0, len(indices_in_bucket), self.batch_size):
+                 batch = indices_in_bucket[i : i + self.batch_size]
+@@ -1613,6 +1680,7 @@ def main(args):
+         cond_latents_cache = []
+         cond_2_latents_cache = []
+         loss_mask_cache = []
++        pair_cache = []
+         _azyah_prompt_memo = {}
+         for batch in tqdm(train_dataloader, desc="Caching latents"):
+             with torch.no_grad():
+@@ -1633,6 +1701,7 @@ def main(args):
+                             cond_2_latents_cache.append(vae.encode(batch["cond_2_pixel_values"]).latent_dist)
+                     if "loss_mask" in batch:
+                         loss_mask_cache.append(batch["loss_mask"])
++                    pair_cache.append(batch.get("pair_ids"))
+                 if train_dataset.custom_instance_prompts:
+                     # Azyah: our captions repeat (one FluxRT prompt per category), so identical
+                     # batches share one tensor instead of ~8 MB of GPU memory per sample.
+@@ -1846,6 +1915,28 @@ def main(args):
+                     timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                     sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+ 
++                # Azyah fxreal3: the two frames of a pair share noise level and noise (like FluxRT's fixed seed).
++                _az_pairs = []
++                if args.pair_column:
++                    _az_ids = pair_cache[step] if (args.cache_latents and pair_cache) else batch.get("pair_ids")
++                    _az_seen = {}
++                    for _i, _pid in enumerate(_az_ids or []):
++                        if not _pid:
++                            continue
++                        if _pid in _az_seen:
++                            _j0 = _az_seen.pop(_pid)
++                            _az_pairs.append((_j0, _i))
++                        else:
++                            _az_seen[_pid] = _i
++                    if _az_pairs:
++                        noise = noise.clone()
++                        sigmas = sigmas.clone()
++                        timesteps = timesteps.clone()
++                        for _i, _j in _az_pairs:
++                            noise[_j] = noise[_i]
++                            sigmas[_j] = sigmas[_i]
++                            timesteps[_j] = timesteps[_i]
++
+                 # Add noise according to flow matching.
+                 # zt = (1 - texp) * x + texp * z1
+                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+@@ -1910,6 +2001,39 @@ def main(args):
+                 else:
+                     loss = torch.mean(err.reshape(target.shape[0], -1), 1).mean()
+ 
++                # Azyah fxreal3: detail (edge) term and same-clip colour term on the predicted clean latents.
++                _az_logs = {}
++                if args.detail_weight > 0 or (args.pair_weight > 0 and _az_pairs):
++                    _sig = sigmas.float().reshape(-1)
++                    _conf = (1.0 - _sig).clamp(min=0.0)  # x0 is only well defined at lower noise
++                    _x0_hat = noisy_model_input.float() - sigmas.float() * model_pred.float()
++                    _x0 = model_input.float()
++                    _mk = m if loss_mask is not None else torch.ones_like(_x0[:, :1])
++                    if args.detail_weight > 0:
++                        _uh = Flux2KleinPipeline._unpatchify_latents(_x0_hat)
++                        _ut = Flux2KleinPipeline._unpatchify_latents(_x0)
++                        _um = torch.nn.functional.interpolate(_mk, size=_uh.shape[-2:], mode="nearest")
++                        _wx = (_um[..., :, 1:] + _um[..., :, :-1]) / 2
++                        _wy = (_um[..., 1:, :] + _um[..., :-1, :]) / 2
++                        _gx = ((_uh[..., :, 1:] - _uh[..., :, :-1]) - (_ut[..., :, 1:] - _ut[..., :, :-1])).abs() * _wx
++                        _gy = ((_uh[..., 1:, :] - _uh[..., :-1, :]) - (_ut[..., 1:, :] - _ut[..., :-1, :])).abs() * _wy
++                        _den = (_wx.sum((1, 2, 3)) + _wy.sum((1, 2, 3))) * _uh.shape[1] + 1e-6
++                        _per = (_gx.sum((1, 2, 3)) + _gy.sum((1, 2, 3))) / _den
++                        _detail = (_conf * _per).sum() / _conf.sum().clamp(min=1e-6)
++                        loss = loss + args.detail_weight * _detail
++                        _az_logs["detail"] = _detail.detach().item()
++                    if args.pair_weight > 0 and _az_pairs:
++                        def _cmean(x, w):
++                            return (x * w).sum((-2, -1)) / w.sum((-2, -1)).clamp(min=1e-6)
++                        _terms = []
++                        for _i, _j in _az_pairs:
++                            _d_hat = _cmean(_x0_hat[_i], _mk[_i]) - _cmean(_x0_hat[_j], _mk[_j])
++                            _d_true = _cmean(_x0[_i], _mk[_i]) - _cmean(_x0[_j], _mk[_j])
++                            _terms.append(_conf[_i] * (_d_hat - _d_true).abs().mean())
++                        _pair = torch.stack(_terms).mean()
++                        loss = loss + args.pair_weight * _pair
++                        _az_logs["pair"] = _pair.detach().item()
++
+                 accelerator.backward(loss)
+                 if accelerator.sync_gradients:
+                     params_to_clip = transformer.parameters()
+@@ -1950,7 +2074,7 @@ def main(args):
+                         accelerator.save_state(save_path)
+                         logger.info(f"Saved state to {save_path}")
+ 
+-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
++            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], **_az_logs}
+             progress_bar.set_postfix(**logs)
+             accelerator.log(logs, step=global_step)
+ 

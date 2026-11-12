@@ -1,0 +1,57 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index 985eb0e..cacb229 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -630,6 +630,25 @@ def parse_args(input_args=None):
+             "vs the answer, inside --mask_column, counted more at low noise. Fights the soft look of plain MSE."
+         ),
+     )
++    parser.add_argument(
++        "--colour_weight",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal5: weight of an L1 term on the garment COLOUR: the average of the predicted clean latents "
++            "inside --mask_column vs the answer's, at every noise level (colour is defined even when x0 is blurry)."
++        ),
++    )
++    parser.add_argument(
++        "--texture_weight",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal5: weight of an L1 term on the garment CONTRAST: the spread (standard deviation) of the "
++            "predicted clean latents inside --mask_column vs the answer's (satin shine, velvet sheen, print "
++            "contrast), counted more at low noise."
++        ),
++    )
+     parser.add_argument(
+         "--time_shift_mu",
+         type=float,
+@@ -2057,6 +2076,26 @@ def main(args):
+                         _pair = torch.stack(_terms).mean()
+                         loss = loss + args.pair_weight * _pair
+                         _az_logs["pair"] = _pair.detach().item()
++                # Azyah fxreal5: garment colour (average) and fabric contrast (spread) of the predicted clean
++                # latents vs the answer, inside --mask_column (the garment area, plus the face).
++                if (args.colour_weight > 0 or args.texture_weight > 0) and loss_mask is not None:
++                    _c5 = (1.0 - sigmas.float().reshape(-1)).clamp(min=0.0)
++                    _xh5 = noisy_model_input.float() - sigmas.float() * model_pred.float()
++                    _xt5 = model_input.float()
++                    _n5 = m.sum((-2, -1)).clamp(min=1e-6)
++                    _mh5 = (_xh5 * m).sum((-2, -1)) / _n5
++                    _mt5 = (_xt5 * m).sum((-2, -1)) / _n5
++                    if args.colour_weight > 0:
++                        _colour = (_mh5 - _mt5).abs().mean()
++                        loss = loss + args.colour_weight * _colour
++                        _az_logs["colour"] = _colour.detach().item()
++                    if args.texture_weight > 0:
++                        _sh5 = (((_xh5 - _mh5[..., None, None]) ** 2 * m).sum((-2, -1)) / _n5).clamp(min=1e-8).sqrt()
++                        _st5 = (((_xt5 - _mt5[..., None, None]) ** 2 * m).sum((-2, -1)) / _n5).clamp(min=1e-8).sqrt()
++                        _per5 = (_sh5 - _st5).abs().mean(dim=1)
++                        _texture = (_c5 * _per5).sum() / _c5.sum().clamp(min=1e-6)
++                        loss = loss + args.texture_weight * _texture
++                        _az_logs["texture"] = _texture.detach().item()
+ 
+                 accelerator.backward(loss)
+                 if accelerator.sync_gradients:

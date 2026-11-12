@@ -31,6 +31,13 @@ SOURCES: dict[str, Source] = {
         commercial_ok=False,
         note="R&D only until legal sign-off. Never in a commercial checkpoint.",
     ),
+    "viton_hd": Source(
+        name="viton_hd",
+        licence="VITON-HD (Choi et al. 2021): non-commercial research licence; mirror forgeml/viton_hd on Hugging Face",
+        commercial_ok=False,
+        note="Real studio photos of models in tops + flat garment photos. Owner accepted the risk for R&D "
+             "(2026-11-08); rights holders to be contacted before any commercial release.",
+    ),
     "own": Source(
         name="own",
         licence="Azyah-owned recordings under signed consent",
