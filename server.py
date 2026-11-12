@@ -620,11 +620,18 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
     }
 
 
+_BACKGROUND_TASKS: List["asyncio.Future[Any]"] = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if os.getenv("AUTO_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on"):
         log.warning("AUTO_WARMUP enabled: starting FluxRT warmup in background")
         start_warmup_background()
+    if WEBRTC_ON:
+        # One UDP check to Cloudflare's STUN port at start-up (logged), so the first WebRTC session
+        # does not wait for it; sessions reuse the answer for 10 minutes.
+        _BACKGROUND_TASKS.append(asyncio.ensure_future(livecam_webrtc.outbound_udp_ok()))
 
     yield
 

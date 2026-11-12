@@ -41,6 +41,28 @@ def test_switch_on_without_aiortc_stays_on_jpeg(monkeypatch):
 
 
 @pytest.mark.skipif(not webrtc.available(), reason="aiortc not installed")
+def test_switch_on_checks_udp_once_at_startup(monkeypatch):
+    from fastapi.testclient import TestClient
+    calls = []
+
+    async def fake_probe(*a, **k):
+        calls.append(a)
+        return True
+
+    s = load(monkeypatch, LIVECAM_WEBRTC="1")
+    monkeypatch.setattr(s.livecam_webrtc, "outbound_udp_ok", fake_probe)
+    with TestClient(s.app):
+        time.sleep(0.1)
+    assert len(calls) == 1
+    s = load(monkeypatch)  # off: no check
+    calls.clear()
+    monkeypatch.setattr(s.livecam_webrtc, "outbound_udp_ok", fake_probe)
+    with TestClient(s.app):
+        time.sleep(0.1)
+    assert calls == []
+
+
+@pytest.mark.skipif(not webrtc.available(), reason="aiortc not installed")
 def test_switch_on_ready_says_so_and_bitrates_follow_env(monkeypatch):
     from aiortc.codecs import h264
     saved = (h264.MAX_BITRATE, h264.DEFAULT_BITRATE)
