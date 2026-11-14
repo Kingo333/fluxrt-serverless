@@ -1,6 +1,7 @@
 # Live Cam dual-engine image: FluxRT (Standard) + JoyAI-Video-Edit (Premium HD).
 #
-#   LIVECAM_ENGINE=fluxrt  (default) FluxRT, same code and Python env as Dockerfile.fluxrt
+#   LIVECAM_ENGINE=fluxrt  (default) FluxRT, same code as Dockerfile.fluxrt; package versions pinned by
+#                                   fluxrt/constraints.txt, plus torchao (FP8) and aiortc (WebRTC)
 #   LIVECAM_ENGINE=joyai             JoyAI adapter (:8765) + unmodified JoyAI on 127.0.0.1:8080
 #
 # Each engine has its own Python so their dependencies never clash:
@@ -54,33 +55,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python3
 
 # ---------------------------------------------------------------------------
-# FluxRT engine (identical steps to Dockerfile.fluxrt)
+# FluxRT engine (Dockerfile.fluxrt's steps, with every package version pinned)
 # ---------------------------------------------------------------------------
 WORKDIR /workspace
-# Small Azyah patch to FluxRT (fluxrt/patches/*.patch: anchor reference + sampler mu override,
-# both inert unless the worker's config asks for them); git apply fails the build if upstream drifts.
+# Small Azyah patches to FluxRT (fluxrt/patches/*.patch: anchor reference + sampler mu override; LoRA fused
+# before INT8, or the FP8 build), all inert unless the worker's config asks for them; git apply fails the build
+# if upstream drifts.
 COPY fluxrt/patches /tmp/fluxrt-patches
 RUN git clone https://github.com/tensorforger/FluxRT.git /workspace/FluxRT \
     && cd /workspace/FluxRT && git checkout ${FLUXRT_REF} \
     && git -C /workspace/FluxRT apply /tmp/fluxrt-patches/*.patch
 WORKDIR /workspace/FluxRT
-RUN /usr/bin/python3.12 -m pip install --upgrade pip setuptools wheel \
+# fluxrt/constraints.txt: the exact versions in today's Live Cam image (FluxRT's requirements.txt is unpinned),
+# so a full rebuild installs the same diffusers/transformers/peft/quanto instead of whatever is newest that day.
+COPY fluxrt/constraints.txt /tmp/fluxrt-constraints.txt
+RUN /usr/bin/python3.12 -m pip install --upgrade pip==26.3 setuptools==84.2.1 wheel==0.48.0 \
     && /usr/bin/python3.12 -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128 \
-    && /usr/bin/python3.12 -m pip install -r requirements.txt \
-    && /usr/bin/python3.12 -m pip install -e . \
-    && /usr/bin/python3.12 -m pip install fastapi "uvicorn[standard]" websockets pillow numpy "huggingface_hub[hf_transfer]"
+    && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt -r requirements.txt \
+    && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt -e . \
+    && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt fastapi "uvicorn[standard]" websockets pillow numpy "huggingface_hub[hf_transfer]"
 # MediaPipe multiclass selfie segmenter (Apache-2.0) for the live-quality switches
 # (FLUXRT_COMPOSITE / FLUXRT_REF_CLEAN / FLUXRT_CACHE_MASK=seg). --no-deps keeps its
 # jax/jaxlib/opencv-contrib dependencies out (FluxRT's cv2 must stay); the listed extras are
 # what the import needs (verified on Python 3.12 with numpy 2.x). The model is baked in so
-# warm-up needs no network.
+# warm-up needs no network: version 1, checked by hash (the same file as ".../latest/", unchanged since 2023-04-26).
 RUN /usr/bin/python3.12 -m pip install --no-deps mediapipe==0.10.21 \
-    && /usr/bin/python3.12 -m pip install absl-py attrs flatbuffers "protobuf>=4.25.3,<5" sounddevice matplotlib \
+    && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt absl-py attrs flatbuffers "protobuf>=4.25.3,<5" sounddevice matplotlib \
     && mkdir -p /opt/models \
     && curl -fsSL -o /opt/models/selfie_multiclass_256x256.tflite \
-        https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite \
-    && test "$(stat -c %s /opt/models/selfie_multiclass_256x256.tflite)" -gt 1000000
-RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, transformers, diffusers, mediapipe; from mediapipe.tasks.python import vision; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'mediapipe', mediapipe.__version__)"
+        https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite \
+    && echo "c6748b1253a99067ef71f7e26ca71096cd449baefa8f101900ea23016507e0e0  /opt/models/selfie_multiclass_256x256.tflite" | sha256sum -c -
+# FP8 (FLUXRT_PRECISION=fp8, off by default; fluxrt/azyah_fuse_lora.py): torchao 0.14.1, the release made for
+# torch 2.9 (no dependencies of its own), in its OWN folder, outside the normal package path: PEFT 0.21 (which
+# loads the LoRA) refuses to run at all once it can see a torchao older than 0.16, so only the FP8 step adds the
+# folder, after the LoRA is fused, and the INT8 path runs exactly as before. WebRTC media path (LIVECAM_WEBRTC):
+# aiortc and its packages at the versions of the thin WebRTC test image (until now only the thin image had them).
+COPY livecam/requirements-webrtc.txt /tmp/livecam-webrtc-requirements.txt
+RUN /usr/bin/python3.12 -m pip install --no-deps --target /opt/azyah-torchao torchao==0.14.1 \
+    && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt -r /tmp/livecam-webrtc-requirements.txt
+RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, transformers, diffusers, peft, mediapipe, aiortc, av; from mediapipe.tasks.python import vision; from fluxrt.stream_processor.azyah_fuse_lora import build_fp8_transformer, fuse_lora_into_int8; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__, 'peft', peft.__version__, 'mediapipe', mediapipe.__version__, 'aiortc', aiortc.__version__)" \
+    && /usr/bin/python3.12 -c "from peft.import_utils import is_torchao_available; assert not is_torchao_available(), 'PEFT must not see torchao'; print('PEFT does not see torchao: ok')" \
+    && /usr/bin/python3.12 -c "from fluxrt.stream_processor.azyah_fuse_lora import import_torchao; import_torchao(); import torchao; assert torchao.__version__ == '0.14.1', torchao.__version__; print('torchao', torchao.__version__, 'from', torchao.__file__)"
 
 # ---------------------------------------------------------------------------
 # JoyAI engine, in its own venv. Built only for the RTX 5090 (sm_120a).
@@ -100,9 +115,12 @@ RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
     && git apply /opt/JoyAI-Video-Edit/deploy/sageattention-cudagraph-stream.patch \
     && EXT_PARALLEL=${EXT_PARALLEL} NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS}" MAX_JOBS=${MAX_JOBS} /opt/joyai-venv/bin/python setup.py install \
     && cd / && rm -rf /tmp/SageAttention
+# joyomni_ops compiles one file at a time: its CUTLASS FP8 GEMM (fp8_gemm.o) alone takes most of the runner's
+# 16 GB, and with two compiles at once nvcc was killed for lack of memory (exit 137, 2026-11-14). Same sources and
+# flags, only slower (a minute or two).
 RUN git clone https://github.com/NVIDIA/cutlass.git /tmp/cutlass \
     && git -C /tmp/cutlass checkout ${CUTLASS_COMMIT} \
-    && JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=${MAX_JOBS} \
+    && JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=1 \
        /opt/joyai-venv/bin/pip install --no-build-isolation /opt/JoyAI-Video-Edit/deploy/joyomni_ops \
     && rm -rf /tmp/cutlass
 COPY joyai/requirements-adapter.txt /tmp/joyai-adapter-requirements.txt
@@ -119,6 +137,7 @@ RUN chmod +x /app/joyai/start_upstream.sh /app/joyai/scripts/populate_volume.sh 
     && /usr/bin/python3.12 -m py_compile /app/server.py /app/bootstrap.py /app/session_token.py /app/livecam/*.py \
     && /opt/joyai-venv/bin/python -m py_compile /app/session_token.py /app/joyai/adapter/*.py \
     && cd /app && SESSION_SIGNING_SECRET=build-check /usr/bin/python3.12 -c "import server; print('fluxrt server import ok')" \
+    && cd /app && /usr/bin/python3.12 -c "from livecam import webrtc; assert webrtc.available(), webrtc.unavailable_reason(); print('webrtc ok')" \
     && cd /app && SESSION_SIGNING_SECRET=build-check JOYAI_UPSTREAM_COMMAND= /opt/joyai-venv/bin/python -c "from joyai.adapter.app import create_app; create_app(); print('joyai adapter import ok')"
 
 ENV LIVECAM_ENGINE=fluxrt \

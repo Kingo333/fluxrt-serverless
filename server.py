@@ -5,6 +5,7 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -52,19 +53,43 @@ ENABLE_REFERENCE_IMAGE = os.getenv("ENABLE_REFERENCE_IMAGE", "true").strip().low
 ENABLE_TINY_VAE = os.getenv("ENABLE_TINY_VAE", "true").strip().lower() in ("1", "true", "yes", "on")
 ENABLE_FLOW_UPSCALER = os.getenv("ENABLE_FLOW_UPSCALER", "true").strip().lower() in ("1", "true", "yes", "on")
 
-WIDTH = int(os.getenv("FLUXRT_WIDTH", "576"))
-HEIGHT = int(os.getenv("FLUXRT_HEIGHT", "320"))
+# Sizes (owner, 2026-11-14: settable in env, any sensible value). FluxRT works in 16-pixel tokens, so each size is
+# rounded to the nearest multiple of 16 and kept within 128..1024 instead of stopping the worker. What was used,
+# and why, is logged at warm-up and shown in the "live switches" line.
+SIZE_MIN, SIZE_MAX = 128, 1024
+SETTING_NOTES: List[str] = []
 
 
-def _mult16(v: int) -> int:
-    return max(16, (int(v) // 16) * 16)
+def _size16(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        asked = float(raw) if raw else float(default)
+    except ValueError:
+        SETTING_NOTES.append(f"{name}={raw!r} is not a number; using {default}")
+        asked = float(default)
+    used = int(min(SIZE_MAX, max(SIZE_MIN, 16 * math.floor(asked / 16 + 0.5))))
+    if raw and used != asked:
+        SETTING_NOTES.append(f"{name}={raw} -> {used} (multiples of 16, {SIZE_MIN}..{SIZE_MAX})")
+    return used
+
+
+def _env_switch(name: str, default: bool) -> bool:
+    """On/off switch: unset = default; 0/false/no/off = off; anything else = on."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+WIDTH = _size16("FLUXRT_WIDTH", 576)
+HEIGHT = _size16("FLUXRT_HEIGHT", 320)
 
 
 # Garment reference size. FluxRT's own default is 256x256, too small for
 # logos and prints. 384x512 (3:4) matches most product photos; cost is
 # (w/16)*(h/16) extra tokens (768 here vs 576 for a 288x512 camera frame).
-REF_WIDTH = _mult16(int(os.getenv("FLUXRT_REF_WIDTH", "384")))
-REF_HEIGHT = _mult16(int(os.getenv("FLUXRT_REF_HEIGHT", "512")))
+REF_WIDTH = _size16("FLUXRT_REF_WIDTH", 384)
+REF_HEIGHT = _size16("FLUXRT_REF_HEIGHT", 512)
 UPSCALE = 2 if ENABLE_FLOW_UPSCALER else 1
 OUT_WIDTH = WIDTH * UPSCALE
 OUT_HEIGHT = HEIGHT * UPSCALE
@@ -97,6 +122,80 @@ def _bounded(name: str, default: float, lo: float, hi: float) -> float:
 # FLUXRT_SHARPEN 0..1 (default 0 = off): unsharp mask on each output frame before JPEG; 0.3 about restores
 #   the crispness the LoRA costs, above 0.5 edges start to halo. About 1 ms per frame, no temporal effect.
 LORA_FUSE = os.getenv("FLUXRT_LORA_FUSE", "true").strip().lower() in ("1", "true", "yes", "on")
+# FP8 (owner, 2026-11-14). FLUXRT_PRECISION=fp8 builds the same favourite (full-precision model with the LoRA
+#   fused at FLUXRT_LORA_SCALE) with the transformer blocks' Linear layers in FP8 weights AND FP8 maths
+#   (fluxrt/azyah_fuse_lora.py, torchao). Today's INT8 model stores 8-bit weights but multiplies in 16 bits, so it
+#   saves memory, not time. Unset or int8 = today's model, unchanged. Needs ENABLE_INT8 (the default: FluxRT's
+#   quantized loader, which also keeps the INT8 text encoder). If FP8 is unavailable on the GPU, FluxRT logs
+#   "[azyah] FP8 transformer unavailable (...); falling back to INT8" and runs INT8.
+PRECISION = os.getenv("FLUXRT_PRECISION", "int8").strip().lower() or "int8"
+if PRECISION not in ("int8", "fp8"):
+    log.warning("FLUXRT_PRECISION=%r is not int8|fp8; using int8", PRECISION)
+    PRECISION = "int8"
+if PRECISION == "fp8" and not ENABLE_INT8:
+    log.warning("FLUXRT_PRECISION=fp8 needs ENABLE_INT8 (FluxRT's quantized loader); running without FP8")
+    PRECISION = "int8"
+if PRECISION == "fp8" and LORA_PATH and not LORA_FUSE:
+    log.warning("FLUXRT_PRECISION=fp8 needs the LoRA fused into the weights (FLUXRT_LORA_FUSE on); running INT8")
+    PRECISION = "int8"
+# FLUXRT_COMPILE=1: FluxRT's own compile option (torch.compile of the transformer, VAE and frame interpolation;
+#   FluxRT's authors run it on). Off by default: the first start of each new worker takes minutes longer.
+#   FLUXRT_COMPILE_CACHE_DIR (a folder on the network volume) keeps the compiled kernels for the next worker.
+COMPILE = os.getenv("FLUXRT_COMPILE", "").strip().lower() in ("1", "true", "yes", "on")
+COMPILE_CACHE_DIR = os.getenv("FLUXRT_COMPILE_CACHE_DIR", "").strip()
+# Compile practice at warm-up (owner, 2026-11-14: a shopper walking past must never see the compiler's pauses).
+#   The compiler is slow the first time it meets each new number of changed tokens. FLUXRT_COMPILE_WARMUP (default on)
+#   feeds FluxRT FLUXRT_COMPILE_WARMUP_PASSES (default 4, 1..12) practice frames with different amounts of change,
+#   and a stand-in garment, before the worker says ready. Only with FLUXRT_COMPILE=1.
+COMPILE_WARMUP = _env_switch("FLUXRT_COMPILE_WARMUP", True)
+COMPILE_WARMUP_PASSES = int(_bounded("FLUXRT_COMPILE_WARMUP_PASSES", 4, 1, 12))
+# TORCHDYNAMO_SUPPRESS_ERRORS (default on with compile): a part that fails to compile runs the normal way and is
+#   logged, instead of stopping the worker. Read here (0/false/off = off) and passed to FluxRT explicitly, because
+#   PyTorch's own reading of this variable treats "0" as on.
+COMPILE_SUPPRESS_ERRORS = _env_switch("TORCHDYNAMO_SUPPRESS_ERRORS", True)
+# FLUXRT_COMPILE_RECOMPILE_LIMIT (default 64, 8..512): how many variants the compiler may build per piece of code
+#   before it runs that piece uncompiled. PyTorch's default of 8 is low for FluxRT's changing token counts.
+COMPILE_RECOMPILE_LIMIT = int(_bounded("FLUXRT_COMPILE_RECOMPILE_LIMIT", 64, 8, 512))
+# FLUXRT_FAST_MASK (default on): FluxRT works out which tokens changed once per model call instead of in each of its
+#   ~110 layer steps (every check made the CPU wait for the GPU: about 440 waits per generated frame), and its
+#   leftover timing helper stops waiting too (fluxrt/patches/fluxrt-speed.patch). Same pictures, fewer waits.
+#   0 = FluxRT's original code path.
+FAST_MASK = _env_switch("FLUXRT_FAST_MASK", True)
+
+
+def compile_cache_env(cache_dir: str) -> Dict[str, str]:
+    """Environment that keeps torch.compile's caches in cache_dir (inherited by FluxRT's model process)."""
+    return {
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(cache_dir, "inductor"),
+        "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
+        "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
+        "TRITON_CACHE_DIR": os.path.join(cache_dir, "triton"),
+    }
+
+
+COMPILE_CACHE_MIN_FREE_GB = 2.0
+
+
+def setup_compile_cache(cache_dir: str, min_free_gb: float = COMPILE_CACHE_MIN_FREE_GB) -> tuple:
+    """(cache kept in cache_dir?, status for the logs). Only with enough free space: a full disk must never
+    stop the worker, so without it the compiler keeps its cache inside the worker as usual."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        free_gb = shutil.disk_usage(cache_dir).free / 1e9
+    except OSError as e:
+        return False, f"not kept: {cache_dir} not usable ({e.__class__.__name__})"
+    if free_gb < min_free_gb:
+        return False, f"not kept: only {free_gb:.1f} GB free at {cache_dir}"
+    for k, v in compile_cache_env(cache_dir).items():
+        os.environ.setdefault(k, v)
+    return True, f"kept at {cache_dir} ({free_gb:.0f} GB free)"
+
+
+COMPILE_CACHE_USED, COMPILE_CACHE_STATUS = False, "off"
+if COMPILE:
+    COMPILE_CACHE_STATUS = "inside this worker only (no FLUXRT_COMPILE_CACHE_DIR)"
+    if COMPILE_CACHE_DIR:
+        COMPILE_CACHE_USED, COMPILE_CACHE_STATUS = setup_compile_cache(COMPILE_CACHE_DIR)
 LORA_SCALE = _bounded("FLUXRT_LORA_SCALE", 1.0, 0.0, 2.0)
 SHARPEN = _bounded("FLUXRT_SHARPEN", 0.0, 0.0, 1.0)
 CLIENT_HINTS = os.getenv("FLUXRT_CLIENT_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -234,6 +333,7 @@ STATE: Dict[str, Any] = {
     "ready_at": None,
     "warmup_thread": None,
     "segmenter": None,
+    "precision_active": None,  # what FluxRT built: fp8 / int8 (read from its marker at warm-up)
 }
 
 
@@ -448,6 +548,63 @@ def check_lora(path: str) -> str:
     return str(p)
 
 
+PRECISION_MARKER = FLUXRT_ROOT / "azyah_precision.json"
+VOLUME_ROOT = Path(os.getenv("RUNPOD_VOLUME_ROOT", "/runpod-volume"))
+
+
+def _folder_gb(path: Path) -> Optional[float]:
+    try:
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) / 1e9
+    except OSError:
+        return None
+
+
+def _disk(path: Path) -> str:
+    try:
+        u = shutil.disk_usage(path)
+    except OSError as e:
+        return f"not readable ({e.__class__.__name__})"
+    return f"{u.free / 1e9:.0f} GB free of {u.total / 1e9:.0f} GB"
+
+
+def storage_report() -> List[str]:
+    """Where the models are and how much room there is, for the warm-up log (read-only)."""
+    def model(label: str, path: Path, repo: str) -> str:
+        gb = _folder_gb(path) if path.is_dir() else None
+        size = f"{gb:.1f} GB" if gb is not None else "MISSING"
+        extra = ""
+        if label == "full precision":
+            extra = f", transformer folder {'present' if (path / 'transformer').is_dir() else 'MISSING'}"
+        return f"model {label}: {path} ({size}{extra}; downloaded from Hugging Face {repo} at start-up)"
+
+    lines = [model("full precision", FLUXRT_ROOT / "FLUX.2-klein-4B", FLUX_REPO_ID)]
+    if ENABLE_INT8:
+        lines.append(model("int8", FLUXRT_ROOT / "FLUX.2-klein-4B-int8", INT8_REPO_ID))
+    lines.append(f"worker disk {FLUXRT_ROOT}: {_disk(FLUXRT_ROOT)}")
+    lines.append(f"network volume {VOLUME_ROOT}: {_disk(VOLUME_ROOT) if VOLUME_ROOT.is_dir() else 'not mounted'}")
+    if LORA_PATH:
+        lp = Path(LORA_PATH)
+        lora_mb = f"{lp.stat().st_size / 1e6:.0f} MB" if lp.is_file() else "MISSING"
+        lines.append(f"LoRA {LORA_PATH} ({lora_mb})")
+    lines.append(f"transformer precision asked: {PRECISION}; compile: {'on' if COMPILE else 'off'}"
+                 + (f", cache {COMPILE_CACHE_STATUS}" if COMPILE else ""))
+    return lines
+
+
+def read_precision_marker(path: Path = PRECISION_MARKER) -> str:
+    """What FluxRT's model process built: 'fp8 (N layers)', 'int8', 'int8 (FP8 unavailable: ...)' or 'unknown'."""
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return "unknown"
+    if info.get("precision") == "fp8":
+        n = info.get("fp8_layers")
+        return f"fp8 ({n} layers)" if n else "fp8"
+    if info.get("fp8_error"):
+        return f"int8 (FP8 unavailable: {info['fp8_error']})"
+    return "int8"
+
+
 def write_runtime_config() -> Path:
     config = {
         "default_prompt": DEFAULT_PROMPT,
@@ -459,7 +616,7 @@ def write_runtime_config() -> Path:
             "height": HEIGHT,
             "width": WIDTH,
         },
-        "compile_models": False,
+        "compile_models": COMPILE,
         "enable_spatial_cache": True,
         "enable_int8_quantization": ENABLE_INT8,
         "enable_tiny_vae": ENABLE_TINY_VAE,
@@ -473,6 +630,11 @@ def write_runtime_config() -> Path:
         },
         "logging": True,
     }
+    config["precision"] = PRECISION  # read by fluxrt/patches/fluxrt-fuse-lora.patch (FP8 or INT8)
+    config["precision_marker"] = str(PRECISION_MARKER)  # the same patch writes which one it built
+    config["fast_active_index"] = FAST_MASK  # read by fluxrt/patches/fluxrt-speed.patch
+    config["compile_suppress_errors"] = COMPILE_SUPPRESS_ERRORS  # the same patch, only with compile_models
+    config["compile_recompile_limit"] = COMPILE_RECOMPILE_LIMIT
     if LORA_PATH:
         config["use_lora"] = True
         config["lora_weights_path"] = check_lora(LORA_PATH)
@@ -491,6 +653,91 @@ def write_runtime_config() -> Path:
     return path
 
 
+# Share of the frame that changes in each practice frame (the first FLUXRT_COMPILE_WARMUP_PASSES are used). Varied on
+# purpose: the compiler builds a fixed-size version first and a changing-size one on the next new size, and
+# "nothing changed" is its own path.
+COMPILE_WARMUP_CHANGE = (0.6, 0.15, 0.0, 0.85, 0.35, 0.5, 0.25, 0.7, 0.05, 0.45, 0.95, 0.3)
+
+
+def _changed_frame(base: np.ndarray, share: float, rng: np.random.Generator) -> np.ndarray:
+    """base with its top `share` of rows replaced by new noise (FluxRT's own motion check sees that part change)."""
+    frame = base.copy()
+    rows = int(round(share * frame.shape[0]))
+    if rows:
+        frame[:rows] = rng.integers(0, 256, size=frame[:rows].shape, dtype=np.uint8)
+    return frame
+
+
+def _practice_mask(cells_h: int, cells_w: int, share: float) -> np.ndarray:
+    """FLUXRT_CACHE_MASK=seg mask with the top `share` of cells recomputed (2) and the rest reused (0)."""
+    mask = np.zeros((cells_h, cells_w), dtype=np.int32)
+    mask.reshape(-1)[: int(round(share * mask.size))] = 2
+    return mask
+
+
+def _wait_frames(proc: Any, frames: int, budget_s: float) -> tuple:
+    """Wait until FluxRT finishes `frames` more frames: (frames seen, seconds, slowest frame in seconds)."""
+    start = time.time()
+    last = proc.get_last_processing_time()
+    seen, slowest = 0, 0.0
+    while seen < frames and time.time() - start < budget_s:
+        time.sleep(0.02)
+        now = proc.get_last_processing_time()
+        if now != last:
+            seen, last, slowest = seen + 1, now, max(slowest, float(now))
+    return seen, time.time() - start, slowest
+
+
+def compile_warmup(proc: Any, passes: int, budget_s: float) -> None:
+    """Practice frames before ready, so the compiler's slow first runs happen here and not in front of a shopper.
+
+    Each pass shows FluxRT a different share of changed tokens (with FLUXRT_CACHE_MASK=seg through the mask the
+    worker sends, otherwise through frames that change in that share), with a stand-in garment set as in a
+    session, and waits for it to finish 3 frames. Afterwards the garment slot and the mask are reset; a session
+    sets its own and starts with a full recompute anyway. Never fails the warm-up: a pass that runs out of time
+    is logged and skipped."""
+    t0 = time.time()
+    res = proc.get_resolution()
+    h, w = int(res["height"]), int(res["width"])
+    rng = np.random.default_rng(0)
+    base = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+    manual = CACHE_MASK == "seg"
+    input_t = proc.get_input_tensor()
+    if ENABLE_REFERENCE_IMAGE:
+        try:
+            proc.set_reference_image(np.full((REF_HEIGHT, REF_WIDTH, 3), 200, dtype=np.uint8))
+        except Exception as e:  # noqa: BLE001
+            log.warning("warmup: compile practice could not set a stand-in garment: %s", e)
+    done = 0
+    for i, share in enumerate(COMPILE_WARMUP_CHANGE[:passes]):
+        left = budget_s - (time.time() - t0)
+        if left <= 5:
+            log.warning("warmup: compile practice stopped after %d of %d passes (warm-up time used up)", done, passes)
+            break
+        if manual:
+            proc.set_mask(_practice_mask(h // 16, w // 16, share))
+            frame = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        else:
+            frame = _changed_frame(base, share, rng)
+        input_t.copy_from(frame)
+        seen, secs, slowest = _wait_frames(proc, 3, min(left, 600.0))
+        if seen < 3:
+            log.warning("warmup: compile practice %d/%d (%d%% changing): only %d frames in %.0f s; moving on",
+                        i + 1, passes, round(share * 100), seen, secs)
+        else:
+            log.info("warmup: compile practice %d/%d (%d%% changing): 3 frames in %.1f s, slowest %.1f s",
+                     i + 1, passes, round(share * 100), secs, slowest)
+        done += 1
+    try:
+        if manual:
+            proc.set_mask(_practice_mask(h // 16, w // 16, 1.0))
+        if ENABLE_REFERENCE_IMAGE:
+            proc.set_reference_image(None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("warmup: compile practice reset: %s", e)
+    log.info("warmup: compile practice done: %d passes in %.0f s", done, time.time() - t0)
+
+
 def warmup_blocking() -> None:
     with STATE_LOCK:
         if STATE["status"] == "ready":
@@ -504,6 +751,8 @@ def warmup_blocking() -> None:
     try:
         os.chdir(str(FLUXRT_ROOT))
         log.info("warmup: cwd=%s", os.getcwd())
+        for note in SETTING_NOTES:
+            log.warning("warmup: setting %s", note)
 
         from fluxrt import StreamProcessor
         from fluxrt.utils import crop_maximal_rectangle
@@ -511,11 +760,17 @@ def warmup_blocking() -> None:
         log.info("warmup: fluxrt imports ok")
 
         ensure_models()
+        for line in storage_report():
+            log.info("warmup: %s", line)
+        try:
+            PRECISION_MARKER.unlink()  # a marker from an earlier start must not be read as this one
+        except OSError:
+            pass
 
         config_path = write_runtime_config()
         log.info("warmup: config written to %s", config_path)
         if LORA_PATH:
-            log.info("warmup: LoRA %s (folder %s, fused before INT8: %s, scale %s)",
+            log.info("warmup: LoRA %s (folder %s, fused into the weights: %s, scale %s)",
                      LORA_PATH, Path(LORA_PATH).parent.name, LORA_FUSE, LORA_SCALE)
         else:
             log.info("warmup: no LoRA (plain FluxRT)")
@@ -526,6 +781,7 @@ def warmup_blocking() -> None:
         log.info("warmup: processor started")
 
         start = time.time()
+        practiced = False
         while time.time() - start < WARMUP_TIMEOUT_S:
             model_proc = getattr(proc.model_inference_subprocess, "process", None)
             if model_proc is not None and not model_proc.is_alive():
@@ -544,10 +800,22 @@ def warmup_blocking() -> None:
                         log.info("warmup: segmenter %s", "loaded" if segmenter is not None else "UNAVAILABLE")
                     if ANCHOR and not hasattr(proc, "set_anchor_image"):
                         log.error("FLUXRT_ANCHOR=1 but this FluxRT has no set_anchor_image (patch missing); anchor OFF")
+                    if COMPILE and COMPILE_WARMUP and not practiced:
+                        practiced = True  # once per warm-up, whatever happens
+                        try:
+                            compile_warmup(proc, COMPILE_WARMUP_PASSES, WARMUP_TIMEOUT_S - (time.time() - start))
+                        except Exception as e:  # noqa: BLE001 - practice is optional, the session still works
+                            log.warning("warmup: compile practice failed (%s); continuing without it", e)
+                        model_proc = getattr(proc.model_inference_subprocess, "process", None)
+                        if model_proc is not None and not model_proc.is_alive():
+                            continue  # the check at the top of the loop reports it
+                    precision_active = read_precision_marker()
+                    log.info("warmup: transformer built in %s", precision_active)
                     with STATE_LOCK:
                         STATE["processor"] = proc
                         STATE["crop_fn"] = crop_maximal_rectangle
                         STATE["segmenter"] = segmenter
+                        STATE["precision_active"] = precision_active
                         STATE["status"] = "ready"
                         STATE["ready_at"] = time.time()
                     log.info("warmup: ready; live switches %s", live_switches(segmenter is not None))
@@ -617,6 +885,20 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "segmenter_loaded": segmenter_loaded,
         "webrtc": WEBRTC_ON,
         "webrtc_max_kbps": WEBRTC_MAX_KBPS if WEBRTC_ON else None,
+        "precision": PRECISION,
+        "precision_active": STATE.get("precision_active"),
+        "fast_mask": FAST_MASK,
+        "compile": COMPILE,
+        "compile_cache": COMPILE_CACHE_STATUS,
+        "compile_warmup_passes": COMPILE_WARMUP_PASSES if (COMPILE and COMPILE_WARMUP) else 0,
+        "compile_suppress_errors": COMPILE_SUPPRESS_ERRORS if COMPILE else None,
+        "compile_recompile_limit": COMPILE_RECOMPILE_LIMIT if COMPILE else None,
+        "size": f"{WIDTH}x{HEIGHT}",
+        "output_size": f"{OUT_WIDTH}x{OUT_HEIGHT}",
+        "ref_size": f"{REF_WIDTH}x{REF_HEIGHT}",
+        "sharpen": SHARPEN,
+        "steps": DEFAULT_STEPS,
+        "setting_notes": list(SETTING_NOTES),
     }
 
 
@@ -1153,9 +1435,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 if ENABLE_LIVECAM_TIMING_LOG and time.time() - window_start >= 5.0:
                     span = time.time() - window_start
                     log.info("livecam pacing: polled=%.1f/s unique_frames=%.1f/s composite=%d pass_through=%d "
-                             "anchors=%d face_pasted=%d face_gain=%.2f",
+                             "anchors=%d face_pasted=%d face_gain=%.2f model=%s",
                              polled / span, published / span, live.stats["composited"], live.stats["passed_through"],
-                             live.stats["anchors"], live.stats.get("face_pasted", 0), live.face_gain)
+                             live.stats["anchors"], live.stats.get("face_pasted", 0), live.face_gain,
+                             STATE.get("precision_active") or "unknown")
                     polled = published = 0
                     window_start = time.time()
                 await asyncio.sleep(max(0.0, period - (time.time() - t0)))

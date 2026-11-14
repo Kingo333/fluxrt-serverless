@@ -15,6 +15,7 @@ on:
       - joyai/**
       - livecam/**
       - fluxrt/patches/**
+      - fluxrt/constraints.txt
       - .github/workflows/build-livecam-dual.yml
   workflow_dispatch:
     inputs:

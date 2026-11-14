@@ -1,0 +1,143 @@
+diff --git a/src/fluxrt/stream_processor/model_inference_subprocess.py b/src/fluxrt/stream_processor/model_inference_subprocess.py
+index fef9191..485acda 100644
+--- a/src/fluxrt/stream_processor/model_inference_subprocess.py
++++ b/src/fluxrt/stream_processor/model_inference_subprocess.py
+@@ -221,6 +221,24 @@ class ModelInferenceSubprocess:
+             ).to(self.dtype)
+ 
+         if self.config.get("compile_models", False):
++            # Azyah patch (FLUXRT_COMPILE_*): a piece that fails to compile runs the normal way instead of
++            # stopping the worker, and enough recompiles are allowed for FluxRT's changing token counts.
++            try:
++                import torch._dynamo as azyah_dynamo
++
++                azyah_dynamo.config.suppress_errors = bool(self.config.get("compile_suppress_errors", True))
++                limit = int(self.config.get("compile_recompile_limit", 64))
++                for name in ("recompile_limit", "cache_size_limit"):
++                    if hasattr(azyah_dynamo.config, name):
++                        setattr(azyah_dynamo.config, name, limit)
++                        break
++                print(
++                    f"[azyah] compile on: suppress_errors={azyah_dynamo.config.suppress_errors}, "
++                    f"recompile limit {limit}",
++                    flush=True,
++                )
++            except Exception as e:  # noqa: BLE001
++                print(f"[azyah] compile settings not applied ({e})", flush=True)
+             self.transformer = torch.compile(
+                 self.transformer,
+             )
+@@ -314,6 +332,14 @@ class ModelInferenceSubprocess:
+         """
+         self.init_process_state()
+         self.init_shared_tensors()
++        # Azyah patch (FLUXRT_FAST_MASK): fewer CPU-GPU waits per frame, same results.
++        from fluxrt.stream_processor import pipeline as azyah_pipeline
++        from fluxrt.stream_processor import transformer_flux2 as azyah_transformer
++
++        fast_mask = bool(self.config.get("fast_active_index", False))
++        azyah_transformer.AZYAH_FAST_MASK = fast_mask
++        azyah_pipeline.AZYAH_PROFILE_SYNC = not fast_mask
++        print(f"[azyah] fast mask {'on' if fast_mask else 'off'}", flush=True)
+         self.load_models()
+         self.update_prompt_embeds(self.process_state["prompt"])
+         self.previous_frame = None
+diff --git a/src/fluxrt/stream_processor/pipeline.py b/src/fluxrt/stream_processor/pipeline.py
+index 1b07fe7..e8bc5ad 100644
+--- a/src/fluxrt/stream_processor/pipeline.py
++++ b/src/fluxrt/stream_processor/pipeline.py
+@@ -42,8 +42,15 @@ prev_time = time.time()
+ import cv2
+ 
+ 
++# Azyah patch: profile() makes the CPU wait for the GPU 12 times per frame although its print is switched off.
++# The worker turns the wait off together with FLUXRT_FAST_MASK.
++AZYAH_PROFILE_SYNC = True
++
++
+ def profile(message):
+     global prev_time
++    if not AZYAH_PROFILE_SYNC:
++        return
+     torch.cuda.synchronize()
+     current_time = time.time()
+     # print(f"{message} : {(current_time - prev_time):.4f} sec")
+diff --git a/src/fluxrt/stream_processor/transformer_flux2.py b/src/fluxrt/stream_processor/transformer_flux2.py
+index 5e1e2a5..5fe3a7f 100644
+--- a/src/fluxrt/stream_processor/transformer_flux2.py
++++ b/src/fluxrt/stream_processor/transformer_flux2.py
+@@ -223,6 +223,30 @@ class SpatialCache:
+         return filled_keys, filled_values
+ 
+ 
++# Azyah patch (the worker's FLUXRT_FAST_MASK, default on): within one transformer call every layer gets the same
++# mask (preprocess_mask runs once at the top of forward), so the active-token index is worked out once per mask
++# instead of in every layer. FluxRT's `if mask.any(): mask.nonzero()` makes the CPU wait for the GPU twice per
++# layer, about 440 times per generated frame; with this on it is once per mask per call. Results are identical.
++AZYAH_FAST_MASK = False
++_AZYAH_ACTIVE = {}
++
++
++@torch.compiler.disable
++def _azyah_reset_active_index():
++    _AZYAH_ACTIVE.clear()
++
++
++@torch.compiler.disable
++def _azyah_active_index(seq_mask: torch.Tensor):
++    """Indices of the active tokens of a 1-D mask (worked out once per transformer call), or None if none."""
++    key = (seq_mask.data_ptr(), seq_mask.shape[0], seq_mask.stride(0), seq_mask._version)
++    active_idx = _AZYAH_ACTIVE.get(key)
++    if active_idx is None:
++        active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)  # one wait; its size is then known
++        _AZYAH_ACTIVE[key] = active_idx
++    return active_idx if active_idx.numel() > 0 else None
++
++
+ def sparse_mlp_compute(
+     mlp_function,
+     mask: torch.Tensor | None,
+@@ -242,6 +266,13 @@ def sparse_mlp_compute(
+     )
+ 
+     seq_mask = mask.squeeze(0)
++    if AZYAH_FAST_MASK:
++        active_idx = _azyah_active_index(seq_mask)
++        if active_idx is not None:
++            mlp_active = input_hidden_states.index_select(1, active_idx)
++            mlp_active_out = mlp_function(mlp_active)
++            mlp_out.index_copy_(1, active_idx, mlp_active_out)
++        return mlp_out
+     if seq_mask.any():
+         active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
+ 
+@@ -275,6 +306,20 @@ def sparse_attention_compute(
+ 
+     hidden_states = torch.zeros_like(query)
+     seq_mask = query_mask.squeeze(0)
++    if AZYAH_FAST_MASK:
++        active_idx = _azyah_active_index(seq_mask)
++        if active_idx is not None:
++            query_active = query.index_select(1, active_idx)
++            hidden_states_active = dispatch_attention_fn(
++                query_active,
++                key,
++                value,
++                attn_mask=attn_mask,
++                backend=backend,
++                parallel_config=parallel_config,
++            )
++            hidden_states.index_copy_(1, active_idx, hidden_states_active)
++        return hidden_states
+     if seq_mask.any():
+         active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
+ 
+@@ -1749,6 +1794,8 @@ class Flux2Transformer2DModel(
+ 
+         if mask is not None:
+             mask = spatial_cache.preprocess_mask(mask)
++            if AZYAH_FAST_MASK:
++                _azyah_reset_active_index()  # Azyah patch: a new mask for this call
+         num_txt_tokens = encoder_hidden_states.shape[1]
+ 
+         # 1. Calculate timestep embedding and modulation parameters

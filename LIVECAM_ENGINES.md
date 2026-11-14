@@ -3,6 +3,15 @@
 One image, `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>`, holds both engines.
 The `LIVECAM_ENGINE` environment variable picks which one a worker runs.
 
+**Two images (2026-11-14).**
+- **Dual image** (FluxRT + JoyAI): `Dockerfile.livecam`, tags `livecam-dual-v1-<sha>`, built by `build-livecam-dual`. This is still how JoyAI is built.
+- **FluxRT-only image**: `Dockerfile.livecam-fluxrt`, tags `livecam-fluxrt-v1-<sha>`, built by `build-livecam-fluxrt`.
+  - It has the same base, system packages, FluxRT steps and app code, without JoyAI's venv, SageAttention, CUTLASS/joyomni_ops or adapter.
+  - It is about 10.8 GB instead of 15.3 GB compressed, and the build takes about a third of the time.
+  - FluxRT runs the same in both: JoyAI is never loaded when `LIVECAM_ENGINE=fluxrt`.
+  - `tests/test_dockerfiles_fluxrt_only.py` keeps the shared steps word for word identical.
+  - On the FluxRT-only image, `LIVECAM_ENGINE=joyai` stops at start-up with "use the livecam-dual image".
+
 **Thin builds.** When only FluxRT app files changed (`server.py`, `bootstrap.py`, `session_token.py`,
 `livecam/`), run the `build-livecam-dual` workflow on the branch with `base_commit` = the commit of an existing
 image (e.g. the live one). The new `livecam-dual-v1-<sha>` is that image plus the app files
@@ -103,8 +112,7 @@ While WebRTC is connected the worker sends no JPEG frames. If it drops, or the a
   - aiortc uses one TURN URL. The worker first sends a STUN check over UDP to that relay. If it answers, it uses TURN over UDP; otherwise TURN over TLS on 443. The log line `livecam webrtc: outbound UDP to ...` says which.
 - **Codecs.** H.264 is preferred both ways, so phones and the kiosk use hardware video; VP8 is accepted. Encode and decode run on the CPU (aiortc + PyAV), never on the GPU.
 - **Packages.** aiortc 1.16.0 (pulls PyAV), listed in `livecam/requirements-webrtc.txt`.
-  - The thin build installs it.
-  - **Before main gets a full build, add the same install to `Dockerfile.livecam`.** It is left out for now because a changed `Dockerfile.livecam` blocks a thin build from the live image.
+  - The thin build installs it, and since 2026-11-14 the full build (`Dockerfile.livecam`) does too.
   - Without the packages the worker logs why and stays on JPEG.
 
 | Variable | Default | What it does |
@@ -116,6 +124,85 @@ While WebRTC is connected the worker sends no JPEG frames. If it drops, or the a
 
 `/ping` shows `webrtc` and `webrtc_max_kbps` under `live_switches`. Every `LIVECAM_LOG_EVERY` frames,
 `livecam webrtc:` logs the state, the TURN transport, frames in, the input size and frames out.
+
+## FP8 transformer and compile (2026-11-14, off by default)
+
+Today's model is INT8 weight-only (optimum-quanto: 8-bit weights, 16-bit maths). It saves memory, not time.
+`FLUXRT_PRECISION=fp8` builds the same favourite #2 with FP8 weights and FP8 maths.
+- **Same favourite.** It starts from the full-precision FLUX.2-klein-4B transformer with the LoRA fused at `FLUXRT_LORA_SCALE`, exactly as the INT8 build does.
+- **What changes.** The Linear layers inside the transformer blocks switch to FP8: torchao, dynamic per-tensor scales, FP8 tensor cores (RTX 4090, RTX 5090, RTX PRO 6000).
+- **What stays the same.**
+  - The embedders, modulation and final layers stay 16-bit.
+  - The text encoder stays INT8.
+  - The VAE, frame interpolation and every live switch are unchanged.
+- **Safe start.** If FP8 cannot run on that GPU (no FP8 tensor cores, a kernel error in the start-up test multiply), FluxRT logs `[azyah] FP8 transformer unavailable (...); falling back to INT8` and builds today's INT8 model.
+- **Where torchao lives.** It sits in its own folder, `/opt/azyah-torchao`, outside the normal package path.
+  - PEFT 0.21, which loads the LoRA, refuses to run once it can see a torchao older than 0.16.
+  - 0.14.1 is the torchao release made for the image's torch 2.9.
+  - So only the FP8 step adds that folder, and only after the LoRA is fused. The INT8 path never sees torchao.
+
+`FLUXRT_COMPILE=1` turns on FluxRT's own `torch.compile` of the transformer and the frame interpolation.
+- FluxRT also wraps the VAE, but it calls the VAE's encode/decode directly, which that wrapper doesn't cover.
+- The first start of a new worker takes minutes longer.
+- The compiler is slow the first time it meets each new number of changed tokens. So before the worker says ready, it runs **compile practice**:
+  - a few practice frames with different amounts of change (60%, 15%, 0%, 85%, ...), with a stand-in garment set as in a session;
+  - shoppers never see those pauses;
+  - afterwards the garment slot and the mask are reset.
+- `FLUXRT_COMPILE_CACHE_DIR` (e.g. `/runpod-volume/fluxrt_compile_cache`) keeps the compiled kernels for the next worker. The cache is only used when that disk has at least 2 GB free.
+  - Note that a network volume reports the whole shared filesystem, not its own quota.
+
+**Fewer CPU-GPU waits (`FLUXRT_FAST_MASK`, on by default).** FluxRT's token-skipping code checks the mask in every layer.
+- Each check makes the CPU wait for the GPU: about 440 waits per generated frame.
+- Its leftover timing helper adds 12 more full waits per frame, although its printout is switched off.
+- The mask is the same for every layer within one model call, so `fluxrt/patches/fluxrt-speed.patch` works the changed tokens out once per call (3 waits) and drops the helper's waits.
+- The output is identical: tested on FluxRT's own transformer with mixed masks.
+- `FLUXRT_FAST_MASK=0` is FluxRT's original code path.
+
+**Sizes are rounded, never fatal.**
+- `FLUXRT_WIDTH`, `FLUXRT_HEIGHT`, `FLUXRT_REF_WIDTH` and `FLUXRT_REF_HEIGHT` are rounded to the nearest multiple of 16 and kept within 128..1024.
+- A value that isn't a number uses the default.
+- Each adjustment is logged at warm-up (`warmup: setting ...`) and listed in `setting_notes`.
+
+All settable in the RunPod env, no rebuild:
+
+| Variable | Default | Range | What it does |
+|---|---|---|---|
+| `FLUXRT_PRECISION` | `int8` | `int8`, `fp8` | `fp8`: FP8 transformer blocks. Needs `ENABLE_INT8` (default on) and the LoRA fused (`FLUXRT_LORA_FUSE`, default on); otherwise the worker logs why and stays INT8. |
+| `FLUXRT_FAST_MASK` | on | `0`/`1` | Changed tokens worked out once per model call (fewer waits, same output). `0` = original. |
+| `FLUXRT_COMPILE` | off | `0`/`1` | FluxRT's `compile_models`. |
+| `FLUXRT_COMPILE_CACHE_DIR` | unset | a folder | Keeps the compile cache across workers. Used only with 2 GB free. |
+| `FLUXRT_COMPILE_WARMUP` | on | `0`/`1` | Compile practice frames before ready (only with compile). |
+| `FLUXRT_COMPILE_WARMUP_PASSES` | `4` | `1`..`12` | How many practice frames. More = longer first start, fewer surprises. |
+| `TORCHDYNAMO_SUPPRESS_ERRORS` | on (with compile) | `0`/`1` | A part that fails to compile runs the normal way and is logged. `0` = stop on compile errors (debugging only). |
+| `FLUXRT_COMPILE_RECOMPILE_LIMIT` | `64` | `8`..`512` | Variants the compiler may build per piece of code before running that piece uncompiled (PyTorch's own default is 8). |
+| `FLUXRT_WIDTH` × `FLUXRT_HEIGHT` | `576` × `320` | multiples of 16, 128..1024 | Model size. The test endpoint uses 288×512; 304×544 is +12% pixels (about +6% detail per side, about 5% slower). |
+| `FLUXRT_SHARPEN` | `0` (off) | `0`..`1` | Unsharp mask on each output frame; above 0.5 edges halo. |
+
+The `warmup: ready; live switches {...}` line shows every value in use:
+- `precision`, `precision_active`, `fast_mask`
+- `compile`, `compile_cache`, `compile_warmup_passes`, `compile_suppress_errors`, `compile_recompile_limit`
+- `size`, `output_size`, `ref_size`, `sharpen`, `steps`, `setting_notes`
+
+The compile practice logs one line per pass: `warmup: compile practice 2/4 (15% changing): 3 frames in N s, slowest M s`.
+
+**Where the models are.** FLUX.2-klein-4B (full precision, with `transformer/`) and FLUX.2-klein-4B-int8 are downloaded from Hugging Face (`HF_TOKEN`) at start-up.
+- They go to the worker's own disk: `/workspace/FluxRT/FLUX.2-klein-4B` and `/workspace/FluxRT/FLUX.2-klein-4B-int8`.
+- They are not on the network volume. Only the LoRA (`/runpod-volume/fluxrt_lora/...`) and JoyAI's weights are.
+- FP8 needs no new download: the fused-LoRA INT8 build already loads that full-precision transformer.
+
+**What the logs show.**
+- At warm-up:
+  - `warmup: model full precision: ...` and `warmup: model int8: ...` give each folder and its size.
+  - `warmup: worker disk ...` and `warmup: network volume ...` give the free space.
+  - `warmup: LoRA ...`.
+  - `warmup: transformer precision asked: ...`.
+  - `warmup: transformer built in fp8 (N layers)` (or `int8`, or `int8 (FP8 unavailable: ...)`).
+- Every 5 s of a session, the `livecam pacing:` line ends in `model=...`, so the precision stays visible after the warm-up lines scroll away.
+- `/ping` `live_switches` has `precision`, `precision_active`, `compile` and `compile_cache`.
+
+**Package versions.** FluxRT's own `requirements.txt` is unpinned, so the full build installs from `fluxrt/constraints.txt`.
+- That file holds the exact versions in the image the test endpoints run today: diffusers 0.42.1, transformers 5.22.2, peft 0.21.2, optimum-quanto 0.2.7, accelerate 1.15.0 and the rest.
+- So a rebuild changes only what the commit changes.
 
 ## Switch to JoyAI
 
