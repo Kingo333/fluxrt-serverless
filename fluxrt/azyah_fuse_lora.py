@@ -1,9 +1,16 @@
-"""Azyah: fuse a LoRA into FluxRT's full-precision transformer, then quantize to INT8 like the pre-quantized model.
+"""Azyah: fuse a LoRA into FluxRT's full-precision transformer, then quantize to INT8 like the pre-quantized model,
+or (FLUXRT_PRECISION=fp8) to FP8 with FP8 maths.
 
 Used by fluxrt/patches/fluxrt-fuse-lora.patch (FluxRT's model process) when the worker config has use_lora and
 fuse_lora. Zero per-frame cost: afterwards the model runs the same INT8 kernels as without a LoRA. The LoRA's
 change (scale x B A) is added to the full-precision weights first, then everything is quantized with the same
 scheme (same layers, same weight type) as the pre-quantized model, read from its quanto_qmap.json.
+
+FP8 (owner, 14 Nov 2026): the pre-quantized INT8 model stores 8-bit weights but multiplies in 16 bits (quanto,
+weights qint8, activations none), so it saves memory, not time. build_fp8_transformer takes the same fused
+full-precision model and converts the transformer blocks' Linear layers to FP8 weights AND FP8 maths (torchao,
+dynamic per-tensor scales: FP8 tensor cores on the RTX 4090, RTX 5090 and RTX PRO 6000). It raises when FP8 is
+unavailable, so the caller falls back to INT8.
 The canonical copy lives in fluxrt/azyah_fuse_lora.py; the patch carries the same text (a test checks that).
 """
 
@@ -13,6 +20,7 @@ import gc
 import json
 import logging
 import os
+import sys
 import time
 
 log = logging.getLogger("azyah.fuse_lora")
@@ -42,6 +50,19 @@ def load_lora_state(lora_path: str) -> tuple:
     return load_file(lora_path), (json.loads(raw) if raw else None)
 
 
+def load_fused_full_precision(model_cls, transformer_dir: str, lora_path, lora_scale: float, dtype):
+    """The full-precision transformer with the LoRA folded into its weights at lora_scale (as it is when
+    lora_path is empty). Shared by the INT8 and the FP8 builds, so both carry exactly the same favourite."""
+    model = model_cls.from_pretrained(transformer_dir, local_files_only=True, torch_dtype=dtype)
+    if lora_path:
+        state, meta = load_lora_state(lora_path)
+        model.load_lora_adapter(state, prefix="transformer", adapter_name="garment", metadata=meta)
+        model.fuse_lora(lora_scale=float(lora_scale), adapter_names=["garment"])
+        model.unload_lora()
+        del state
+    return model
+
+
 def fuse_lora_into_int8(model_cls, transformer_dir: str, int8_models_path: str, lora_path: str,
                         lora_scale: float, device, dtype):
     """Full-precision model + LoRA (fused at lora_scale) -> INT8 model with the pre-quantized model's scheme."""
@@ -50,12 +71,7 @@ def fuse_lora_into_int8(model_cls, transformer_dir: str, int8_models_path: str, 
     t0 = time.time()
     qmap = read_qmap(int8_models_path)
     weights_q, acts_q = qmap_scheme(qmap)
-    model = model_cls.from_pretrained(transformer_dir, local_files_only=True, torch_dtype=dtype)
-    state, meta = load_lora_state(lora_path)
-    model.load_lora_adapter(state, prefix="transformer", adapter_name="garment", metadata=meta)
-    model.fuse_lora(lora_scale=float(lora_scale), adapter_names=["garment"])
-    model.unload_lora()
-    del state
+    model = load_fused_full_precision(model_cls, transformer_dir, lora_path, lora_scale, dtype)
     model.to(device)
     quantize(model, weights=weights_q, activations=acts_q, include=list(qmap))
     freeze(model)
@@ -70,3 +86,113 @@ def fuse_lora_into_int8(model_cls, transformer_dir: str, int8_models_path: str, 
     log.info("fused LoRA %s (scale %s) into the weights and quantized %d layers to %s in %.0fs",
              lora_path, lora_scale, len(got), weights_q, time.time() - t0)
     return model
+
+
+# ---- FP8 (FLUXRT_PRECISION=fp8) ---------------------------------------------------------------------------
+# Only the Linear layers inside the transformer blocks (attention projections, MLPs): nearly all of the work.
+# The embedders (x_embedder, context_embedder), the time/guidance embedding, the shared modulation layers and
+# the final norm/projection stay full precision: they are small and the most sensitive to rounding.
+FP8_BLOCKS = ("transformer_blocks.", "single_transformer_blocks.")
+
+
+def fp8_layer(name: str, module) -> bool:
+    """Whether this layer goes to FP8: a Linear in a transformer block whose sizes suit the FP8 kernels."""
+    import torch
+    return (isinstance(module, torch.nn.Linear) and name.startswith(FP8_BLOCKS)
+            and module.in_features % 16 == 0 and module.out_features % 16 == 0)
+
+
+def is_fp8_weight(weight) -> bool:
+    """Whether torchao turned this layer's weight into FP8 (it silently keeps layers it cannot convert)."""
+    return "float8" in type(weight).__name__.lower()
+
+
+# torchao lives in its own folder in the image, outside the normal package path (Dockerfile.livecam). PEFT, which
+# loads the LoRA, refuses to run at all once it can see a torchao older than 0.16, and torchao 0.14 is the release
+# made for this image's torch 2.9. So the folder is added only by import_torchao, after the LoRA is fused, and the
+# INT8 path never sees torchao (it runs exactly as before).
+TORCHAO_PATH = os.environ.get("AZYAH_TORCHAO_PATH", "/opt/azyah-torchao")
+
+
+def import_torchao():
+    """(Float8DynamicActivationFloat8WeightConfig, PerTensor, quantize_) from torchao's own folder."""
+    try:  # PEFT caches its "is torchao there?" answer: record "no" before torchao becomes visible
+        from peft.import_utils import is_torchao_available
+        is_torchao_available()
+    except Exception:  # noqa: BLE001 - no PEFT, or one that already sees a torchao
+        pass
+    if TORCHAO_PATH and os.path.isdir(TORCHAO_PATH) and TORCHAO_PATH not in sys.path:
+        sys.path.append(TORCHAO_PATH)
+    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, quantize_
+    try:
+        from torchao.quantization import PerTensor
+    except ImportError:  # older torchao keeps it here
+        from torchao.quantization.granularity import PerTensor
+    return Float8DynamicActivationFloat8WeightConfig, PerTensor, quantize_
+
+
+def fp8_unavailable(device):
+    """None when this GPU multiplies in FP8 (compute capability 8.9 or newer: RTX 4090, RTX 5090,
+    RTX PRO 6000, H100), else the reason it cannot."""
+    import torch
+    if str(device).startswith("cpu") or not torch.cuda.is_available():
+        return "no CUDA GPU"
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) < (8, 9):
+        return f"compute capability {major}.{minor} has no FP8 tensor cores"
+    return None
+
+
+def build_fp8_transformer(model_cls, transformer_dir: str, lora_path, lora_scale: float, device, dtype):
+    """Full-precision model + LoRA (fused at lora_scale, exactly as for INT8) -> the transformer blocks' Linear
+    layers with FP8 weights and FP8 maths (torchao, dynamic per-tensor scales). Raises when FP8 is unavailable
+    here (GPU, torchao, kernels), so the caller falls back to INT8 and the worker still starts."""
+    import torch
+    why = fp8_unavailable(device)
+    if why:
+        raise RuntimeError(f"FP8 unavailable: {why}")
+    t0 = time.time()
+    model = load_fused_full_precision(model_cls, transformer_dir, lora_path, lora_scale, dtype)  # PEFT done here
+    model.to(device)
+    Float8DynamicActivationFloat8WeightConfig, PerTensor, quantize_ = import_torchao()
+    names = [n for n, m in model.named_modules() if fp8_layer(n, m)]
+    if not names:
+        raise RuntimeError("FP8: no transformer-block Linear layers found")
+    # set_inductor_config=False: torchao would otherwise change process-wide settings (TF32 for float32 maths,
+    # slower compiler tuning) that also reach the VAE and the frame interpolation.
+    quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor(), set_inductor_config=False),
+              filter_fn=lambda m, fqn: fp8_layer(fqn, m))
+    model.eval()
+    modules = dict(model.named_modules())
+    converted = [n for n in names if is_fp8_weight(modules[n].weight)]
+    if not converted:
+        raise RuntimeError(f"FP8: torchao converted none of the {len(names)} block layers")
+    # FluxRT moves the whole pipeline to the GPU again later (pipe.to); do it here, where a failure still falls back.
+    model.to(device)
+    # One multiply through a converted layer with an odd token count, as FluxRT's cache recomputes a different
+    # number of tokens every frame: an unsupported kernel fails here, at start-up, not in a shopper's session.
+    probe = modules[converted[0]]
+    with torch.no_grad():
+        out = probe(torch.randn(1, 17, probe.in_features, device=device, dtype=dtype))
+    if not torch.isfinite(out).all():
+        raise RuntimeError("FP8: the test multiply gave non-finite numbers")
+    model.azyah_fp8_layers = len(converted)
+    gc.collect()
+    torch.cuda.empty_cache()
+    msg = (f"FP8 transformer ready: {len(converted)} of {len(names)} block layers in FP8 "
+           f"(LoRA {lora_path or 'none'}, scale {lora_scale}) on {torch.cuda.get_device_name(device)} "
+           f"in {time.time() - t0:.0f}s")
+    log.info(msg)
+    print(f"[azyah] {msg}", flush=True)
+    return model
+
+
+def write_precision_marker(path, info: dict) -> None:
+    """Best effort: tell the worker which transformer FluxRT built (fp8, or int8 and why); read at warm-up."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)

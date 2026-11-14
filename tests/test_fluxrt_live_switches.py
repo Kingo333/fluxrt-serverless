@@ -20,7 +20,8 @@ SWITCHES = ("FLUXRT_OUTPUT_PACING", "FLUXRT_OUTPUT_POLL_HZ", "FLUXRT_COMPOSITE",
             "FLUXRT_FACE_PASTE_FEATHER", "FLUXRT_FACE_PASTE_SHRINK", "FLUXRT_FACE_PASTE_MIN_OVERLAP", "FLUXRT_INPUT_SCALE", "FLUXRT_SEG_MODEL",
             "ENABLE_PLAYBACK_SCHEDULER", "PLAYBACK_TARGET_FPS", "REPEAT_LAST_FRAME_WHEN_IDLE",
             "FLUXRT_WIDTH", "FLUXRT_HEIGHT", "FLUXRT_CLIENT_HINTS", "FLUXRT_LORA_PATH", "FLUXRT_REF_CLEAN_DRESS",
-            "LIVECAM_WEBRTC", "LIVECAM_WEBRTC_MAX_KBPS", "LIVECAM_WEBRTC_START_KBPS")
+            "LIVECAM_WEBRTC", "LIVECAM_WEBRTC_MAX_KBPS", "LIVECAM_WEBRTC_START_KBPS",
+            "FLUXRT_PRECISION", "FLUXRT_COMPILE", "FLUXRT_COMPILE_CACHE_DIR")
 
 
 def load(monkeypatch, **env):
@@ -44,7 +45,8 @@ def test_defaults_are_all_off(monkeypatch):
     sw = s.live_switches(False)
     assert sw == {"output_pacing": False, "output_poll_hz": None, "composite": False, "ref_clean": False,
                   "ref_clean_dress": False, "cache_mask": "auto", "anchor": False, "anchor_refresh_s": None, "face_paste": False, "mu": None,
-                  "input_scale": 1, "segmenter_loaded": False, "webrtc": False, "webrtc_max_kbps": None}
+                  "input_scale": 1, "segmenter_loaded": False, "webrtc": False, "webrtc_max_kbps": None,
+                  "precision": "int8", "precision_active": None, "compile": False, "compile_cache": False}
 
 
 def test_ready_message_unchanged_when_off_and_extended_when_on(monkeypatch):

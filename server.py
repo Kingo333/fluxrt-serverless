@@ -97,6 +97,62 @@ def _bounded(name: str, default: float, lo: float, hi: float) -> float:
 # FLUXRT_SHARPEN 0..1 (default 0 = off): unsharp mask on each output frame before JPEG; 0.3 about restores
 #   the crispness the LoRA costs, above 0.5 edges start to halo. About 1 ms per frame, no temporal effect.
 LORA_FUSE = os.getenv("FLUXRT_LORA_FUSE", "true").strip().lower() in ("1", "true", "yes", "on")
+# FP8 (owner, 2026-11-14). FLUXRT_PRECISION=fp8 builds the same favourite (full-precision model with the LoRA
+#   fused at FLUXRT_LORA_SCALE) with the transformer blocks' Linear layers in FP8 weights AND FP8 maths
+#   (fluxrt/azyah_fuse_lora.py, torchao). Today's INT8 model stores 8-bit weights but multiplies in 16 bits, so it
+#   saves memory, not time. Unset or int8 = today's model, unchanged. Needs ENABLE_INT8 (the default: FluxRT's
+#   quantized loader, which also keeps the INT8 text encoder). If FP8 is unavailable on the GPU, FluxRT logs
+#   "[azyah] FP8 transformer unavailable (...); falling back to INT8" and runs INT8.
+PRECISION = os.getenv("FLUXRT_PRECISION", "int8").strip().lower() or "int8"
+if PRECISION not in ("int8", "fp8"):
+    log.warning("FLUXRT_PRECISION=%r is not int8|fp8; using int8", PRECISION)
+    PRECISION = "int8"
+if PRECISION == "fp8" and not ENABLE_INT8:
+    log.warning("FLUXRT_PRECISION=fp8 needs ENABLE_INT8 (FluxRT's quantized loader); running without FP8")
+    PRECISION = "int8"
+if PRECISION == "fp8" and LORA_PATH and not LORA_FUSE:
+    log.warning("FLUXRT_PRECISION=fp8 needs the LoRA fused into the weights (FLUXRT_LORA_FUSE on); running INT8")
+    PRECISION = "int8"
+# FLUXRT_COMPILE=1: FluxRT's own compile option (torch.compile of the transformer, VAE and frame interpolation;
+#   FluxRT's authors run it on). Off by default: the first start of each new worker takes minutes longer.
+#   FLUXRT_COMPILE_CACHE_DIR (a folder on the network volume) keeps the compiled kernels for the next worker.
+COMPILE = os.getenv("FLUXRT_COMPILE", "").strip().lower() in ("1", "true", "yes", "on")
+COMPILE_CACHE_DIR = os.getenv("FLUXRT_COMPILE_CACHE_DIR", "").strip()
+
+
+def compile_cache_env(cache_dir: str) -> Dict[str, str]:
+    """Environment that keeps torch.compile's caches in cache_dir (inherited by FluxRT's model process)."""
+    return {
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(cache_dir, "inductor"),
+        "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
+        "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
+        "TRITON_CACHE_DIR": os.path.join(cache_dir, "triton"),
+    }
+
+
+COMPILE_CACHE_MIN_FREE_GB = 2.0
+
+
+def setup_compile_cache(cache_dir: str, min_free_gb: float = COMPILE_CACHE_MIN_FREE_GB) -> tuple:
+    """(cache kept in cache_dir?, status for the logs). Only with enough free space: a full disk must never
+    stop the worker, so without it the compiler keeps its cache inside the worker as usual."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        free_gb = shutil.disk_usage(cache_dir).free / 1e9
+    except OSError as e:
+        return False, f"not kept: {cache_dir} not usable ({e.__class__.__name__})"
+    if free_gb < min_free_gb:
+        return False, f"not kept: only {free_gb:.1f} GB free at {cache_dir}"
+    for k, v in compile_cache_env(cache_dir).items():
+        os.environ.setdefault(k, v)
+    return True, f"kept at {cache_dir} ({free_gb:.0f} GB free)"
+
+
+COMPILE_CACHE_USED, COMPILE_CACHE_STATUS = False, "off"
+if COMPILE:
+    COMPILE_CACHE_STATUS = "inside this worker only (no FLUXRT_COMPILE_CACHE_DIR)"
+    if COMPILE_CACHE_DIR:
+        COMPILE_CACHE_USED, COMPILE_CACHE_STATUS = setup_compile_cache(COMPILE_CACHE_DIR)
 LORA_SCALE = _bounded("FLUXRT_LORA_SCALE", 1.0, 0.0, 2.0)
 SHARPEN = _bounded("FLUXRT_SHARPEN", 0.0, 0.0, 1.0)
 CLIENT_HINTS = os.getenv("FLUXRT_CLIENT_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -234,6 +290,7 @@ STATE: Dict[str, Any] = {
     "ready_at": None,
     "warmup_thread": None,
     "segmenter": None,
+    "precision_active": None,  # what FluxRT built: fp8 / int8 (read from its marker at warm-up)
 }
 
 
@@ -448,6 +505,63 @@ def check_lora(path: str) -> str:
     return str(p)
 
 
+PRECISION_MARKER = FLUXRT_ROOT / "azyah_precision.json"
+VOLUME_ROOT = Path(os.getenv("RUNPOD_VOLUME_ROOT", "/runpod-volume"))
+
+
+def _folder_gb(path: Path) -> Optional[float]:
+    try:
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) / 1e9
+    except OSError:
+        return None
+
+
+def _disk(path: Path) -> str:
+    try:
+        u = shutil.disk_usage(path)
+    except OSError as e:
+        return f"not readable ({e.__class__.__name__})"
+    return f"{u.free / 1e9:.0f} GB free of {u.total / 1e9:.0f} GB"
+
+
+def storage_report() -> List[str]:
+    """Where the models are and how much room there is, for the warm-up log (read-only)."""
+    def model(label: str, path: Path, repo: str) -> str:
+        gb = _folder_gb(path) if path.is_dir() else None
+        size = f"{gb:.1f} GB" if gb is not None else "MISSING"
+        extra = ""
+        if label == "full precision":
+            extra = f", transformer folder {'present' if (path / 'transformer').is_dir() else 'MISSING'}"
+        return f"model {label}: {path} ({size}{extra}; downloaded from Hugging Face {repo} at start-up)"
+
+    lines = [model("full precision", FLUXRT_ROOT / "FLUX.2-klein-4B", FLUX_REPO_ID)]
+    if ENABLE_INT8:
+        lines.append(model("int8", FLUXRT_ROOT / "FLUX.2-klein-4B-int8", INT8_REPO_ID))
+    lines.append(f"worker disk {FLUXRT_ROOT}: {_disk(FLUXRT_ROOT)}")
+    lines.append(f"network volume {VOLUME_ROOT}: {_disk(VOLUME_ROOT) if VOLUME_ROOT.is_dir() else 'not mounted'}")
+    if LORA_PATH:
+        lp = Path(LORA_PATH)
+        lora_mb = f"{lp.stat().st_size / 1e6:.0f} MB" if lp.is_file() else "MISSING"
+        lines.append(f"LoRA {LORA_PATH} ({lora_mb})")
+    lines.append(f"transformer precision asked: {PRECISION}; compile: {'on' if COMPILE else 'off'}"
+                 + (f", cache {COMPILE_CACHE_STATUS}" if COMPILE else ""))
+    return lines
+
+
+def read_precision_marker(path: Path = PRECISION_MARKER) -> str:
+    """What FluxRT's model process built: 'fp8 (N layers)', 'int8', 'int8 (FP8 unavailable: ...)' or 'unknown'."""
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return "unknown"
+    if info.get("precision") == "fp8":
+        n = info.get("fp8_layers")
+        return f"fp8 ({n} layers)" if n else "fp8"
+    if info.get("fp8_error"):
+        return f"int8 (FP8 unavailable: {info['fp8_error']})"
+    return "int8"
+
+
 def write_runtime_config() -> Path:
     config = {
         "default_prompt": DEFAULT_PROMPT,
@@ -459,7 +573,7 @@ def write_runtime_config() -> Path:
             "height": HEIGHT,
             "width": WIDTH,
         },
-        "compile_models": False,
+        "compile_models": COMPILE,
         "enable_spatial_cache": True,
         "enable_int8_quantization": ENABLE_INT8,
         "enable_tiny_vae": ENABLE_TINY_VAE,
@@ -473,6 +587,8 @@ def write_runtime_config() -> Path:
         },
         "logging": True,
     }
+    config["precision"] = PRECISION  # read by fluxrt/patches/fluxrt-fuse-lora.patch (FP8 or INT8)
+    config["precision_marker"] = str(PRECISION_MARKER)  # the same patch writes which one it built
     if LORA_PATH:
         config["use_lora"] = True
         config["lora_weights_path"] = check_lora(LORA_PATH)
@@ -511,11 +627,17 @@ def warmup_blocking() -> None:
         log.info("warmup: fluxrt imports ok")
 
         ensure_models()
+        for line in storage_report():
+            log.info("warmup: %s", line)
+        try:
+            PRECISION_MARKER.unlink()  # a marker from an earlier start must not be read as this one
+        except OSError:
+            pass
 
         config_path = write_runtime_config()
         log.info("warmup: config written to %s", config_path)
         if LORA_PATH:
-            log.info("warmup: LoRA %s (folder %s, fused before INT8: %s, scale %s)",
+            log.info("warmup: LoRA %s (folder %s, fused into the weights: %s, scale %s)",
                      LORA_PATH, Path(LORA_PATH).parent.name, LORA_FUSE, LORA_SCALE)
         else:
             log.info("warmup: no LoRA (plain FluxRT)")
@@ -544,10 +666,13 @@ def warmup_blocking() -> None:
                         log.info("warmup: segmenter %s", "loaded" if segmenter is not None else "UNAVAILABLE")
                     if ANCHOR and not hasattr(proc, "set_anchor_image"):
                         log.error("FLUXRT_ANCHOR=1 but this FluxRT has no set_anchor_image (patch missing); anchor OFF")
+                    precision_active = read_precision_marker()
+                    log.info("warmup: transformer built in %s", precision_active)
                     with STATE_LOCK:
                         STATE["processor"] = proc
                         STATE["crop_fn"] = crop_maximal_rectangle
                         STATE["segmenter"] = segmenter
+                        STATE["precision_active"] = precision_active
                         STATE["status"] = "ready"
                         STATE["ready_at"] = time.time()
                     log.info("warmup: ready; live switches %s", live_switches(segmenter is not None))
@@ -617,6 +742,10 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "segmenter_loaded": segmenter_loaded,
         "webrtc": WEBRTC_ON,
         "webrtc_max_kbps": WEBRTC_MAX_KBPS if WEBRTC_ON else None,
+        "precision": PRECISION,
+        "precision_active": STATE.get("precision_active"),
+        "compile": COMPILE,
+        "compile_cache": COMPILE_CACHE_USED,
     }
 
 
@@ -1153,9 +1282,10 @@ async def ws(websocket: WebSocket, token: str = Query(default="")):
                 if ENABLE_LIVECAM_TIMING_LOG and time.time() - window_start >= 5.0:
                     span = time.time() - window_start
                     log.info("livecam pacing: polled=%.1f/s unique_frames=%.1f/s composite=%d pass_through=%d "
-                             "anchors=%d face_pasted=%d face_gain=%.2f",
+                             "anchors=%d face_pasted=%d face_gain=%.2f model=%s",
                              polled / span, published / span, live.stats["composited"], live.stats["passed_through"],
-                             live.stats["anchors"], live.stats.get("face_pasted", 0), live.face_gain)
+                             live.stats["anchors"], live.stats.get("face_pasted", 0), live.face_gain,
+                             STATE.get("precision_active") or "unknown")
                     polled = published = 0
                     window_start = time.time()
                 await asyncio.sleep(max(0.0, period - (time.time() - t0)))

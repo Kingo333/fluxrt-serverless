@@ -14,7 +14,8 @@ def load(monkeypatch, **env):
     for k in ("ENABLE_TINY_VAE", "ENABLE_FLOW_UPSCALER", "FLUXRT_WIDTH", "FLUXRT_HEIGHT",
               "FLUXRT_REF_WIDTH", "FLUXRT_REF_HEIGHT", "FLUXRT_CLIENT_HINTS",
               "FLUXRT_LORA_PATH", "FLUXRT_ALLOW_RESEARCH_MODEL",
-              "FLUXRT_LORA_FUSE", "FLUXRT_LORA_SCALE", "FLUXRT_SHARPEN"):
+              "FLUXRT_LORA_FUSE", "FLUXRT_LORA_SCALE", "FLUXRT_SHARPEN",
+              "FLUXRT_PRECISION", "FLUXRT_COMPILE", "FLUXRT_COMPILE_CACHE_DIR"):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
