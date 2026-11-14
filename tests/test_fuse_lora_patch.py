@@ -31,9 +31,9 @@ def test_patch_carries_the_same_helper_as_the_repo_and_touches_the_right_places(
     assert 'self.config.get("precision", "int8")).lower() == "fp8"' in patch and "build_fp8_transformer(" in patch
     assert "falling back to INT8" in patch and 'precision_info["fp8_error"]' in patch
     assert 'self.config.get("precision_marker")' in patch and "write_precision_marker(" in patch
-    # Dockerfile.livecam applies fluxrt/patches/*.patch in name order: anchor first, then this one.
+    # Dockerfile.livecam applies fluxrt/patches/*.patch in name order: anchor, this one, then the speed patch.
     names = sorted(p.name for p in (ROOT / "fluxrt/patches").glob("*.patch"))
-    assert names == ["fluxrt-anchor-reference.patch", "fluxrt-fuse-lora.patch"]
+    assert names == ["fluxrt-anchor-reference.patch", "fluxrt-fuse-lora.patch", "fluxrt-speed.patch"]
     assert "fluxrt/patches" in (ROOT / "Dockerfile.livecam").read_text()
 
 

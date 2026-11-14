@@ -21,7 +21,10 @@ SWITCHES = ("FLUXRT_OUTPUT_PACING", "FLUXRT_OUTPUT_POLL_HZ", "FLUXRT_COMPOSITE",
             "ENABLE_PLAYBACK_SCHEDULER", "PLAYBACK_TARGET_FPS", "REPEAT_LAST_FRAME_WHEN_IDLE",
             "FLUXRT_WIDTH", "FLUXRT_HEIGHT", "FLUXRT_CLIENT_HINTS", "FLUXRT_LORA_PATH", "FLUXRT_REF_CLEAN_DRESS",
             "LIVECAM_WEBRTC", "LIVECAM_WEBRTC_MAX_KBPS", "LIVECAM_WEBRTC_START_KBPS",
-            "FLUXRT_PRECISION", "FLUXRT_COMPILE", "FLUXRT_COMPILE_CACHE_DIR")
+            "FLUXRT_PRECISION", "FLUXRT_COMPILE", "FLUXRT_COMPILE_CACHE_DIR", "FLUXRT_FAST_MASK",
+            "FLUXRT_COMPILE_WARMUP", "FLUXRT_COMPILE_WARMUP_PASSES", "FLUXRT_COMPILE_RECOMPILE_LIMIT",
+            "TORCHDYNAMO_SUPPRESS_ERRORS", "FLUXRT_REF_WIDTH", "FLUXRT_REF_HEIGHT", "FLUXRT_SHARPEN", "FLUXRT_STEPS",
+            "ENABLE_TINY_VAE", "ENABLE_FLOW_UPSCALER")
 
 
 def load(monkeypatch, **env):
@@ -46,7 +49,10 @@ def test_defaults_are_all_off(monkeypatch):
     assert sw == {"output_pacing": False, "output_poll_hz": None, "composite": False, "ref_clean": False,
                   "ref_clean_dress": False, "cache_mask": "auto", "anchor": False, "anchor_refresh_s": None, "face_paste": False, "mu": None,
                   "input_scale": 1, "segmenter_loaded": False, "webrtc": False, "webrtc_max_kbps": None,
-                  "precision": "int8", "precision_active": None, "compile": False, "compile_cache": False}
+                  "precision": "int8", "precision_active": None, "fast_mask": True, "compile": False,
+                  "compile_cache": "off", "compile_warmup_passes": 0, "compile_suppress_errors": None,
+                  "compile_recompile_limit": None, "size": "576x320", "output_size": "1152x640", "ref_size": "384x512",
+                  "sharpen": 0.0, "steps": 2, "setting_notes": []}
 
 
 def test_ready_message_unchanged_when_off_and_extended_when_on(monkeypatch):

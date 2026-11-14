@@ -132,16 +132,49 @@ Today's model is INT8 weight-only (optimum-quanto: 8-bit weights, 16-bit maths).
   - 0.14.1 is the torchao release made for the image's torch 2.9.
   - So only the FP8 step adds that folder, and only after the LoRA is fused. The INT8 path never sees torchao.
 
-`FLUXRT_COMPILE=1` turns on FluxRT's own `torch.compile` of the transformer, VAE and frame interpolation (FluxRT's authors benchmark with it on).
+`FLUXRT_COMPILE=1` turns on FluxRT's own `torch.compile` of the transformer and the frame interpolation.
+- FluxRT also wraps the VAE, but it calls the VAE's encode/decode directly, which that wrapper doesn't cover.
 - The first start of a new worker takes minutes longer.
-- The first session after that may stutter for a few seconds while the compiler adapts to the changing token counts.
+- The compiler is slow the first time it meets each new number of changed tokens. So before the worker says ready, it runs **compile practice**:
+  - a few practice frames with different amounts of change (60%, 15%, 0%, 85%, ...), with a stand-in garment set as in a session;
+  - shoppers never see those pauses;
+  - afterwards the garment slot and the mask are reset.
 - `FLUXRT_COMPILE_CACHE_DIR` (e.g. `/runpod-volume/fluxrt_compile_cache`) keeps the compiled kernels for the next worker. The cache is only used when that disk has at least 2 GB free.
+  - Note that a network volume reports the whole shared filesystem, not its own quota.
 
-| Variable | Default | What it does |
-|---|---|---|
-| `FLUXRT_PRECISION` | `int8` | `fp8`: FP8 transformer blocks. Needs `ENABLE_INT8` (default on) and the LoRA fused (`FLUXRT_LORA_FUSE`, default on); otherwise the worker logs why and stays INT8. |
-| `FLUXRT_COMPILE` | off | `1`: FluxRT's `compile_models`. |
-| `FLUXRT_COMPILE_CACHE_DIR` | unset | Folder that keeps the compile cache across workers (network volume). |
+**Fewer CPU-GPU waits (`FLUXRT_FAST_MASK`, on by default).** FluxRT's token-skipping code checks the mask in every layer.
+- Each check makes the CPU wait for the GPU: about 440 waits per generated frame.
+- Its leftover timing helper adds 12 more full waits per frame, although its printout is switched off.
+- The mask is the same for every layer within one model call, so `fluxrt/patches/fluxrt-speed.patch` works the changed tokens out once per call (3 waits) and drops the helper's waits.
+- The output is identical: tested on FluxRT's own transformer with mixed masks.
+- `FLUXRT_FAST_MASK=0` is FluxRT's original code path.
+
+**Sizes are rounded, never fatal.**
+- `FLUXRT_WIDTH`, `FLUXRT_HEIGHT`, `FLUXRT_REF_WIDTH` and `FLUXRT_REF_HEIGHT` are rounded to the nearest multiple of 16 and kept within 128..1024.
+- A value that isn't a number uses the default.
+- Each adjustment is logged at warm-up (`warmup: setting ...`) and listed in `setting_notes`.
+
+All settable in the RunPod env, no rebuild:
+
+| Variable | Default | Range | What it does |
+|---|---|---|---|
+| `FLUXRT_PRECISION` | `int8` | `int8`, `fp8` | `fp8`: FP8 transformer blocks. Needs `ENABLE_INT8` (default on) and the LoRA fused (`FLUXRT_LORA_FUSE`, default on); otherwise the worker logs why and stays INT8. |
+| `FLUXRT_FAST_MASK` | on | `0`/`1` | Changed tokens worked out once per model call (fewer waits, same output). `0` = original. |
+| `FLUXRT_COMPILE` | off | `0`/`1` | FluxRT's `compile_models`. |
+| `FLUXRT_COMPILE_CACHE_DIR` | unset | a folder | Keeps the compile cache across workers. Used only with 2 GB free. |
+| `FLUXRT_COMPILE_WARMUP` | on | `0`/`1` | Compile practice frames before ready (only with compile). |
+| `FLUXRT_COMPILE_WARMUP_PASSES` | `4` | `1`..`12` | How many practice frames. More = longer first start, fewer surprises. |
+| `TORCHDYNAMO_SUPPRESS_ERRORS` | on (with compile) | `0`/`1` | A part that fails to compile runs the normal way and is logged. `0` = stop on compile errors (debugging only). |
+| `FLUXRT_COMPILE_RECOMPILE_LIMIT` | `64` | `8`..`512` | Variants the compiler may build per piece of code before running that piece uncompiled (PyTorch's own default is 8). |
+| `FLUXRT_WIDTH` × `FLUXRT_HEIGHT` | `576` × `320` | multiples of 16, 128..1024 | Model size. The test endpoint uses 288×512; 304×544 is +12% pixels (about +6% detail per side, about 5% slower). |
+| `FLUXRT_SHARPEN` | `0` (off) | `0`..`1` | Unsharp mask on each output frame; above 0.5 edges halo. |
+
+The `warmup: ready; live switches {...}` line shows every value in use:
+- `precision`, `precision_active`, `fast_mask`
+- `compile`, `compile_cache`, `compile_warmup_passes`, `compile_suppress_errors`, `compile_recompile_limit`
+- `size`, `output_size`, `ref_size`, `sharpen`, `steps`, `setting_notes`
+
+The compile practice logs one line per pass: `warmup: compile practice 2/4 (15% changing): 3 frames in N s, slowest M s`.
 
 **Where the models are.** FLUX.2-klein-4B (full precision, with `transformer/`) and FLUX.2-klein-4B-int8 are downloaded from Hugging Face (`HF_TOKEN`) at start-up.
 - They go to the worker's own disk: `/workspace/FluxRT/FLUX.2-klein-4B` and `/workspace/FluxRT/FLUX.2-klein-4B-int8`.

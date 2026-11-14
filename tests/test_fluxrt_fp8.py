@@ -54,7 +54,7 @@ def test_default_is_todays_int8_model_without_compile(monkeypatch, tmp_path):
     assert cfg["precision"] == "int8" and cfg["compile_models"] is False
     assert cfg["precision_marker"] == str(tmp_path / "fluxrt" / "azyah_precision.json")
     sw = s.live_switches(False)
-    assert (sw["precision"], sw["precision_active"], sw["compile"], sw["compile_cache"]) == ("int8", None, False, False)
+    assert (sw["precision"], sw["precision_active"], sw["compile"], sw["compile_cache"]) == ("int8", None, False, "off")
     import os
     assert not any(k in os.environ for k in COMPILER_ENV)          # compile caches untouched when off
 
