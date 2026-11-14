@@ -115,9 +115,12 @@ RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention \
     && git apply /opt/JoyAI-Video-Edit/deploy/sageattention-cudagraph-stream.patch \
     && EXT_PARALLEL=${EXT_PARALLEL} NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS}" MAX_JOBS=${MAX_JOBS} /opt/joyai-venv/bin/python setup.py install \
     && cd / && rm -rf /tmp/SageAttention
+# joyomni_ops compiles one file at a time: its CUTLASS FP8 GEMM (fp8_gemm.o) alone takes most of the runner's
+# 16 GB, and with two compiles at once nvcc was killed for lack of memory (exit 137, 2026-11-14). Same sources and
+# flags, only slower (a minute or two).
 RUN git clone https://github.com/NVIDIA/cutlass.git /tmp/cutlass \
     && git -C /tmp/cutlass checkout ${CUTLASS_COMMIT} \
-    && JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=${MAX_JOBS} \
+    && JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=1 \
        /opt/joyai-venv/bin/pip install --no-build-isolation /opt/JoyAI-Video-Edit/deploy/joyomni_ops \
     && rm -rf /tmp/cutlass
 COPY joyai/requirements-adapter.txt /tmp/joyai-adapter-requirements.txt

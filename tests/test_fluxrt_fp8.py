@@ -199,6 +199,8 @@ def test_full_image_pins_packages_and_keeps_torchao_out_of_peft_sight():
     assert df.count("torchao==") == 1 and "PEFT must not see torchao" in df and "import_torchao()" in df
     helper = (ROOT / "fluxrt" / "azyah_fuse_lora.py").read_text()
     assert 'os.environ.get("AZYAH_TORCHAO_PATH", "/opt/azyah-torchao")' in helper
+    # JoyAI's CUTLASS FP8 kernel compiles one file at a time (two at once ran the 16 GB runner out of memory)
+    assert "JOYOMNI_OPS_CUTLASS_DIR=/tmp/cutlass MAX_JOBS=1" in df
     # WebRTC in the full image too, checked like the thin image does
     assert "-r /tmp/livecam-webrtc-requirements.txt" in df
     assert "assert webrtc.available(), webrtc.unavailable_reason()" in df
