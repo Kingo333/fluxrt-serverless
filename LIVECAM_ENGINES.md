@@ -3,6 +3,15 @@
 One image, `ghcr.io/kingo333/fluxrt-serverless:livecam-dual-v1-<sha>`, holds both engines.
 The `LIVECAM_ENGINE` environment variable picks which one a worker runs.
 
+**Two images (2026-11-14).**
+- **Dual image** (FluxRT + JoyAI): `Dockerfile.livecam`, tags `livecam-dual-v1-<sha>`, built by `build-livecam-dual`. This is still how JoyAI is built.
+- **FluxRT-only image**: `Dockerfile.livecam-fluxrt`, tags `livecam-fluxrt-v1-<sha>`, built by `build-livecam-fluxrt`.
+  - It has the same base, system packages, FluxRT steps and app code, without JoyAI's venv, SageAttention, CUTLASS/joyomni_ops or adapter.
+  - It is about 10.8 GB instead of 15.3 GB compressed, and the build takes about a third of the time.
+  - FluxRT runs the same in both: JoyAI is never loaded when `LIVECAM_ENGINE=fluxrt`.
+  - `tests/test_dockerfiles_fluxrt_only.py` keeps the shared steps word for word identical.
+  - On the FluxRT-only image, `LIVECAM_ENGINE=joyai` stops at start-up with "use the livecam-dual image".
+
 **Thin builds.** When only FluxRT app files changed (`server.py`, `bootstrap.py`, `session_token.py`,
 `livecam/`), run the `build-livecam-dual` workflow on the branch with `base_commit` = the commit of an existing
 image (e.g. the live one). The new `livecam-dual-v1-<sha>` is that image plus the app files
