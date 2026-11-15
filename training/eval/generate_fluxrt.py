@@ -163,6 +163,10 @@ def main(argv=None) -> None:
                     help="with --lora2: share of the FIRST LoRA (0.3 = 30%% first, 70%% second); --lora-scale scales both")
     ap.add_argument("--prompt-style", choices=("full", "compact", "live"), default="full",
                     help="compact = the app's default FluxRT prompt since azyah-shopping #21 (buildCompactTryOnPrompt)")
+    ap.add_argument("--anchor-after", type=int, default=0,
+                    help="fxreal6: like the live FLUXRT_ANCHOR, after this many output frames of a clip the model also "
+                         "gets its own last picture as a third image (0 = off; --clip-list only)")
+    ap.add_argument("--anchor-every", type=int, default=0, help="and that picture is renewed every this many frames (0 = once)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
                     "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
                     "--staging is then ignored")
@@ -283,11 +287,17 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
         plain = {"plain": True} if a.prompt_style == "live" and it.get("plain") else {}
         prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"), **plain)
         outs = []
+        anchor, anchor_at = None, None
         for i, frame in enumerate(frames):
+            if a.anchor_after > 0 and outs and (
+                    (anchor is None and i >= a.anchor_after)
+                    or (anchor is not None and a.anchor_every > 0 and i - anchor_at >= a.anchor_every)):
+                anchor, anchor_at = outs[-1].resize((w, h)), i   # its own picture, as the live worker takes it
             gen = torch.Generator(device="cuda").manual_seed(a.seed)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            img = pipe(prompt=prompt, image=[frame, garment], height=h, width=w, guidance_scale=1.0,
+            images = [frame, garment] + ([anchor] if anchor is not None else [])
+            img = pipe(prompt=prompt, image=images, height=h, width=w, guidance_scale=1.0,
                        num_inference_steps=a.steps, generator=gen).images[0]
             torch.cuda.synchronize()
             if i >= 3:

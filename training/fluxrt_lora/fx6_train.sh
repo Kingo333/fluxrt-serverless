@@ -79,11 +79,13 @@ train() {  # steps, save interval, minutes
     AZ_CKPT_INTERVAL=$2 AZ_CKPT_LIMIT=12 AZ_MASK_COLUMN=mask AZ_MASK_WEIGHT=${AZ_MASK_WEIGHT:-3.0} \
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
     AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
+    AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor} AZ_ANCHOR_PROB=${AZ_ANCHOR_PROB:-1.0} \
     AZ_INIT_LORA=$INIT bash" > "$AZ_ROOT/reports/fx6_${STAGE}_run.log" 2>&1
   echo "TRAIN_EXIT=$?"
   LOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
   grep -h "LoRA initialised from" "$LOG" 2>/dev/null | tail -1
   grep -h "^REF_SIZES" "$LOG" 2>/dev/null | tail -1
+  grep -h "^ANCHOR_BATCHES" "$LOG" 2>/dev/null | tail -1
   grep -hE "^(CACHE_RAM|CACHE_CPU|NOT_ENOUGH_CPU_RAM)|OutOfMemoryError|CUDA out of memory|Traceback" "$LOG" "$AZ_ROOT/reports/fx6_${STAGE}_run.log" 2>/dev/null | tail -6
   grep -oE "(loss|detail|pair|colour|texture)=[0-9.e+-]+" "$LOG" 2>/dev/null | tail -10 | tr '\n' ' '; echo
   ls "$OUT" 2>/dev/null | tr '\n' ' '; echo
@@ -127,7 +129,7 @@ train)
 eval)
   FX="$OUT/pytorch_lora_weights.safetensors"
   [ -f "$FX" ] || { echo "NO_FX6_LORA: $FX"; exit 1; }
-  FAV="fav2_$TAG"; NEW="fx6_$TAG"; MIX="fx6b75_$TAG"
+  FAV="fav2_$TAG"; NEW="fx6_$TAG"; MIX="fx6b75_$TAG"; ANC="fx6anchor_$TAG"
   # an earlier save, about two thirds of the way, to see whether the last steps helped
   LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
   EARLY=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | awk -v t="$(( ${LAST:-0} * 2 / 3 ))" '$1 <= t' | tail -1)
@@ -147,9 +149,11 @@ eval)
     render "$s" "$FAV" --lora "$INIT/pytorch_lora_weights.safetensors"      # kept from the baseline: nothing new to render
     render "$s" "$NEW" --lora "$FX"
     render "$s" "$MIX" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend 0.75
+    # with its own earlier picture as the third image, as live with FLUXRT_ANCHOR=1 (taken after 8 frames, renewed every 12)
+    render "$s" "$ANC" --lora "$FX" --anchor-after 8 --anchor-every 12
     [ -n "$OLD" ] && render "$s" "$OLD" --lora "$OUT/checkpoint-$EARLY/pytorch_lora_weights.safetensors"
   done
-  CANDS="$NEW $MIX $OLD"
+  CANDS="$NEW $MIX $ANC $OLD"
   echo "== priority 4: face and skin against favourite #2 ($(mins))"
   for s in $SETS; do
     LEAK=""; [ "$s" = "fx6logo" ] && LEAK="--leak-pairs"
@@ -198,10 +202,10 @@ PYEOF
     ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" $CANDS --baseline "$FAV" --out "$E/garment_fx6_$s.md" \
         --json "$R/$s/garment_report_fx6.json" ) 2>&1 | grep -E "^PRIORITY|DINO" || echo "GARMENT_SCORE_${s}_EXIT=$?"
   done
-  echo "== labelled videos: garment | camera | favourite #2 (today) | fxreal6 | fxreal6 at 75% ($(mins))"
+  echo "== labelled videos: garment | camera | favourite #2 (today) | fxreal6 | fxreal6 + earlier frame | fxreal6 at 75% ($(mins))"
   for s in $SETS; do
-    ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols 5 --no-legend \
-        --panels "$FAV=favourite #2 (today)" "$NEW=fxreal6" "$MIX=fxreal6 at 75%" ) > "$E/video_fx6_$s.log" 2>&1 || echo "VIDEO_${s}_EXIT=$?"
+    ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols 6 --no-legend \
+        --panels "$FAV=favourite #2 (today)" "$NEW=fxreal6" "$ANC=fxreal6 + earlier frame" "$MIX=fxreal6 at 75%" ) > "$E/video_fx6_$s.log" 2>&1 || echo "VIDEO_${s}_EXIT=$?"
     [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx6_${s}_${TAG}.mp4"
   done
   ( cd "$E" && tar cf "$AZ_ROOT/eval/fx6_review.tar" faceskin_fx6_*.md preserve_fx6_*.md stability_fx6_*.md garment_fx6_*.md \

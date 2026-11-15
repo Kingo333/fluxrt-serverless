@@ -74,6 +74,16 @@ Cut to fit $100, and what it costs:
 Kept in full: the logo and plain-garment fixes, the face and skin protection, the head and hair rules.
 They come from the data rules and the loss weights, not from volume.
 
+## Previous frame (owner, 2026-11-15)
+
+Included in this run. Every frame-window row also carries an earlier frame of the same video (the other half of
+its window, 0.3 to 0.5 s away), at the answer's size and framing and with the same light; half of them softened
+and JPEG-coded like the model's own pictures. The trainer adds it as a third image after the person and the
+garment ([camera frame, garment, earlier frame], as FluxRT's live anchor), whenever every row of a batch has one
+(about half the batches; the rest train without, so the model works both ways). Live it is the existing switch
+FLUXRT_ANCHOR=1 (its own picture, taken FLUXRT_ANCHOR_DELAY_S after a garment change, renewed every
+FLUXRT_ANCHOR_REFRESH_S); unset it to turn it off. About 25-30% more training time (about $2-3).
+
 ## Sized to the money in the account: $50 (2026-11-15)
 
 The cap stays $100, but the account holds about $21 and the owner tops up to at least $50, and the

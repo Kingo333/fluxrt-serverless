@@ -91,6 +91,9 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-refsizes.patch"
 # encoder is freed after caching. Memory only: every step gets the same numbers.
 curl -fsSL "$RAW/patches/flux2-klein-cpucache.patch" -o "$AZ_ROOT/flux2-klein-cpucache.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-cpucache.patch"
+# fxreal6: a third input, an earlier frame of the same video (--cond_image_column_3; off unless AZ_ANCHOR_COLUMN is set).
+curl -fsSL "$RAW/patches/flux2-klein-anchor.patch" -o "$AZ_ROOT/flux2-klein-anchor.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-anchor.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -147,6 +150,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   ${AZ_COLOUR_WEIGHT:+--colour_weight="$AZ_COLOUR_WEIGHT"} \
   ${AZ_TEXTURE_WEIGHT:+--texture_weight="$AZ_TEXTURE_WEIGHT"} \
   ${AZ_REF_SIZES:+--cond_2_sizes="$AZ_REF_SIZES"} \
+  ${AZ_ANCHOR_COLUMN:+--cond_image_column_3="$AZ_ANCHOR_COLUMN" --cond_3_prob="${AZ_ANCHOR_PROB:-1.0}"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

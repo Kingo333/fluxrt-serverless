@@ -1,0 +1,219 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index e8e2b81..b8f0ab5 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -350,6 +350,20 @@ def parse_args(input_args=None):
+         "batch gets one of them (weighted, seeded), so the LoRA works at every live FLUXRT_REF size. Off: "
+         "--cond_2_size for every batch.",
+     )
++    parser.add_argument(
++        "--cond_image_column_3",
++        type=str,
++        default=None,
++        help="Azyah fxreal6: optional third condition image (an earlier frame of the same video, the 'anchor'). It is "
++        "passed after the person and the garment, like FluxRT's image=[camera_frame, garment, anchor] when the live "
++        "anchor is on. Rows without one leave it empty; a batch uses it only when every row has one.",
++    )
++    parser.add_argument(
++        "--cond_3_prob",
++        type=float,
++        default=1.0,
++        help="Azyah fxreal6: chance that a batch whose rows all have an anchor uses it (the others train without).",
++    )
+     parser.add_argument(
+         "--caption_column",
+         type=str,
+@@ -899,6 +913,12 @@ class DreamBoothDataset(Dataset):
+             if cond_image_column is not None:
+                 cond_images = [dataset["train"][i][cond_image_column] for i in range(len(dataset["train"]))]
+                 assert len(instance_images) == len(cond_images)
++            cond_images_3 = None
++            if getattr(args, "cond_image_column_3", None):
++                if args.cond_image_column_3 not in column_names:
++                    raise ValueError(f"`--cond_image_column_3` value '{args.cond_image_column_3}' not found in dataset columns.")
++                cond_images_3 = dataset["train"][args.cond_image_column_3]
++                assert len(instance_images) == len(cond_images_3)
+             cond_images_2 = None
+             if args.cond_image_column_2 is not None:
+                 if args.cond_image_column_2 not in column_names:
+@@ -946,6 +966,7 @@ class DreamBoothDataset(Dataset):
+         self.instance_images = []
+         self.cond_images = []
+         self.cond_images_2 = []
++        self.cond_images_3 = []
+         self.loss_masks = []
+         self.pair_ids = []
+         for i, img in enumerate(instance_images):
+@@ -954,6 +975,8 @@ class DreamBoothDataset(Dataset):
+                 self.cond_images.extend(itertools.repeat(cond_images[i], repeats))
+             if args.dataset_name is not None and cond_images_2 is not None:
+                 self.cond_images_2.extend(itertools.repeat(cond_images_2[i], repeats))
++            if args.dataset_name is not None and cond_images_3 is not None:
++                self.cond_images_3.extend(itertools.repeat(cond_images_3[i], repeats))
+             if args.dataset_name is not None and loss_masks is not None:
+                 self.loss_masks.extend(itertools.repeat(loss_masks[i], repeats))
+             if args.dataset_name is not None and pair_ids is not None:
+@@ -1047,6 +1070,11 @@ class DreamBoothDataset(Dataset):
+                 example["cond_image_2_raw"] = self.cond_images_2[index % self.num_instance_images]
+             else:
+                 example["cond_images_2"] = cond_2
++        if self.cond_images_3:
++            anchor = self.cond_images_3[index % self.num_instance_images]
++            if anchor is not None:
++                h, w = instance_image.shape[-2:]
++                example["cond_images_3"] = _azyah_anchor_tensor(anchor, w, h)
+         if self.pair_ids:
+             example["pair_id"] = self.pair_ids[index % self.num_instance_images]
+         if self.loss_masks:
+@@ -1208,6 +1236,30 @@ def _azyah_pad_to(image, width, height):
+     return TF.normalize(TF.to_tensor(canvas), [0.5], [0.5])
+ 
+ 
++# Azyah fxreal6: the earlier frame ("anchor"): the same size and framing as the answer, used per batch.
++_AZ_COND3_PROB = 1.0
++_AZ_COND3_RNG = random.Random(6)
++_AZ_COND3_COUNTS = {"with": 0, "without": 0}
++
++
++def _azyah_anchor_tensor(image, width, height):
++    """The anchor picture as the trainer's tensors: RGB, resized to the answer's size (it was stored at that size)."""
++    image = exif_transpose(image)
++    if image.mode != "RGB":
++        image = image.convert("RGB")
++    if image.size != (width, height):
++        image = image.resize((width, height), Image.BILINEAR)
++    return TF.normalize(TF.to_tensor(image), [0.5], [0.5])
++
++
++def _azyah_use_anchor(examples):
++    """A batch uses its anchors only when every row has one (the tokens are concatenated per batch), and then with
++    probability --cond_3_prob."""
++    if not examples or not all("cond_images_3" in e for e in examples):
++        return False
++    return _AZ_COND3_RNG.random() < _AZ_COND3_PROB
++
++
+ def collate_fn(examples):
+     pixel_values = [example["instance_images"] for example in examples]
+     prompts = [example["instance_prompt"] for example in examples]
+@@ -1234,6 +1286,9 @@ def collate_fn(examples):
+         cond_2 = torch.stack([_azyah_pad_to(example["cond_image_2_raw"], w, h) for example in examples])
+         batch["cond_2_pixel_values"] = cond_2.to(memory_format=torch.contiguous_format).float()
+         batch["cond_2_size"] = f"{w}x{h}"
++    if _azyah_use_anchor(examples):
++        cond_3 = torch.stack([example["cond_images_3"] for example in examples])
++        batch["cond_3_pixel_values"] = cond_3.to(memory_format=torch.contiguous_format).float()
+     return batch
+ 
+ 
+@@ -1342,10 +1397,11 @@ class PromptDataset(Dataset):
+ 
+ 
+ def main(args):
+-    global _AZ_REF_SIZES
++    global _AZ_REF_SIZES, _AZ_COND3_PROB
+     if args.cond_2_sizes:
+         _AZ_REF_SIZES = _azyah_parse_ref_sizes(args.cond_2_sizes)
+         _AZ_REF_RNG.seed(args.seed if args.seed is not None else 0)
++    _AZ_COND3_PROB = float(getattr(args, "cond_3_prob", 1.0))  # Azyah fxreal6
+     if args.report_to == "wandb" and args.hub_token is not None:
+         raise ValueError(
+             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
+@@ -1830,6 +1886,7 @@ def main(args):
+         latents_cache = []
+         cond_latents_cache = []
+         cond_2_latents_cache = []
++        cond_3_latents_cache = []  # Azyah fxreal6: one entry per batch, None when that batch has no anchor
+         loss_mask_cache = []
+         pair_cache = []
+         _azyah_prompt_memo = {}
+@@ -1855,6 +1912,16 @@ def main(args):
+                             cond_2_latents_cache.append(
+                                 _AzCpuLatent(vae.encode(batch["cond_2_pixel_values"]).latent_dist, accelerator.device)
+                             )
++                        if "cond_3_pixel_values" in batch:
++                            batch["cond_3_pixel_values"] = batch["cond_3_pixel_values"].to(
++                                accelerator.device, non_blocking=True, dtype=vae.dtype
++                            )
++                            cond_3_latents_cache.append(
++                                _AzCpuLatent(vae.encode(batch["cond_3_pixel_values"]).latent_dist, accelerator.device)
++                            )
++                        else:
++                            cond_3_latents_cache.append(None)
++                        _AZ_COND3_COUNTS["with" if "cond_3_pixel_values" in batch else "without"] += 1
+                     if "loss_mask" in batch:
+                         loss_mask_cache.append(batch["loss_mask"])
+                     pair_cache.append(batch.get("pair_ids"))
+@@ -1881,7 +1948,8 @@ def main(args):
+                     import psutil
+                     _az_used = prompt_embeds_cache.nbytes + text_ids_cache.nbytes + sum(
+                         c.value.numel() * c.value.element_size()
+-                        for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache) for c in cache)
++                        for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache, cond_3_latents_cache)
++                        for c in cache if c is not None)
+                     _az_need = _az_used / _az_n * (len(train_dataloader) - _az_n)
+                     _az_free = psutil.virtual_memory().available
+                     print(f"CACHE_RAM {_az_used / 1e9:.1f} GB after {_az_n} batches, about {_az_need / 1e9:.1f} GB "
+@@ -1894,7 +1962,11 @@ def main(args):
+             logger.info(f"Azyah garment-photo sizes per batch: {_az_ref_size_counts}")
+             print(f"REF_SIZES {_az_ref_size_counts}", flush=True)
+         _az_lat = sum(c.value.numel() * c.value.element_size()
+-                      for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache) for c in cache)
++                      for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache, cond_3_latents_cache)
++                      for c in cache if c is not None)
++        if getattr(args, "cond_image_column_3", None):
++            print(f"ANCHOR_BATCHES {_AZ_COND3_COUNTS['with']} with the earlier frame, {_AZ_COND3_COUNTS['without']} without",
++                  flush=True)
+         print(f"CACHE_CPU text {prompt_embeds_cache.nbytes / 1e9:.1f} GB ({prompt_embeds_cache.distinct()} distinct "
+               f"caption rows for {len(prompt_embeds_cache)} batches), latents {_az_lat / 1e9:.1f} GB; GPU memory in use "
+               f"{torch.cuda.memory_allocated() / 1e9:.1f} GB", flush=True)
+@@ -2037,6 +2109,8 @@ def main(args):
+                     model_input = latents_cache[step].mode()
+                     cond_model_input = cond_latents_cache[step].mode()
+                     cond_2_model_input = cond_2_latents_cache[step].mode() if cond_2_latents_cache else None
++                    cond_3_model_input = (cond_3_latents_cache[step].mode()
++                                          if cond_3_latents_cache and cond_3_latents_cache[step] is not None else None)
+                 else:
+                     with offload_models(vae, device=accelerator.device, offload=args.offload):
+                         pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
+@@ -2047,6 +2121,10 @@ def main(args):
+                         if "cond_2_pixel_values" in batch:
+                             cond_2_pixel_values = batch["cond_2_pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
+                             cond_2_model_input = vae.encode(cond_2_pixel_values).latent_dist.mode()
++                        cond_3_model_input = None
++                        if "cond_3_pixel_values" in batch:
++                            cond_3_pixel_values = batch["cond_3_pixel_values"].to(device=accelerator.device, dtype=vae.dtype)
++                            cond_3_model_input = vae.encode(cond_3_pixel_values).latent_dist.mode()
+ 
+                 model_input = Flux2KleinPipeline._patchify_latents(model_input)
+                 model_input = (model_input - latents_bn_mean) / latents_bn_std
+@@ -2056,6 +2134,9 @@ def main(args):
+                 if cond_2_model_input is not None:
+                     cond_2_model_input = Flux2KleinPipeline._patchify_latents(cond_2_model_input)
+                     cond_2_model_input = (cond_2_model_input - latents_bn_mean) / latents_bn_std
++                if cond_3_model_input is not None:
++                    cond_3_model_input = Flux2KleinPipeline._patchify_latents(cond_3_model_input)
++                    cond_3_model_input = (cond_3_model_input - latents_bn_mean) / latents_bn_std
+ 
+                 model_input_ids = Flux2KleinPipeline._prepare_latent_ids(model_input).to(device=model_input.device)
+                 # Each batch element is an independent training sample with a single
+@@ -2066,6 +2147,8 @@ def main(args):
+                 cond_list = [cond_model_input[0:1]]
+                 if cond_2_model_input is not None:
+                     cond_list.append(cond_2_model_input[0:1])
++                if cond_3_model_input is not None:  # Azyah fxreal6: third, as FluxRT's [frame, garment, anchor]
++                    cond_list.append(cond_3_model_input[0:1])
+                 cond_model_input_ids = Flux2KleinPipeline._prepare_image_ids(cond_list).to(
+                     device=cond_model_input.device
+                 )
+@@ -2132,6 +2215,10 @@ def main(args):
+                     packed_cond_model_input = torch.cat(
+                         [packed_cond_model_input, Flux2KleinPipeline._pack_latents(cond_2_model_input)], dim=1
+                     )
++                if cond_3_model_input is not None:
++                    packed_cond_model_input = torch.cat(
++                        [packed_cond_model_input, Flux2KleinPipeline._pack_latents(cond_3_model_input)], dim=1
++                    )
+                 orig_input_shape = packed_noisy_model_input.shape
+                 orig_input_ids_shape = model_input_ids.shape
+ 

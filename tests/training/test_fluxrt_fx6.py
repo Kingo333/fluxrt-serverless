@@ -438,7 +438,7 @@ def test_window_rows_are_built_as_pairs_with_live_captions_closeups_marks_and_sl
         s = build_real.main(["--out", str(tmp_path / "data"), "--viton-dir", str(tmp_path / "viton"), "--klein", "x",
                              "--test-out", str(tmp_path / "pairs"), "--viton-n", "0", "--holdout", "2", "--test-items", "0",
                              "--windows", str(win), "--caption-style", "live", "--closeup-frac", "1.0", "--logo-frac", "1.0",
-                             "--exposure-frac", "1.0", "--nochange-frac", "0"])
+                             "--exposure-frac", "1.0", "--nochange-frac", "0", "--anchor-frac", "1.0"])
     finally:
         build_real.Redresser, build_real.DinoSim = old
     assert s["window_pairs_tried"] == 14 and s["window_pairs_kept"] == 14 and s["samples"] == 28
@@ -461,6 +461,12 @@ def test_window_rows_are_built_as_pairs_with_live_captions_closeups_marks_and_sl
     row = {c: tabs[0].column(c)[0].as_py() for c in ("person", "target", "mask")}
     sizes = {c: Image.open(io.BytesIO(row[c]["bytes"])).size for c in row}
     assert sizes == {"person": (288, 512), "target": (288, 512), "mask": (288, 512)}
+    # fxreal6 previous frame: every window row carries the other half's frame, at the answer's size and framing
+    assert s["anchors"] == 28 and all("anchor" in x.column_names for x in tabs)
+    anchors = sum((x.column("anchor").to_pylist() for x in tabs), [])
+    assert all(an is not None for an in anchors)
+    an = Image.open(io.BytesIO(anchors[0]["bytes"]))
+    assert an.size == (288, 512)
     person, target = (np.asarray(Image.open(io.BytesIO(row[c]["bytes"])).convert("RGB")).astype(int) for c in ("person", "target"))
     assert np.abs(person - target).mean() > 5                # the input differs from the answer (re-dressed, marked)
 
@@ -483,3 +489,92 @@ def test_pod_scripts_rebuild_the_tools_venv_and_train_with_the_fx5_recipe():
         assert must in data, must
     base = (ROOT / "training/fluxrt_lora/fx6_baseline.sh").read_text()
     assert 'rm -f "$GUARD"' in base and "touch \"$GUARD\"" not in base  # an early stop never blocks the rerun
+
+
+
+# ---------------------------------------------------------------- previous frame (owner, 2026-11-15)
+def test_the_earlier_frame_comes_from_the_other_half_of_the_window(tmp_path):
+    sys.path.insert(0, str(ROOT / "training" / "fluxrt_lora"))
+    from fluxrt_lora.build_real import degrade_like_output, other_window_frame, write_parquet
+    import random as _r
+    from PIL import Image
+    for suffix in ("a", "b"):
+        d = tmp_path / f"clip7_w1{suffix}"
+        d.mkdir()
+        for tag in ("a", "b"):
+            Image.new("RGB", (8, 8)).save(d / f"{tag}_target.png")
+    assert other_window_frame(tmp_path / "clip7_w1a") == tmp_path / "clip7_w1b" / "b_target.png"   # frame 4 for frames 1-2
+    assert other_window_frame(tmp_path / "clip7_w1b") == tmp_path / "clip7_w1a" / "a_target.png"   # frame 1 for frames 3-4
+    assert other_window_frame(tmp_path / "clip8_w1a") is None and other_window_frame(tmp_path / "plain") is None
+    img = Image.new("RGB", (64, 64), (200, 30, 30))
+    outs = [degrade_like_output(img, _r.Random(k)) for k in range(40)]
+    assert any(o is img for o in outs) and any(o is not img for o in outs)    # about half are softened
+    import io as _io
+    import pyarrow.parquet as pq
+    b = _io.BytesIO(); img.save(b, format="JPEG")
+    row = {"key": "k", "caption": "c", "pair": "", **{c: b.getvalue() for c in ("person", "garment", "target", "mask")}}
+    write_parquet([row, {**row, "key": "k2", "anchor": b.getvalue()}], tmp_path / "t.parquet", anchor=True)
+    t = pq.read_table(tmp_path / "t.parquet")
+    assert t.column("anchor").to_pylist()[0] is None and t.column("anchor").to_pylist()[1]["bytes"]
+    write_parquet([row], tmp_path / "u.parquet")                                 # older runs: no new column
+    assert "anchor" not in pq.read_table(tmp_path / "u.parquet").column_names
+
+
+def test_trainer_patch_adds_the_earlier_frame_as_the_third_image(tmp_path):
+    import random
+    import subprocess
+    import types
+    trainer = "train_dreambooth_lora_flux2_klein_img2img.py"
+    local = Path("/home/user/repos/diffusers")
+    if not (local / "examples" / "dreambooth" / trainer).exists():
+        import pytest
+        pytest.skip("diffusers checkout not present")
+    r = subprocess.run(["git", "-C", str(local), "show", f"HEAD:examples/dreambooth/{trainer}"], capture_output=True, text=True)
+    repo = tmp_path / "d"
+    (repo / "examples" / "dreambooth").mkdir(parents=True)
+    (repo / "examples" / "dreambooth" / trainer).write_text(r.stdout)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    order = ("garment", "timeshift", "maskloss", "fx3", "initlora", "fx5", "refsizes", "cpucache", "anchor")
+    run = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
+    assert [n for n in order if f"flux2-klein-{n}.patch" in run] == list(order)          # the launcher applies it last
+    assert run.index("flux2-klein-anchor.patch") > run.index("flux2-klein-cpucache.patch")
+    for name in order:
+        rr = subprocess.run(["git", "-C", str(repo), "apply", str(ROOT / "training" / "patches" / f"flux2-klein-{name}.patch")],
+                            capture_output=True, text=True)
+        assert rr.returncode == 0, f"{name}: {rr.stderr}"
+    src = (repo / "examples" / "dreambooth" / trainer).read_text()
+    compile(src, trainer, "exec")
+    for must in ('"--cond_image_column_3"', '"--cond_3_prob"', "cond_3_latents_cache.append(None)",
+                 "cond_list.append(cond_3_model_input[0:1])", "Flux2KleinPipeline._pack_latents(cond_3_model_input)",
+                 "ANCHOR_BATCHES", "_AZ_COND3_PROB = float(getattr(args, \"cond_3_prob\", 1.0))"):
+        assert must in src, must
+    # [person, garment, anchor]: the anchor goes last, after the garment, as in FluxRT's reference list
+    assert src.index("cond_list.append(cond_3_model_input[0:1])") > src.index("cond_list.append(cond_2_model_input[0:1])")
+    torch = __import__("pytest").importorskip("torch")
+    from PIL import Image, ImageOps
+    start = src.index("# Azyah fxreal6: the earlier frame")
+    end = src.index("def collate_fn(examples):")
+    tf = types.SimpleNamespace(
+        to_tensor=lambda im: torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1),
+        normalize=lambda t, mean, std: (t - mean[0]) / std[0])
+    ns = {"random": random, "torch": torch, "Image": Image, "TF": tf, "exif_transpose": ImageOps.exif_transpose}
+    exec(compile(src[start:end] + "\n", "anchor_block", "exec"), ns)
+    t = ns["_azyah_anchor_tensor"](Image.new("RGB", (144, 256), (255, 0, 0)), 288, 512)
+    assert tuple(t.shape) == (3, 512, 288) and abs(float(t[0].mean()) - 1.0) < 1e-6
+    full = [{"cond_images_3": t} for _ in range(4)]
+    assert ns["_azyah_use_anchor"](full) is True                                  # prob 1.0: every eligible batch
+    assert ns["_azyah_use_anchor"](full[:3] + [{}]) is False                      # one row without: none of them
+    ns["_AZ_COND3_PROB"] = 0.5
+    ns["_AZ_COND3_RNG"].seed(1)
+    share = sum(ns["_azyah_use_anchor"](full) for _ in range(2000)) / 2000
+    assert abs(share - 0.5) < 0.05
+
+
+def test_scripts_carry_the_earlier_frame_and_the_live_setting_stays_a_switch():
+    data = (ROOT / "training/fluxrt_lora/fx6_data.sh").read_text()
+    train = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
+    assert '--anchor-frac "${AZ_ANCHOR_FRAC:-1.0}"' in data and "'anchors'" in data
+    assert "AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor}" in train and "^ANCHOR_BATCHES" in train
+    assert '--anchor-after 8 --anchor-every 12' in train and "fxreal6 + earlier frame" in train
+    gen = (ROOT / "training/eval/generate_fluxrt.py").read_text()
+    assert '"--anchor-after"' in gen and "images = [frame, garment] + ([anchor] if anchor is not None else [])" in gen

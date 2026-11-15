@@ -249,8 +249,9 @@ def outside_diff(inp, target, mask) -> float:
     return float((d * m).sum() / m.sum())
 
 
-def write_parquet(rows: list[dict], path: Path) -> None:
-    """person / garment / target / mask images + caption, in the Hugging Face datasets layout."""
+def write_parquet(rows: list[dict], path: Path, anchor: bool = False) -> None:
+    """person / garment / target / mask images + caption, in the Hugging Face datasets layout. anchor (fxreal6):
+    one more image column, the row's earlier frame (empty on rows that have none)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     img = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
@@ -258,15 +259,45 @@ def write_parquet(rows: list[dict], path: Path) -> None:
     features = {"key": {"dtype": "string", "_type": "Value"}, "caption": {"dtype": "string", "_type": "Value"},
                 "pair": {"dtype": "string", "_type": "Value"},
                 "person": feat, "garment": feat, "target": feat, "mask": feat}
-    schema = pa.schema([("key", pa.string()), ("caption", pa.string()), ("pair", pa.string()), ("person", img),
-                        ("garment", img), ("target", img), ("mask", img)],
-                       metadata={"huggingface": json.dumps({"info": {"features": features}})})
+    fields = [("key", pa.string()), ("caption", pa.string()), ("pair", pa.string()), ("person", img),
+              ("garment", img), ("target", img), ("mask", img)]
+    if anchor:
+        features["anchor"] = feat
+        fields.append(("anchor", img))
+    schema = pa.schema(fields, metadata={"huggingface": json.dumps({"info": {"features": features}})})
     cols = {"key": [r["key"] for r in rows], "caption": [r["caption"] for r in rows],
             "pair": [r.get("pair", "") for r in rows]}
     for c in ("person", "garment", "target", "mask"):
         ext = "png" if c == "mask" else "jpg"
         cols[c] = [{"bytes": r[c], "path": f"{r['key']}_{c}.{ext}"} for r in rows]
+    if anchor:
+        cols["anchor"] = [{"bytes": r["anchor"], "path": f"{r['key']}_anchor.jpg"} if r.get("anchor") else None for r in rows]
     pq.write_table(pa.table(cols, schema=schema), path)
+
+
+def other_window_frame(folder: Path):
+    """fxreal6 previous-frame input: a window is two pair folders, <clip>_w<k>a (frames 1-2) and <clip>_w<k>b
+    (frames 3-4). For rows of one folder, the earlier/later frame is the other folder's frame farthest away
+    (a rows: frame 4, b rows: frame 1), a few live frames apart. None when the other folder is not there."""
+    name = folder.name
+    if not name[-1:] in ("a", "b"):
+        return None
+    other = folder.parent / (name[:-1] + ("b" if name.endswith("a") else "a"))
+    f = other / ("b_target.png" if name.endswith("a") else "a_target.png")
+    return f if f.exists() else None
+
+
+def degrade_like_output(img, rng: random.Random):
+    """Live, the earlier frame is the model's own picture: a little softer than a camera frame and video-coded.
+    Half the training earlier frames get a light blur and JPEG pass, so the model does not lean on fine detail
+    that its own frames will not have."""
+    from PIL import Image, ImageFilter
+    if rng.random() >= 0.5:
+        return img
+    img = img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.4, 0.9)))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=rng.randint(55, 80))
+    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
 
 
 def _png(img) -> bytes:
@@ -444,6 +475,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--logo-frac", type=float, default=0.0, help="fxreal6: share of window rows (tops, dresses) whose INPUT garment gets a sharp mark")
     ap.add_argument("--closeup-frac", type=float, default=0.0, help="fxreal6: share of window rows (tops, dresses) cropped to head and shoulders")
     ap.add_argument("--exposure-frac", type=float, default=0.0, help="fxreal6: share of window tops whose INPUT is drawn with long sleeves over the bare arms")
+    ap.add_argument("--anchor-frac", type=float, default=0.0,
+                    help="fxreal6: share of window rows that also carry an earlier frame of the same video (anchor "
+                         "column; the trainer decides per batch whether to use it), like FluxRT's live anchor")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -463,13 +497,13 @@ def main(argv=None) -> dict:
                                  "motion_clips_tried": 0, "motion_pairs_kept": 0, "motion_singles_kept": 0,
                                  "motion_outfit_kept": 0, "pair_clips_kept_dress": 0,
                                  "window_pairs_tried": 0, "window_pairs_kept": 0, "window_by_type": {}, "closeups": 0,
-                                 "logos": 0, "exposure_kept": 0, "plain_captions": 0}
+                                 "logos": 0, "exposure_kept": 0, "plain_captions": 0, "anchors": 0}
     used = set()
 
     def flush(final=False):
         nonlocal rows, files
         if rows and (final or len(rows) >= a.per_file):
-            write_parquet(rows, out / "data" / f"train-{files:05d}.parquet")
+            write_parquet(rows, out / "data" / f"train-{files:05d}.parquet", anchor=a.anchor_frac > 0)
             files, rows = files + 1, []
 
     counts = {"dress": 0, "other": 0}
@@ -489,17 +523,26 @@ def main(argv=None) -> dict:
             arr, _ = stamp(np.asarray(person.convert("RGB")), area, np.random.default_rng(extra["logo"]), kind=extra.get("kind"))
             person = Image.fromarray(arr)
             stats["logos"] += 1
+        anchor = extra.get("anchor") if extra else None
+        if anchor is not None:
+            anchor = anchor.resize(person.size)
         if extra and extra.get("closeup"):
             box = closeup_box(mask, *person.size)
             person, target, mask = person.crop(box), target.resize(person.size).crop(box), mask.resize(person.size).crop(box)
+            anchor = anchor.crop(box) if anchor is not None else None  # the earlier frame has the same framing
             stats["closeups"] += 1
         jf = jitter_factors(rng, a.photo_aug) if jitter == "auto" else jitter
         if jf:
             person, target = photo_jitter(person, *jf), photo_jitter(target, *jf)
+            anchor = photo_jitter(anchor, *jf) if anchor is not None else None  # and the same light
             stats["photo_aug"] += 1
-        rows.append({"key": key, "caption": caption, "pair": pair, "person": _jpeg(_cover(person, w, h)),
-                     "garment": _jpeg(g), "target": _jpeg(_cover(target, w, h)),
-                     "mask": _png(_cover(mask.convert("L"), w, h))})
+        row = {"key": key, "caption": caption, "pair": pair, "person": _jpeg(_cover(person, w, h)),
+               "garment": _jpeg(g), "target": _jpeg(_cover(target, w, h)),
+               "mask": _png(_cover(mask.convert("L"), w, h))}
+        if anchor is not None:
+            row["anchor"] = _jpeg(_cover(degrade_like_output(anchor, rng), w, h))
+            stats["anchors"] += 1
+        rows.append(row)
         flush()
 
     # Shared by the sections below (created up front so the dress-first order can run them in any order).
@@ -764,13 +807,17 @@ def main(argv=None) -> dict:
             jf = jitter_factors(rng, a.photo_aug)
             garment = Image.open(ref).convert("RGB")
             desc = meta_description(ref.parent)
-            extra = None
+            extra = {}
             if cat != "lower":  # a close-up or a chest mark would leave trousers out of the picture
                 extra = {"closeup": rng.random() < a.closeup_frac,
                          "logo": seed if rng.random() < a.logo_frac else None, "kind": STAMP_KINDS[seed % len(STAMP_KINDS)]}
+            # The earlier frame (fxreal6): the same for both rows of the pair, as live the anchor is one picture.
+            other = other_window_frame(ref.parent) if a.anchor_frac > 0 and rng.random() < a.anchor_frac else None
+            if other is not None:
+                extra["anchor"] = _cover(Image.open(other).convert("RGB"), gw, gh)
             for tag, (inp, real, soft) in zip("ab", built):
                 add(f"vivid_win_{clip}_{tag}", caption_for(cat, desc), inp, garment, real, soft, pair=f"w_{clip}",
-                    jitter=jf, dress=cat == "dress", extra=extra)
+                    jitter=jf, dress=cat == "dress", extra=extra or None)
             used.add("vivid")
             stats["window_pairs_kept"] += 1
             stats["window_by_type"][cat] = stats["window_by_type"].get(cat, 0) + 1
@@ -780,7 +827,8 @@ def main(argv=None) -> dict:
                 print(json.dumps({"window_progress": stats["window_pairs_tried"], "kept": stats["window_pairs_kept"]}), flush=True)
         if windows:
             print(json.dumps({k: stats[k] for k in ("window_pairs_tried", "window_pairs_kept", "window_by_type",
-                                                     "closeups", "logos", "exposure_kept", "plain_captions")}), flush=True)
+                                                     "closeups", "logos", "exposure_kept", "plain_captions", "anchors")}),
+                  flush=True)
 
     if a.dress_share > 0:
         # fxreal5 (owner, 2026-11-11): dresses first, then tops and bottoms up to the share the owner set

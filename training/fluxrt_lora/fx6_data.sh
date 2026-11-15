@@ -8,7 +8,9 @@
 #      5% inputs with a mark on the garment (fluxrt_lora/build_real.py)
 #   3. weights and balance: face full weight, skin and hair half weight, rare skin-tone groups repeated
 #      (data_tools.region_weight)
-#   4. 20 sample sheets for the owner to look at: input | garment | answer | weight mask
+#   4. 20 sample sheets for the owner to look at: input | garment | answer | weight mask | earlier frame
+#   (owner, 2026-11-15) every window row also carries an earlier frame of the same video (the "anchor"), so the
+#   model learns to use its own previous picture live (FLUXRT_ANCHOR); the trainer decides per batch.
 # Needs a GPU with >= 30 GB (RTX PRO 6000 or RTX 5090) and the azyah-vton-train volume at /workspace.
 # Never touches an endpoint or the azyah-joyai volume. About 4-5 hours; it can be stopped and started
 # again (finished windows and a finished dataset are kept).
@@ -77,6 +79,7 @@ if [ ! -f "$DATA/dataset_summary.json" ]; then
     --klein "$C/FLUX.2-klein-4B" --vivid-stills "$S/vivid_dress_stills" "$S/vivid_upper_stills" "$S/vivid_lower_stills" \
     --windows "$S/vivid_windows" --caption-style live \
     --closeup-frac "${AZ_CLOSEUP:-0.3}" --exposure-frac "${AZ_EXPOSURE:-0.2}" --logo-frac "${AZ_LOGO:-0.05}" \
+    --anchor-frac "${AZ_ANCHOR_FRAC:-1.0}" \
     --test-out "$AZ_ROOT/eval/fx6_unused_test_pairs" --test-items 0 \
     --viton-n "${AZ_VITON_N:-1500}" --holdout 300 --nochange-frac "${AZ_NOCHANGE:-0.15}" --photo-aug 0.3 \
     --longer-frac "${AZ_LONGER:-0.25}" --longer-ext 0.2 2>&1 | grep -vE "^\s*$" | tail -40
@@ -86,7 +89,7 @@ fi
 "$PY" -c "
 import json; s = json.load(open('$DATA/dataset_summary.json'))
 keep = ('samples', 'vivid_live', 'viton_kept', 'nochange', 'window_pairs_tried', 'window_pairs_kept', 'window_by_type',
-        'closeups', 'logos', 'exposure_kept', 'plain_captions', 'described', 'photo_aug')
+        'closeups', 'logos', 'exposure_kept', 'plain_captions', 'anchors', 'described', 'photo_aug')
 print('DATASET ' + json.dumps({k: s.get(k) for k in keep}))"
 
 echo "== 3. weights for face, skin and hair; skin-tone balance ($(mins))"
@@ -115,8 +118,9 @@ for kind, want in kinds.items():
         if not idx:
             continue
         i = rng.choice(idx)
-        row = {c: t.column(c)[i].as_py() for c in ("key", "caption", "person", "garment", "target", "mask")}
-        ims = [Image.open(io.BytesIO(row[c]["bytes"])).convert("RGB") for c in ("person", "garment", "target", "mask")]
+        cols = ["person", "garment", "target", "mask"] + (["anchor"] if "anchor" in t.column_names else [])
+        row = {c: t.column(c)[i].as_py() for c in ["key", "caption"] + cols}
+        ims = [Image.open(io.BytesIO(row[c]["bytes"])).convert("RGB") for c in cols if row.get(c)]
         h = 512
         ims = [im.resize((round(im.width * h / im.height), h)) for im in ims]
         sheet = Image.new("RGB", (sum(im.width for im in ims) + 30, h + 70), "white")
@@ -124,7 +128,8 @@ for kind, want in kinds.items():
         for im in ims:
             sheet.paste(im, (x, 0)); x += im.width + 10
         d = ImageDraw.Draw(sheet)
-        d.text((4, h + 4), f"{row['key']}   input | garment | answer | weights", fill="black")
+        d.text((4, h + 4), f"{row['key']}   input | garment | answer | weights" + (" | earlier frame" if row.get("anchor") else ""),
+               fill="black")
         cap = row["caption"]
         d.text((4, h + 22), cap[:190], fill="black"); d.text((4, h + 40), cap[190:380], fill="black")
         done += 1; got += 1
