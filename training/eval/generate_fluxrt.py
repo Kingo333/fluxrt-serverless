@@ -161,7 +161,7 @@ def main(argv=None) -> None:
     ap.add_argument("--lora2", help="second LoRA file: the two are blended in weight space (Step A, 2026-11-09)")
     ap.add_argument("--blend", type=float, default=0.5,
                     help="with --lora2: share of the FIRST LoRA (0.3 = 30%% first, 70%% second); --lora-scale scales both")
-    ap.add_argument("--prompt-style", choices=("full", "compact"), default="full",
+    ap.add_argument("--prompt-style", choices=("full", "compact", "live"), default="full",
                     help="compact = the app's default FluxRT prompt since azyah-shopping #21 (buildCompactTryOnPrompt)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
                     "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
@@ -172,8 +172,10 @@ def main(argv=None) -> None:
     import torch
     from diffusers import Flux2KleinPipeline
     from PIL import Image
-    from data_tools.fluxrt_prompt import compact_prompt, fluxrt_prompt
-    make_prompt = compact_prompt if a.prompt_style == "compact" else fluxrt_prompt
+    from data_tools.fluxrt_prompt import compact_prompt, fluxrt_prompt, fx6_prompt
+    # "live" = the app's prompt as it is today (fxreal6): "head covering" for a dress, never "hijab",
+    # and the plain wording for a clip-list item marked "plain": true.
+    make_prompt = {"compact": compact_prompt, "live": fx6_prompt}.get(a.prompt_style, fluxrt_prompt)
 
     w, h = (int(v) for v in a.size.lower().split("x"))
     rw, rh = (int(v) for v in a.ref_size.lower().split("x"))
@@ -278,7 +280,8 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
             continue
         ref_path = Path(it["ref"])
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
-        prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"))
+        plain = {"plain": True} if a.prompt_style == "live" and it.get("plain") else {}
+        prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"), **plain)
         outs = []
         for i, frame in enumerate(frames):
             gen = torch.Generator(device="cuda").manual_seed(a.seed)

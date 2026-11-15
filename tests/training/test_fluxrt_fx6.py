@@ -196,3 +196,118 @@ def test_judge_is_the_bar_against_favourite_2():
     assert s["skin_de"] == 3 and s["skin_dl"] == -1 and s["skin_dl_abs"] == 2 and s["closeup"] is True and s["face_px"] is None
     g = by_group({"a": {"skin_de": 2.0}, "b": {"skin_de": 2.0}, "c": {"skin_de": 8.0}}, {"a": "light", "b": "light", "c": "dark"})
     assert g["unfair"] == ["dark"] and g["groups"]["light"] == 2.0
+
+
+# ---------------------------------------------------------------- baseline step: logo set, report, script
+def test_face_ncc_is_one_for_the_same_face_whatever_the_brightness():
+    from eval.face_skin import face_ncc
+    rng = np.random.default_rng(1)
+    cam = rng.integers(40, 200, (60, 60, 3)).astype(np.uint8)
+    m = np.zeros((60, 60), dtype=bool)
+    m[10:50, 10:50] = True
+    assert abs(face_ncc(cam, cam, m) - 1) < 1e-9
+    brighter = np.clip(cam.astype(int) + 30, 0, 255).astype(np.uint8)
+    assert face_ncc(cam, brighter, m) > 0.99
+    other = rng.integers(40, 200, (60, 60, 3)).astype(np.uint8)
+    assert abs(face_ncc(cam, other, m)) < 0.2
+    assert face_ncc(cam, cam, np.zeros_like(m)) is None
+    flat = np.full((60, 60, 3), 120, dtype=np.uint8)
+    assert face_ncc(flat, flat, m) is None
+
+
+def test_leak_ratio_is_zero_when_the_logo_is_gone_and_one_when_it_is_kept():
+    from data_tools.logo_stamp import stamp
+    from eval.face_skin import leak_ratio
+    clean, garment = _shirt((250, 250, 250))
+    marked, _ = stamp(clean, garment, np.random.default_rng(5), kind="logo")
+    out = np.full_like(clean, 200)
+    out[garment] = (128, 128, 128)                    # the try-on: a plain grey tee
+    assert leak_ratio(clean, marked, out, out, garment) == 0.0
+    diff = marked.astype(int) - clean.astype(int)     # the logo copied straight into the try-on
+    scale = 0.5                                       # at half its contrast, so nothing clips at black or white
+    kept = np.clip(out.astype(int) + (diff * scale).astype(int), 0, 255).astype(np.uint8)
+    full = leak_ratio(clean, marked, out, kept, garment)
+    assert abs(full - scale) < 0.02
+    faint = np.clip(out.astype(int) + (diff * 0.1).astype(int), 0, 255).astype(np.uint8)
+    assert 0 < leak_ratio(clean, marked, out, faint, garment) < full
+    assert leak_ratio(clean, clean, out, out, garment) is None  # no mark to measure
+
+
+def test_plain_score_tells_a_plain_garment_photo_from_a_printed_one():
+    from eval.logo_set import choose, plain_score
+    def photo(fill):
+        img = np.full((120, 100, 3), 255, dtype=np.uint8)
+        img[20:100, 20:80] = fill(np.zeros((80, 60, 3), dtype=np.uint8))
+        return img
+    def plain(a):
+        a[:] = (30, 60, 150)
+        a[:, ::7] = (26, 54, 140)      # folds: a little darker, the same colour
+        return a
+    def striped(a):
+        a[:] = (30, 60, 150)
+        a[::6] = (240, 240, 240)
+        a[1::6] = (240, 240, 240)
+        return a
+    p, s = plain_score(photo(plain)), plain_score(photo(striped))
+    assert p["plain"] is True and s["plain"] is False and p["rank"] < s["rank"]
+    assert plain_score(np.full((50, 50, 3), 255, dtype=np.uint8)) is None  # nothing but backdrop
+    items = [{"key": "a", "category": "tops"}, {"key": "b", "category": "dresses"}, {"key": "c", "category": "bottoms"},
+             {"key": "d", "category": "tops"}]
+    got = choose(items, {"a": s, "b": p, "c": p, "d": None}, 5)
+    assert [i["key"] for i in got] == ["b", "a"]  # plain first; bottoms and unreadable photos left out
+
+
+def test_logo_follows_the_garment_and_stays_on_the_top_for_tops():
+    from eval.logo_set import garment_area, stamp_frames
+    cat = np.zeros((120, 90), dtype=np.uint8)
+    cat[20:110, 20:70] = 4
+    top = garment_area(cat, "tops")
+    assert top[25, 40] and not top[100, 40] and garment_area(cat, "dresses")[100, 40]
+    frames, cats = [], []
+    for shift in (0, 8):
+        c = np.zeros((120, 90), dtype=np.uint8)
+        c[20:110, 15 + shift:65 + shift] = 4
+        f = np.full((120, 90, 3), 200, dtype=np.uint8)
+        f[c == 4] = (245, 245, 245)
+        frames.append(f)
+        cats.append(c)
+    out, kind = stamp_frames(frames, cats, "tops", seed=101)
+    marks = [np.abs(o.astype(int) - f.astype(int)).sum(axis=2) > 0 for o, f in zip(out, frames)]
+    assert all(m.any() for m in marks) and kind in ("logo", "text", "stripes", "graphic")
+    cx = [np.nonzero(m.any(axis=0))[0].mean() for m in marks]
+    assert 6 <= cx[1] - cx[0] <= 10                    # the mark moved with the garment
+    assert all(not m[70:, :].any() for m in marks)      # never on the trousers
+
+
+def test_report_numbers_for_a_clip_with_a_fake_segmenter():
+    from PIL import Image
+    from eval.face_skin_report import averages, clip_numbers, table
+    rng = np.random.default_rng(2)
+    cat = np.zeros((128, 72), dtype=np.uint8)
+    cat[10:50, 20:52] = 3      # face
+    cat[50:120, 10:62] = 4     # clothes
+    cat[60:100, 2:10] = 2      # arm
+    base = rng.integers(60, 200, (128, 72, 3)).astype(np.uint8)
+    cams = [Image.fromarray(base), Image.fromarray(np.roll(base, 1, axis=1))]
+    seg = lambda im: cat  # noqa: E731
+    same = clip_numbers(cams, cams, seg)
+    assert abs(same["face_match"] - 1) < 1e-9 and same["face_px"] == 0 and same["skin_de"] == 0 and same["face_drift"] == 0
+    lighter = [Image.fromarray(np.clip(np.asarray(c).astype(int) + 30, 0, 255).astype(np.uint8)) for c in cams]
+    lit = clip_numbers(cams, lighter, seg)
+    assert lit["skin_dl"] > 2 and lit["face_px"] > 20 and lit["face_match"] > 0.95
+    per = {"clip1": {"fav2": same, "new": lit}}
+    av = averages(per, "new")
+    assert av["clips"] == 1 and av["skin_dl"] == lit["skin_dl"]
+    assert any("clip1 | new" in line for line in table(per, ["fav2", "new"]))
+
+
+def test_live_prompt_style_and_baseline_script():
+    src = (ROOT / "training/eval/generate_fluxrt.py").read_text()
+    assert '"live": fx6_prompt' in src and 'choices=("full", "compact", "live")' in src
+    sh = (ROOT / "training/fluxrt_lora/fx6_baseline.sh").read_text()
+    for must in ("--prompt-style live", "528x704", "blend05s065", "eval.logo_set", "--leak-pairs", "FX6_BASELINE_DONE",
+                 "GUARD", "AZ_NO_STOP"):
+        assert must in sh, must
+    assert "run_train.sh" not in sh and "train_dreambooth" not in sh  # it trains nothing
+    import subprocess
+    assert subprocess.run(["bash", "-n", str(ROOT / "training/fluxrt_lora/fx6_baseline.sh")]).returncode == 0

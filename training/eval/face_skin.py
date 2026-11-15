@@ -163,3 +163,32 @@ def by_group(clips: dict[str, dict], groups: dict[str, str], key: str = "skin_de
         per.setdefault(groups.get(c, "unknown"), []).append(v)
     means = {g: float(np.mean(v)) for g, v in per.items()}
     return {"overall": overall, "groups": means, "unfair": sorted(g for g, m in means.items() if m > 1.5 * overall + 1e-9)}
+
+
+def face_ncc(cam: np.ndarray, out: np.ndarray, mask: np.ndarray) -> float | None:
+    """How alike the face is in structure: correlation of brightness inside the face area between the
+    output and the camera frame it was made from (same pose, so same pixels). 1 = the same face,
+    whatever the lighting level; 0 = unrelated. This is the "90% true" number (0.90) on close-ups."""
+    if mask.sum() < MIN_PX:
+        return None
+    a = cam.astype(np.float64).mean(axis=2)[mask]
+    b = out.astype(np.float64).mean(axis=2)[mask]
+    a, b = a - a.mean(), b - b.mean()
+    den = np.sqrt((a * a).sum() * (b * b).sum())
+    return float((a * b).sum() / den) if den > 1e-9 else None
+
+
+def leak_ratio(in_clean: np.ndarray, in_marked: np.ndarray, out_clean: np.ndarray, out_marked: np.ndarray,
+               garment: np.ndarray, min_contrast: float = 30.0) -> float | None:
+    """How much of a logo on the shopper's own garment survives into the try-on (0 = gone, 1 = fully kept).
+    The same clip is rendered twice, once with a mark stamped on the input garment (data_tools.logo_stamp)
+    and once without. Where the two inputs differ is the mark; the two outputs should not differ there any
+    more than they differ on the rest of the garment."""
+    d_in = np.abs(in_marked.astype(np.float64) - in_clean.astype(np.float64)).mean(axis=2)
+    mark = (d_in > min_contrast) & garment
+    rest = garment & ~mark
+    if mark.sum() < MIN_PX or rest.sum() < MIN_PX:
+        return None
+    d_out = np.abs(out_marked.astype(np.float64) - out_clean.astype(np.float64)).mean(axis=2)
+    return float(max(0.0, d_out[mark].mean() - d_out[rest].mean()) / d_in[mark].mean())
+
