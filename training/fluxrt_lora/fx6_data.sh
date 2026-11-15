@@ -74,6 +74,12 @@ echo "pair folders on disk: $(ls -d "$S"/vivid_windows/*/ 2>/dev/null | wc -l)"
 [ "$(ls -d "$S"/vivid_windows/*/ 2>/dev/null | wc -l)" -ge 200 ] || { echo NO_WINDOWS; exit 1; }
 
 if [ ! -f "$DATA/dataset_summary.json" ]; then
+  # A build that was stopped part-way leaves some row files and no summary: start the rows clean, so files from
+  # an older, stopped build (without the earlier-frame column) are never mixed in. The frame windows are kept.
+  if [ -d "$DATA" ]; then
+    echo "removing an unfinished row build in $DATA ($(ls "$DATA"/data/*.parquet 2>/dev/null | wc -l) files)"
+    mv "$DATA" "$DATA.stopped-$(date -u +%Y%m%dT%H%M%SZ)" && rm -rf "$DATA".stopped-*
+  fi
   echo "== 2. build the rows ($(mins))"
   timeout -s INT "$(left)m" "$PY" "$T/fluxrt_lora/build_real.py" --out "$DATA" --viton-dir "$D/raw/viton_hd" \
     --klein "$C/FLUX.2-klein-4B" --vivid-stills "$S/vivid_dress_stills" "$S/vivid_upper_stills" "$S/vivid_lower_stills" \

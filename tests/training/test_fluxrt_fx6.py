@@ -574,6 +574,7 @@ def test_scripts_carry_the_earlier_frame_and_the_live_setting_stays_a_switch():
     data = (ROOT / "training/fluxrt_lora/fx6_data.sh").read_text()
     train = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
     assert '--anchor-frac "${AZ_ANCHOR_FRAC:-1.0}"' in data and "'anchors'" in data
+    assert "removing an unfinished row build" in data                            # a stopped build never mixes in
     assert "AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor}" in train and "^ANCHOR_BATCHES" in train
     assert '--anchor-after 8 --anchor-every 12' in train and "fxreal6 + earlier frame" in train
     gen = (ROOT / "training/eval/generate_fluxrt.py").read_text()
