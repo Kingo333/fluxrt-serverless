@@ -93,9 +93,10 @@ RUN /usr/bin/python3.12 -m pip install --no-deps mediapipe==0.10.21 \
 COPY livecam/requirements-webrtc.txt /tmp/livecam-webrtc-requirements.txt
 RUN /usr/bin/python3.12 -m pip install --no-deps --target /opt/azyah-torchao torchao==0.14.1 \
     && /usr/bin/python3.12 -m pip install -c /tmp/fluxrt-constraints.txt -r /tmp/livecam-webrtc-requirements.txt
-RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, transformers, diffusers, peft, mediapipe, aiortc, av; from mediapipe.tasks.python import vision; from fluxrt.stream_processor.azyah_fuse_lora import build_fp8_transformer, fuse_lora_into_int8; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__, 'peft', peft.__version__, 'mediapipe', mediapipe.__version__, 'aiortc', aiortc.__version__)" \
+RUN /usr/bin/python3.12 -c "import fastapi, uvicorn, numpy, PIL, cv2, torch, fluxrt, transformers, diffusers, peft, mediapipe, aiortc, av; from mediapipe.tasks.python import vision; from fluxrt.stream_processor.azyah_fuse_lora import build_fp8_transformer, build_fp4_transformer, fuse_lora_into_int8; print('fluxrt env ok', torch.__version__, torch.version.cuda, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__, 'peft', peft.__version__, 'mediapipe', mediapipe.__version__, 'aiortc', aiortc.__version__)" \
     && /usr/bin/python3.12 -c "from peft.import_utils import is_torchao_available; assert not is_torchao_available(), 'PEFT must not see torchao'; print('PEFT does not see torchao: ok')" \
-    && /usr/bin/python3.12 -c "from fluxrt.stream_processor.azyah_fuse_lora import import_torchao; import_torchao(); import torchao; assert torchao.__version__ == '0.14.1', torchao.__version__; print('torchao', torchao.__version__, 'from', torchao.__file__)"
+    && /usr/bin/python3.12 -c "from fluxrt.stream_processor.azyah_fuse_lora import import_torchao; import_torchao(); import torchao; assert torchao.__version__ == '0.14.1', torchao.__version__; print('torchao', torchao.__version__, 'from', torchao.__file__)" \
+    && /usr/bin/python3.12 -c "from fluxrt.stream_processor.azyah_fuse_lora import import_torchao_fp4; c, m = import_torchao_fp4(); print('NVFP4 (FLUXRT_PRECISION=fp4) available in torchao:', c.__name__, m.DYNAMIC)"
 
 # ---------------------------------------------------------------------------
 # JoyAI engine, in its own venv. Built only for the RTX 5090 (sm_120a).

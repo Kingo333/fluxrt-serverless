@@ -11,6 +11,13 @@ weights qint8, activations none), so it saves memory, not time. build_fp8_transf
 full-precision model and converts the transformer blocks' Linear layers to FP8 weights AND FP8 maths (torchao,
 dynamic per-tensor scales: FP8 tensor cores on the RTX 4090, RTX 5090 and RTX PRO 6000). It raises when FP8 is
 unavailable, so the caller falls back to INT8.
+
+FP4 (owner, 15 Nov 2026): build_fp4_transformer takes the same fused full-precision model and converts most of the
+transformer blocks' Linear layers to NVFP4 (4-bit weights and 4-bit maths with 16-value block scales: torchao's
+NVFP4InferenceConfig, Blackwell tensor cores, RTX 5090 / RTX PRO 6000 / B200). The first and last blocks
+(FP4_KEEP_EDGE_BLOCKS) and any layer FP4 cannot take go to FP8, so nothing is left in 16 bits. Before it is used,
+a test multiply is checked against the full-precision layer; on any problem it raises and the caller falls back
+to FP8, then INT8.
 The canonical copy lives in fluxrt/azyah_fuse_lora.py; the patch carries the same text (a test checks that).
 """
 
@@ -196,3 +203,148 @@ def write_precision_marker(path, info: dict) -> None:
             json.dump(info, f)
     except OSError as e:
         log.warning("could not write %s: %s", path, e)
+
+
+# ---- FP4 (FLUXRT_PRECISION=fp4) ---------------------------------------------------------------------------
+# NVFP4 multiplies need the reduction size in whole 64-value groups and the output size in 16s.
+FP4_MULTIPLE_IN, FP4_MULTIPLE_OUT = 64, 16
+# A test multiply in FP4 may differ from full precision by this much (relative size of the difference). 4-bit
+# numbers with block scales typically land around 0.05-0.12 on real weights; a broken kernel gives about 1 or more.
+FP4_MAX_RELATIVE_ERROR = 0.25
+
+
+def block_index(name: str):
+    """('double' | 'single', block number) for a layer inside a transformer block, else None."""
+    for kind, prefix in (("double", "transformer_blocks."), ("single", "single_transformer_blocks.")):
+        if name.startswith(prefix):
+            head = name[len(prefix):].split(".", 1)[0]
+            return (kind, int(head)) if head.isdigit() else None
+    return None
+
+
+def edge_blocks(names, keep: int) -> set:
+    """The first and last `keep` blocks of each kind, as (kind, number): kept in FP8, not FP4. Rounding in the
+    first blocks reaches every later layer, and the last blocks write the picture, so they are the most sensitive."""
+    if keep <= 0:
+        return set()
+    seen: dict = {}
+    for n in names:
+        b = block_index(n)
+        if b:
+            seen.setdefault(b[0], set()).add(b[1])
+    out = set()
+    for kind, nums in seen.items():
+        order = sorted(nums)
+        out |= {(kind, i) for i in order[:keep] + order[-keep:]}
+    return out
+
+
+def fp4_layer(name: str, module, keep_blocks: set = frozenset()) -> bool:
+    """Whether this layer goes to FP4: an FP8-eligible layer whose sizes suit NVFP4, outside the kept edge blocks."""
+    return (fp8_layer(name, module) and module.in_features % FP4_MULTIPLE_IN == 0
+            and module.out_features % FP4_MULTIPLE_OUT == 0 and block_index(name) not in keep_blocks)
+
+
+def is_fp4_weight(weight) -> bool:
+    """Whether torchao turned this layer's weight into NVFP4."""
+    return "nvfp4" in type(weight).__name__.lower()
+
+
+def import_torchao_fp4():
+    """(NVFP4InferenceConfig, NVFP4MMConfig) from torchao's own folder (see import_torchao)."""
+    import_torchao()  # adds the folder the same careful way (PEFT never sees torchao before the LoRA is fused)
+    from torchao.prototype.mx_formats.inference_workflow import NVFP4InferenceConfig, NVFP4MMConfig
+    return NVFP4InferenceConfig, NVFP4MMConfig
+
+
+def fp4_unavailable(device):
+    """None when this GPU multiplies in FP4 (Blackwell, compute capability 10.0 or newer: B200, RTX 5090,
+    RTX PRO 6000), else the reason it cannot (the RTX 4090 is 8.9)."""
+    import torch
+    if str(device).startswith("cpu") or not torch.cuda.is_available():
+        return "no CUDA GPU"
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) < (10, 0):
+        return f"compute capability {major}.{minor} has no FP4 tensor cores (needs 10.0 or newer)"
+    return None
+
+
+def relative_error(out, ref) -> float:
+    import torch
+    return float(torch.linalg.vector_norm((out - ref).float()) / torch.linalg.vector_norm(ref.float()).clamp(min=1e-6))
+
+
+def build_fp4_transformer(model_cls, transformer_dir: str, lora_path, lora_scale: float, device, dtype,
+                          keep_edge_blocks: int = 1):
+    """Full-precision model + LoRA (fused at lora_scale, exactly as for INT8 and FP8) -> most transformer-block Linear
+    layers in NVFP4 (4-bit weights and maths), the first and last `keep_edge_blocks` blocks of each kind and any layer
+    FP4 cannot take in FP8. Raises when FP4 is unavailable or its test multiply is wrong, so the caller falls back."""
+    import torch
+    why = fp4_unavailable(device)
+    if why:
+        raise RuntimeError(f"FP4 unavailable: {why}")
+    t0 = time.time()
+    model = load_fused_full_precision(model_cls, transformer_dir, lora_path, lora_scale, dtype)  # PEFT done here
+    model.to(device)
+    NVFP4InferenceConfig, NVFP4MMConfig = import_torchao_fp4()
+    Float8DynamicActivationFloat8WeightConfig, PerTensor, quantize_ = import_torchao()
+    block_names = [n for n, m in model.named_modules() if fp8_layer(n, m)]
+    if not block_names:
+        raise RuntimeError("FP4: no transformer-block Linear layers found")
+    keep = edge_blocks(block_names, int(keep_edge_blocks))
+    modules = dict(model.named_modules())
+    want4 = [n for n in block_names if fp4_layer(n, modules[n], keep)]
+    if not want4:
+        raise RuntimeError("FP4: no layer suits FP4")
+    # The layer used for the test multiply, with its full-precision weight kept for the comparison.
+    probe_name = want4[len(want4) // 2]
+    probe_ref = torch.nn.Linear(modules[probe_name].in_features, modules[probe_name].out_features,
+                                bias=modules[probe_name].bias is not None, device=device, dtype=dtype)
+    probe_ref.load_state_dict(modules[probe_name].state_dict())
+    want4_set = set(want4)
+    quantize_(model, NVFP4InferenceConfig(mm_config=NVFP4MMConfig.DYNAMIC, use_triton_kernel=True,
+                                          use_dynamic_per_tensor_scale=True),
+              filter_fn=lambda m, fqn: fqn in want4_set and isinstance(m, torch.nn.Linear))
+    modules = dict(model.named_modules())
+    in4 = [n for n in block_names if is_fp4_weight(modules[n].weight)]
+    if not in4:
+        raise RuntimeError(f"FP4: torchao converted none of the {len(want4)} chosen layers")
+    # Everything else in the blocks (the kept edge blocks, any layer FP4 did not take) goes to FP8, as today.
+    rest = {n for n in block_names if n not in set(in4)}
+    if rest:
+        quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor(), set_inductor_config=False),
+                  filter_fn=lambda m, fqn: fqn in rest and isinstance(m, torch.nn.Linear))
+    model.eval()
+    model.to(device)
+    modules = dict(model.named_modules())
+    in8 = [n for n in block_names if is_fp8_weight(modules[n].weight)]
+    # Test multiplies at token counts FluxRT really uses (it recomputes a different number every frame): odd and
+    # even counts, under and over the 128-token tiles of the fast kernel. Each must be finite and close to the
+    # full-precision layer, so a missing or wrong kernel fails here, at start-up, not in a shopper's session.
+    probe = modules[probe_name]
+    worst = 0.0
+    with torch.no_grad():
+        for tokens in (17, 128, 1000, 2304):
+            x = torch.randn(1, tokens, probe.in_features, device=device, dtype=dtype)
+            out, ref = probe(x), probe_ref(x)
+            if not torch.isfinite(out).all():
+                raise RuntimeError(f"FP4: the test multiply ({tokens} tokens) gave non-finite numbers")
+            err = relative_error(out, ref)
+            worst = max(worst, err)
+            if err > FP4_MAX_RELATIVE_ERROR:
+                raise RuntimeError(f"FP4: the test multiply ({tokens} tokens) is {err:.2f} off full precision "
+                                   f"(limit {FP4_MAX_RELATIVE_ERROR})")
+    del probe_ref
+    model.azyah_fp4_layers = len(in4)
+    model.azyah_fp8_layers = len(in8)
+    model.azyah_fp4_error = round(worst, 4)
+    gc.collect()
+    torch.cuda.empty_cache()
+    left = len(block_names) - len(in4) - len(in8)
+    msg = (f"FP4 transformer ready: {len(in4)} of {len(block_names)} block layers in FP4, {len(in8)} in FP8 "
+           f"(edge blocks kept: {keep_edge_blocks} each end), {left} in 16 bits; test multiply within {worst:.3f} of "
+           f"full precision (LoRA {lora_path or 'none'}, scale {lora_scale}) on {torch.cuda.get_device_name(device)} "
+           f"in {time.time() - t0:.0f}s")
+    log.info(msg)
+    print(f"[azyah] {msg}", flush=True)
+    return model

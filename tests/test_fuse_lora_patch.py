@@ -28,8 +28,9 @@ def test_patch_carries_the_same_helper_as_the_repo_and_touches_the_right_places(
     assert "fuse_lora_into_int8(" in patch and 'self.config["use_lora"] = False' in patch
     assert 'adapter_name="garment"' in patch and "set_adapters" in patch
     # FP8 (FLUXRT_PRECISION=fp8): built first when asked, INT8 when it cannot be, and the worker is told which
-    assert 'self.config.get("precision", "int8")).lower() == "fp8"' in patch and "build_fp8_transformer(" in patch
-    assert "falling back to INT8" in patch and 'precision_info["fp8_error"]' in patch
+    # (FLUXRT_PRECISION=fp4 tries FP4 first, then FP8, then INT8: test_fluxrt_fp4.py)
+    assert 'asked = str(self.config.get("precision", "int8")).lower()' in patch and "build_fp8_transformer(" in patch
+    assert '"fp8": ("fp8",)' in patch and "falling back to {nxt}" in patch and 'precision_info[f"{want}_error"]' in patch
     assert 'self.config.get("precision_marker")' in patch and "write_precision_marker(" in patch
     # Dockerfile.livecam applies fluxrt/patches/*.patch in name order: anchor, this one, then the speed patch.
     names = sorted(p.name for p in (ROOT / "fluxrt/patches").glob("*.patch"))

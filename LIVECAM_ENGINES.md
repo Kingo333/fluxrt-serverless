@@ -128,7 +128,9 @@ While WebRTC is connected the worker sends no JPEG frames. If it drops, or the a
 ## FP8 transformer and compile (2026-11-14, off by default)
 
 Today's model is INT8 weight-only (optimum-quanto: 8-bit weights, 16-bit maths). It saves memory, not time.
-`FLUXRT_PRECISION=fp8` builds the same favourite #2 with FP8 weights and FP8 maths.
+`FLUXRT_PRECISION=fp8` builds the same favourite #2 with FP8 weights and FP8 maths. `FLUXRT_PRECISION=fp4` (owner,
+2026-11-15) builds it with most block layers in NVFP4 (4-bit, Blackwell GPUs) and the first and last blocks in FP8;
+the warm-up log says `transformer built in fp4 (N layers FP4, M FP8, test error e)`, or which fallback ran and why.
 - **Same favourite.** It starts from the full-precision FLUX.2-klein-4B transformer with the LoRA fused at `FLUXRT_LORA_SCALE`, exactly as the INT8 build does.
 - **What changes.** The Linear layers inside the transformer blocks switch to FP8: torchao, dynamic per-tensor scales, FP8 tensor cores (RTX 4090, RTX 5090, RTX PRO 6000).
 - **What stays the same.**
@@ -167,7 +169,10 @@ All settable in the RunPod env, no rebuild:
 
 | Variable | Default | Range | What it does |
 |---|---|---|---|
-| `FLUXRT_PRECISION` | `int8` | `int8`, `fp8` | `fp8`: FP8 transformer blocks. Needs `ENABLE_INT8` (default on) and the LoRA fused (`FLUXRT_LORA_FUSE`, default on); otherwise the worker logs why and stays INT8. |
+| `FLUXRT_PRECISION` | `int8` | `int8`, `fp8`, `fp4` | `fp8`: FP8 transformer blocks. `fp4` (Blackwell only: RTX 5090, RTX PRO 6000, B200): most block layers in NVFP4, the edge blocks in FP8, checked against full precision at start-up; falls back to FP8, then INT8, and logs why. Both need `ENABLE_INT8` (default on) and the LoRA fused (`FLUXRT_LORA_FUSE`, default on); otherwise the worker logs why and stays INT8. |
+| `FLUXRT_FP4_KEEP_EDGE_BLOCKS` | `1` | `0`..`4` | With `fp4`: how many blocks at each end of each block type stay in FP8 (the most rounding-sensitive). |
+| `FLUXRT_COMPILE_MODE` | `default` | `default`, `max-autotune-no-cudagraphs` | With compile: the compiler tries several kernels per transformer multiply and keeps the fastest. Longer first warm-up; the compile cache keeps it. |
+| `FLUXRT_COMPILE_TUNE` | off | `0`/`1` | With compile: the compiler's finer kernel search (coordinate descent) on top. |
 | `FLUXRT_FAST_MASK` | on | `0`/`1` | Changed tokens worked out once per model call (fewer waits, same output). `0` = original. |
 | `FLUXRT_COMPILE` | off | `0`/`1` | FluxRT's `compile_models`. |
 | `FLUXRT_COMPILE_CACHE_DIR` | unset | a folder | Keeps the compile cache across workers. Used only with 2 GB free. |

@@ -1,8 +1,8 @@
 diff --git a/src/fluxrt/stream_processor/model_inference_subprocess.py b/src/fluxrt/stream_processor/model_inference_subprocess.py
-index fef9191..485acda 100644
+index b8d59fc..5d1c655 100644
 --- a/src/fluxrt/stream_processor/model_inference_subprocess.py
 +++ b/src/fluxrt/stream_processor/model_inference_subprocess.py
-@@ -221,6 +221,24 @@ class ModelInferenceSubprocess:
+@@ -238,8 +238,47 @@ class ModelInferenceSubprocess:
              ).to(self.dtype)
  
          if self.config.get("compile_models", False):
@@ -24,10 +24,33 @@ index fef9191..485acda 100644
 +                )
 +            except Exception as e:  # noqa: BLE001
 +                print(f"[azyah] compile settings not applied ({e})", flush=True)
++            # Azyah patch (FLUXRT_COMPILE_MODE, FLUXRT_COMPILE_TUNE): a tighter compile of the transformer, where
++            # nearly all the time goes. "max-autotune-no-cudagraphs" tries several kernels per multiply and keeps the
++            # fastest (no CUDA graphs: FluxRT's token count changes every frame); the tune switch adds the
++            # compiler's finer search. Both make the first warm-up longer; the compile cache keeps the result.
++            azyah_compile_kwargs = {}
++            azyah_mode = str(self.config.get("compile_mode", "default") or "default")
++            if azyah_mode != "default":
++                azyah_compile_kwargs["mode"] = azyah_mode
++            if self.config.get("compile_tune", False):
++                try:
++                    import torch._inductor.config as azyah_inductor
++
++                    azyah_inductor.coordinate_descent_tuning = True
++                    azyah_inductor.epilogue_fusion = True
++                except Exception as e:  # noqa: BLE001
++                    print(f"[azyah] compile tuning not applied ({e})", flush=True)
++            print(
++                f"[azyah] compile mode {azyah_mode}, tuning {'on' if self.config.get('compile_tune', False) else 'off'}",
++                flush=True,
++            )
              self.transformer = torch.compile(
                  self.transformer,
++                **azyah_compile_kwargs,
              )
-@@ -314,6 +332,14 @@ class ModelInferenceSubprocess:
+             self.vae = torch.compile(
+                 self.vae,
+@@ -331,6 +370,14 @@ class ModelInferenceSubprocess:
          """
          self.init_process_state()
          self.init_shared_tensors()

@@ -128,16 +128,22 @@ LORA_FUSE = os.getenv("FLUXRT_LORA_FUSE", "true").strip().lower() in ("1", "true
 #   saves memory, not time. Unset or int8 = today's model, unchanged. Needs ENABLE_INT8 (the default: FluxRT's
 #   quantized loader, which also keeps the INT8 text encoder). If FP8 is unavailable on the GPU, FluxRT logs
 #   "[azyah] FP8 transformer unavailable (...); falling back to INT8" and runs INT8.
+# FP4 (owner, 2026-11-15). FLUXRT_PRECISION=fp4 builds the same favourite with most of the transformer blocks'
+#   Linear layers in NVFP4 (4-bit weights and maths, Blackwell only: RTX 5090, RTX PRO 6000, B200) and the first and
+#   last FLUXRT_FP4_KEEP_EDGE_BLOCKS blocks (default 1, 0..4) in FP8. A test multiply is checked against full
+#   precision at start-up. If FP4 is unavailable (an RTX 4090, a kernel, the check), FluxRT logs
+#   "[azyah] FP4 transformer unavailable (...); falling back to FP8" and builds FP8, then INT8 if FP8 fails too.
 PRECISION = os.getenv("FLUXRT_PRECISION", "int8").strip().lower() or "int8"
-if PRECISION not in ("int8", "fp8"):
-    log.warning("FLUXRT_PRECISION=%r is not int8|fp8; using int8", PRECISION)
+if PRECISION not in ("int8", "fp8", "fp4"):
+    log.warning("FLUXRT_PRECISION=%r is not int8|fp8|fp4; using int8", PRECISION)
     PRECISION = "int8"
-if PRECISION == "fp8" and not ENABLE_INT8:
-    log.warning("FLUXRT_PRECISION=fp8 needs ENABLE_INT8 (FluxRT's quantized loader); running without FP8")
+if PRECISION in ("fp8", "fp4") and not ENABLE_INT8:
+    log.warning("FLUXRT_PRECISION=%s needs ENABLE_INT8 (FluxRT's quantized loader); running INT8", PRECISION)
     PRECISION = "int8"
-if PRECISION == "fp8" and LORA_PATH and not LORA_FUSE:
-    log.warning("FLUXRT_PRECISION=fp8 needs the LoRA fused into the weights (FLUXRT_LORA_FUSE on); running INT8")
+if PRECISION in ("fp8", "fp4") and LORA_PATH and not LORA_FUSE:
+    log.warning("FLUXRT_PRECISION=%s needs the LoRA fused into the weights (FLUXRT_LORA_FUSE on); running INT8", PRECISION)
     PRECISION = "int8"
+FP4_KEEP_EDGE_BLOCKS = int(_bounded("FLUXRT_FP4_KEEP_EDGE_BLOCKS", 1, 0, 4))
 # FLUXRT_COMPILE=1: FluxRT's own compile option (torch.compile of the transformer, VAE and frame interpolation;
 #   FluxRT's authors run it on). Off by default: the first start of each new worker takes minutes longer.
 #   FLUXRT_COMPILE_CACHE_DIR (a folder on the network volume) keeps the compiled kernels for the next worker.
@@ -156,6 +162,17 @@ COMPILE_SUPPRESS_ERRORS = _env_switch("TORCHDYNAMO_SUPPRESS_ERRORS", True)
 # FLUXRT_COMPILE_RECOMPILE_LIMIT (default 64, 8..512): how many variants the compiler may build per piece of code
 #   before it runs that piece uncompiled. PyTorch's default of 8 is low for FluxRT's changing token counts.
 COMPILE_RECOMPILE_LIMIT = int(_bounded("FLUXRT_COMPILE_RECOMPILE_LIMIT", 64, 8, 512))
+# Tighter compile (owner, 2026-11-15), only with FLUXRT_COMPILE=1, both off by default (today's compile):
+#   FLUXRT_COMPILE_MODE=max-autotune-no-cudagraphs: the compiler tries several kernels per multiply in the transformer
+#     and keeps the fastest. No CUDA graphs (FluxRT's token count changes every frame). "default" = today.
+#   FLUXRT_COMPILE_TUNE=1: the compiler's finer kernel search (coordinate descent) on top.
+#   Both make the first warm-up of a new worker longer; FLUXRT_COMPILE_CACHE_DIR keeps the result for the next one.
+COMPILE_MODES = ("default", "max-autotune-no-cudagraphs")
+COMPILE_MODE = os.getenv("FLUXRT_COMPILE_MODE", "default").strip().lower() or "default"
+if COMPILE_MODE not in COMPILE_MODES:
+    log.warning("FLUXRT_COMPILE_MODE=%r is not one of %s; using default", COMPILE_MODE, "|".join(COMPILE_MODES))
+    COMPILE_MODE = "default"
+COMPILE_TUNE = _env_switch("FLUXRT_COMPILE_TUNE", False)
 # FLUXRT_FAST_MASK (default on): FluxRT works out which tokens changed once per model call instead of in each of its
 #   ~110 layer steps (every check made the CPU wait for the GPU: about 440 waits per generated frame), and its
 #   leftover timing helper stops waiting too (fluxrt/patches/fluxrt-speed.patch). Same pictures, fewer waits.
@@ -587,22 +604,34 @@ def storage_report() -> List[str]:
         lora_mb = f"{lp.stat().st_size / 1e6:.0f} MB" if lp.is_file() else "MISSING"
         lines.append(f"LoRA {LORA_PATH} ({lora_mb})")
     lines.append(f"transformer precision asked: {PRECISION}; compile: {'on' if COMPILE else 'off'}"
-                 + (f", cache {COMPILE_CACHE_STATUS}" if COMPILE else ""))
+                 + ((f" (mode {COMPILE_MODE}, tuning {'on' if COMPILE_TUNE else 'off'})"
+                     if (COMPILE_MODE != "default" or COMPILE_TUNE) else "") + f", cache {COMPILE_CACHE_STATUS}"
+                    if COMPILE else ""))
     return lines
 
 
 def read_precision_marker(path: Path = PRECISION_MARKER) -> str:
-    """What FluxRT's model process built: 'fp8 (N layers)', 'int8', 'int8 (FP8 unavailable: ...)' or 'unknown'."""
+    """What FluxRT's model process built, as one line: 'fp4 (N layers FP4, M FP8, test error e)', 'fp8 (N layers)',
+    'int8', each with the reason when it fell back ('fp8 (... ; FP4 unavailable: ...)'), or 'unknown'."""
     try:
         info = json.loads(path.read_text())
     except (OSError, ValueError):
         return "unknown"
-    if info.get("precision") == "fp8":
+    got = info.get("precision")
+    why = []
+    if got != "fp4" and info.get("fp4_error"):
+        why.append(f"FP4 unavailable: {info['fp4_error']}")
+    if got == "int8" and info.get("fp8_error"):
+        why.append(f"FP8 unavailable: {info['fp8_error']}")
+    if got == "fp4":
+        n4, n8, err = info.get("fp4_layers"), info.get("fp8_layers"), info.get("fp4_test_error")
+        line = f"fp4 ({n4} layers FP4, {n8 or 0} FP8" + (f", test error {err}" if err is not None else "") + ")"
+    elif got == "fp8":
         n = info.get("fp8_layers")
-        return f"fp8 ({n} layers)" if n else "fp8"
-    if info.get("fp8_error"):
-        return f"int8 (FP8 unavailable: {info['fp8_error']})"
-    return "int8"
+        line = f"fp8 ({n} layers)" if n else "fp8"
+    else:
+        line = "int8"
+    return line + (f" ({'; '.join(why)})" if why else "")
 
 
 def write_runtime_config() -> Path:
@@ -630,11 +659,14 @@ def write_runtime_config() -> Path:
         },
         "logging": True,
     }
-    config["precision"] = PRECISION  # read by fluxrt/patches/fluxrt-fuse-lora.patch (FP8 or INT8)
+    config["precision"] = PRECISION  # read by fluxrt/patches/fluxrt-fuse-lora.patch (FP4, FP8 or INT8)
+    config["fp4_keep_edge_blocks"] = FP4_KEEP_EDGE_BLOCKS  # the same patch, only with FP4
     config["precision_marker"] = str(PRECISION_MARKER)  # the same patch writes which one it built
     config["fast_active_index"] = FAST_MASK  # read by fluxrt/patches/fluxrt-speed.patch
     config["compile_suppress_errors"] = COMPILE_SUPPRESS_ERRORS  # the same patch, only with compile_models
     config["compile_recompile_limit"] = COMPILE_RECOMPILE_LIMIT
+    config["compile_mode"] = COMPILE_MODE  # the speed patch, only with compile_models
+    config["compile_tune"] = COMPILE_TUNE
     if LORA_PATH:
         config["use_lora"] = True
         config["lora_weights_path"] = check_lora(LORA_PATH)
@@ -893,6 +925,9 @@ def live_switches(segmenter_loaded: bool) -> Dict[str, Any]:
         "compile_warmup_passes": COMPILE_WARMUP_PASSES if (COMPILE and COMPILE_WARMUP) else 0,
         "compile_suppress_errors": COMPILE_SUPPRESS_ERRORS if COMPILE else None,
         "compile_recompile_limit": COMPILE_RECOMPILE_LIMIT if COMPILE else None,
+        "compile_mode": COMPILE_MODE if COMPILE else None,
+        "compile_tune": COMPILE_TUNE if COMPILE else None,
+        "fp4_keep_edge_blocks": FP4_KEEP_EDGE_BLOCKS if PRECISION == "fp4" else None,
         "size": f"{WIDTH}x{HEIGHT}",
         "output_size": f"{OUT_WIDTH}x{OUT_HEIGHT}",
         "ref_size": f"{REF_WIDTH}x{REF_HEIGHT}",

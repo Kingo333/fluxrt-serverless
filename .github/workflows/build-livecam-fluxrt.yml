@@ -9,6 +9,8 @@ on:
       - main
       # The FP8 / compile test branch: workflow_dispatch only works for workflows already on main.
       - feat/fluxrt-fp8
+      # The FP4 / tighter-compile test branch (owner, 2026-11-15): its own commit tags only.
+      - feat/fluxrt-fp4
     paths:
       - Dockerfile.livecam-fluxrt
       - Dockerfile.livecam

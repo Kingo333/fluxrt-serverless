@@ -51,7 +51,8 @@ def test_defaults_are_all_off(monkeypatch):
                   "input_scale": 1, "segmenter_loaded": False, "webrtc": False, "webrtc_max_kbps": None,
                   "precision": "int8", "precision_active": None, "fast_mask": True, "compile": False,
                   "compile_cache": "off", "compile_warmup_passes": 0, "compile_suppress_errors": None,
-                  "compile_recompile_limit": None, "size": "576x320", "output_size": "1152x640", "ref_size": "384x512",
+                  "compile_recompile_limit": None, "compile_mode": None, "compile_tune": None,
+                  "fp4_keep_edge_blocks": None, "size": "576x320", "output_size": "1152x640", "ref_size": "384x512",
                   "sharpen": 0.0, "steps": 2, "setting_notes": []}
 
 
