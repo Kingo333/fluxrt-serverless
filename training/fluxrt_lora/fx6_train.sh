@@ -128,15 +128,22 @@ train)
   ;;
 eval)
   FX="$OUT/pytorch_lora_weights.safetensors"
+  if [ ! -f "$FX" ]; then  # a training run stopped by its time limit: use its newest save
+    LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
+    [ -n "$LAST" ] && [ -f "$OUT/checkpoint-$LAST/pytorch_lora_weights.safetensors" ] \
+      && cp "$OUT/checkpoint-$LAST/pytorch_lora_weights.safetensors" "$FX" && echo "using the newest save, step $LAST"
+  fi
   [ -f "$FX" ] || { echo "NO_FX6_LORA: $FX"; exit 1; }
+  cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true
+  sha256sum "$FX"
   FAV="fav2_$TAG"; NEW="fx6_$TAG"; MIX="fx6b75_$TAG"; ANC="fx6anchor_$TAG"
-  # an earlier save, about two thirds of the way, to see whether the last steps helped
-  LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
-  EARLY=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | awk -v t="$(( ${LAST:-0} * 2 / 3 ))" '$1 <= t' | tail -1)
-  OLD=""; [ -n "$EARLY" ] && [ -f "$OUT/checkpoint-$EARLY/pytorch_lora_weights.safetensors" ] && OLD="fx6s${EARLY}_$TAG"
+  # Sets and models are trimmed to keep the scoring inside the budget (the baseline's scoring alone took 66 min for
+  # one model): AZ_EVAL_SETS (default the 24 new test clips, the owner's 5 cases, the hijab set, the 10 dresses);
+  # AZ_EVAL_BLEND=1 adds the 75% blend back towards favourite #2.
   SETS=""
-  for s in fx6test fx6logo dress10 set2 cases5 hijab; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
-  echo "== renders at garment size $REF_SIZE on:$SETS ($(mins))"
+  for s in ${AZ_EVAL_SETS:-fx6test cases5 hijab dress10}; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
+  CANDS="$NEW $ANC"; [ "${AZ_EVAL_BLEND:-0}" = "1" ] && CANDS="$CANDS $MIX"
+  echo "== renders at garment size $REF_SIZE on:$SETS; models: favourite #2 (kept from the baseline), $CANDS ($(mins))"
   G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --steps 2 --prompt-style live --ref-size $REF_SIZE"
   render() {  # set, name, extra args...
     local s="$1" n="$2"; shift 2
@@ -148,24 +155,35 @@ eval)
   for s in $SETS; do
     render "$s" "$FAV" --lora "$INIT/pytorch_lora_weights.safetensors"      # kept from the baseline: nothing new to render
     render "$s" "$NEW" --lora "$FX"
-    render "$s" "$MIX" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend 0.75
     # with its own earlier picture as the third image, as live with FLUXRT_ANCHOR=1 (taken after 8 frames, renewed every 12)
     render "$s" "$ANC" --lora "$FX" --anchor-after 8 --anchor-every 12
-    [ -n "$OLD" ] && render "$s" "$OLD" --lora "$OUT/checkpoint-$EARLY/pytorch_lora_weights.safetensors"
+    [ "${AZ_EVAL_BLEND:-0}" = "1" ] && render "$s" "$MIX" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend 0.75
   done
-  CANDS="$NEW $MIX $ANC $OLD"
-  echo "== priority 4: face and skin against favourite #2 ($(mins))"
-  for s in $SETS; do
-    LEAK=""; [ "$s" = "fx6logo" ] && LEAK="--leak-pairs"
+  # Scoring runs on the CPU, one process per set at the same time (the Pod has many cores; the GPU is free now).
+  echo "== scoring: face and skin, background and steadiness, head covering, garment and colour; sets in parallel ($(mins))"
+  score_set() {
+    local s="$1" leak=""
+    [ "$s" = "fx6logo" ] && leak="--leak-pairs"
     ( cd "$T" && "$MP" -m eval.face_skin_report "$R/$s" --models "$FAV" $CANDS --baseline "$FAV" --model "$SEG" \
-        --out "$E/faceskin_fx6_$s.md" $LEAK ) 2>&1 | grep -E "^(FACESKIN|LOGO_LEAK)" | cut -c1-600 || echo "FACESKIN_${s}_EXIT=$?"
-  done
-  echo "== priorities 3 and 5: background, steadiness, head covering ($(mins))"
-  for s in $SETS; do
+        --out "$E/faceskin_fx6_$s.md" $leak ) > "$E/faceskin_fx6_$s.log" 2>&1 || echo "FACESKIN_${s}_EXIT=$?" >> "$E/faceskin_fx6_$s.log"
     ( cd "$T" && "$MP" -m eval.preserve_check "$R/$s" --base "$FAV" --candidates $CANDS --out "$E/preserve_fx6_$s.md" --model "$SEG" ) \
-      > "$E/preserve_fx6_$s.log" 2>&1 || echo "GATE_${s}_EXIT=$?"
+      > "$E/preserve_fx6_$s.log" 2>&1 || echo "GATE_${s}_EXIT=$?" >> "$E/preserve_fx6_$s.log"
     ( cd "$T" && "$MP" -m eval.stability_report "$R/$s" --models "$FAV" $CANDS --model "$SEG" --out "$E/stability_fx6_$s.md" ) \
-      > "$E/stability_fx6_$s.log" 2>&1 || echo "STABILITY_${s}_EXIT=$?"
+      > "$E/stability_fx6_$s.log" 2>&1 || echo "STABILITY_${s}_EXIT=$?" >> "$E/stability_fx6_$s.log"
+    ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "$FAV" $CANDS --model "$SEG" ) > "$E/garment_seg_fx6_$s.log" 2>&1 \
+      || echo "GARMENT_SEG_${s}_EXIT=$?" >> "$E/garment_seg_fx6_$s.log"
+    ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" $CANDS --baseline "$FAV" --out "$E/garment_fx6_$s.md" \
+        --json "$R/$s/garment_report_fx6.json" ) > "$E/garment_score_fx6_$s.log" 2>&1 || echo "GARMENT_SCORE_${s}_EXIT=$?" >> "$E/garment_score_fx6_$s.log"
+  }
+  for s in $SETS; do score_set "$s" & done
+  wait
+  echo "== results ($(mins))"
+  for s in $SETS; do
+    echo "-- $s"
+    grep -hE "^(FACESKIN|LOGO_LEAK)|_EXIT=" "$E/faceskin_fx6_$s.log" | cut -c1-600
+    grep -hE "^PRIORITY|DINO|_EXIT=" "$E/garment_score_fx6_$s.log" "$E/garment_seg_fx6_$s.log" | cut -c1-400
+    grep -hE "_EXIT=" "$E/preserve_fx6_$s.log" "$E/stability_fx6_$s.log"
+    grep -hE "wobble|sharpness|colour" "$E/stability_fx6_$s.md" 2>/dev/null | head -6 | cut -c1-220 | sed "s/^/STEADY $s /"
   done
   ( cd "$T" && "$PY" - "$R" "$FAV" $SETS <<'PYEOF'
 import json, sys
@@ -193,25 +211,18 @@ for c, r in res.items():
     print(f"GATE {c} vs favourite #2: {'PASS' if r['pass'] else 'FAIL'} ({r['clips']} clips)" + ("" if r["pass"] else f"; worse on {r['fails']}"))
 PYEOF
   ) || true
-  for s in $SETS; do grep -hE "wobble|sharpness|colour" "$E/stability_fx6_$s.md" 2>/dev/null | head -6 | cut -c1-220 | sed "s/^/STEADY $s /"; done
-  echo "== priorities 1 and 2: garment accuracy and colour against favourite #2 ($(mins))"
+  echo "== labelled videos: garment | camera | favourite #2 (today) | fxreal6 | fxreal6 + earlier frame ($(mins))"
   for s in $SETS; do
-    ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "$FAV" $CANDS --model "$SEG" ) > "$E/garment_seg_fx6_$s.log" 2>&1 \
-      || echo "GARMENT_SEG_${s}_EXIT=$?"
-    echo "-- $s"
-    ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" $CANDS --baseline "$FAV" --out "$E/garment_fx6_$s.md" \
-        --json "$R/$s/garment_report_fx6.json" ) 2>&1 | grep -E "^PRIORITY|DINO" || echo "GARMENT_SCORE_${s}_EXIT=$?"
-  done
-  echo "== labelled videos: garment | camera | favourite #2 (today) | fxreal6 | fxreal6 + earlier frame | fxreal6 at 75% ($(mins))"
-  for s in $SETS; do
-    ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols 6 --no-legend \
-        --panels "$FAV=favourite #2 (today)" "$NEW=fxreal6" "$ANC=fxreal6 + earlier frame" "$MIX=fxreal6 at 75%" ) > "$E/video_fx6_$s.log" 2>&1 || echo "VIDEO_${s}_EXIT=$?"
+    PANELS=("$FAV=favourite #2 (today)" "$NEW=fxreal6" "$ANC=fxreal6 + earlier frame")
+    [ "${AZ_EVAL_BLEND:-0}" = "1" ] && PANELS+=("$MIX=fxreal6 at 75%")
+    ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
+        --panels "${PANELS[@]}" ) > "$E/video_fx6_$s.log" 2>&1 || echo "VIDEO_${s}_EXIT=$?"
     [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx6_${s}_${TAG}.mp4"
   done
   ( cd "$E" && tar cf "$AZ_ROOT/eval/fx6_review.tar" faceskin_fx6_*.md preserve_fx6_*.md stability_fx6_*.md garment_fx6_*.md \
-      results/*/face_skin.json results/*/garment_report_fx6.json render_fx6_*.log 2>/dev/null )
+      results/*/face_skin.json results/*/garment_report_fx6.json render_fx6_*.log fx6_*_"$TAG".mp4 2>/dev/null )
   echo "FX6_EVAL_DONE after $(mins): videos $(ls "$E"/fx6_*_"$TAG".mp4 2>/dev/null | tr '\n' ' ')"
-  echo "LoRA $FX; reports $AZ_ROOT/eval/fx6_review.tar"
+  echo "LoRA $FX (+ selection.json); reports and videos $AZ_ROOT/eval/fx6_review.tar"
   ;;
 *) echo "BAD_AZ_STAGE: $STAGE (trial, train or eval)"; exit 1 ;;
 esac

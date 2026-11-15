@@ -579,3 +579,60 @@ def test_scripts_carry_the_earlier_frame_and_the_live_setting_stays_a_switch():
     assert '--anchor-after 8 --anchor-every 12' in train and "fxreal6 + earlier frame" in train
     gen = (ROOT / "training/eval/generate_fluxrt.py").read_text()
     assert '"--anchor-after"' in gen and "images = [frame, garment] + ([anchor] if anchor is not None else [])" in gen
+
+
+# ---------------------------------------------------------------- overnight chain (owner, 2026-11-15)
+def _overnight(tmp_path, spent, sec="3.10", rows=8000, trial_extra="", train_extra=""):
+    """Runs fx6_overnight.sh against a fake fx6_train.sh and a finished data log; returns (exit code, output, calls)."""
+    import os
+    import subprocess
+    ws = tmp_path / "ws"
+    root = ws / "azyah-vton"
+    (root / "reports").mkdir(parents=True)
+    (ws / "fx6_data.log").write_text('DATASET {"samples": 8000, "anchors": 6200}\nREGIONS {"rows_written": 8000}\nFX6_DATA_DONE after 150 min\n')
+    calls = ws / "calls.txt"
+    (ws / "fx6_train.sh").write_text(f"""#!/usr/bin/env bash
+echo "$AZ_STAGE steps=${{AZ_MAX_STEPS:-}} minutes=${{AZ_MAX_MINUTES:-}}" >> {calls}
+log={root}/reports/fluxlora_fxreal6_x.log
+case "$AZ_STAGE" in
+trial) echo "step 1 loss=0.31 detail=0.2 {trial_extra}" > $log
+       echo "TRIAL {sec} s per step (batch 4), {rows} rows"; echo "FX6_TRIAL_DONE after 30 min" ;;
+train) echo "loss=0.28 {train_extra}" >> $log; mkdir -p {root}/outputs/fluxrt_lora/fxreal6/checkpoint-500
+       echo "FX6_TRAIN_DONE" ;;
+eval)  echo "FACESKIN fx6test fx6_r528: clips 24"; echo "FX6_EVAL_DONE after 60 min" ;;
+esac
+""")
+    env = {**os.environ, "AZ_REF": "x", "AZ_SPENT": str(spent), "AZ_WS": str(ws), "AZ_SKIP_FETCH": "1", "AZ_NO_STOP": "1"}
+    r = subprocess.run(["bash", str(ROOT / "training/fluxrt_lora/fx6_overnight.sh")], capture_output=True, text=True,
+                       env=env, timeout=60)
+    return r.returncode, r.stdout + r.stderr, calls.read_text().splitlines() if calls.exists() else []
+
+
+def test_overnight_runs_trial_then_full_training_then_eval_within_the_cap(tmp_path):
+    code, out, calls = _overnight(tmp_path, spent=20)
+    assert code == 0, out
+    assert calls[0].startswith("trial") and calls[1].startswith("train") and calls[2].startswith("eval")
+    steps = int(calls[1].split("steps=")[1].split()[0])
+    minutes = int(calls[1].split("minutes=")[1])
+    assert steps == 6000                                       # 3 passes of 8000 rows at batch 4, rounded down
+    assert minutes <= ((45 - 20 - 2) / 2.70 - 1.5) * 60        # the time limit can never spend past the cap
+    assert steps * 3.10 / 60 + 20 >= minutes                   # and it is the steps' own time when that fits
+    assert "OVERNIGHT" in out and "DONE: LoRA" in out and "6200 rows with the earlier frame" in out
+
+
+def test_overnight_trains_fewer_steps_when_money_is_short_and_stops_when_too_short(tmp_path):
+    code, out, calls = _overnight(tmp_path, spent=33)
+    assert code == 0, out
+    steps = int(calls[1].split("steps=")[1].split()[0])
+    assert 800 <= steps < 6000                                 # what the money left pays for
+    assert steps * 3.10 / 3600 * 2.70 <= 45 - 33 - 2 - 1.5 * 2.70 + 0.5
+    code, out, calls = _overnight(tmp_path / "b", spent=38.5)
+    assert code != 0 and "not worth training" in out or "too much of the budget" in out
+    assert not any(c.startswith("train") for c in calls)
+
+
+def test_overnight_stops_on_a_bad_trial(tmp_path):
+    code, out, calls = _overnight(tmp_path, spent=20, trial_extra="loss=nan")
+    assert code != 0 and "NaN" in out and calls == ["trial steps= minutes="]
+    code, out, calls = _overnight(tmp_path / "b", spent=20, trial_extra="torch.OutOfMemoryError: CUDA out of memory")
+    assert code != 0 and "the trial hit an error" in out and len(calls) == 1
