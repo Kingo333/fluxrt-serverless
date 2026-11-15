@@ -205,3 +205,40 @@ def compact_prompt(category=None, name=None, description=None, hint=None) -> str
     parts.append(f"Keep its exact colour, print, pattern, logo, fabric and fit{sleeves}.")
     parts.append(COMPACT_KEEP_DRESS if cat == "dresses" else COMPACT_KEEP)
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------- fxreal6 (owner, 2026-11-15)
+# The app's compact prompt as it is live TODAY (azyah-shopping buildTryOnPrompt.ts after #39):
+#   - a dress names "head covering" only (fxreal5's captions said "hijab or head covering" on every
+#     dress; the owner's fxreal5 result kept adding a hijab. The live app never sends the word "hijab");
+#   - a plain item (one solid colour, no print or logo) gets the plain wording, so a plain tee is never
+#     told to keep a "print, pattern, logo" (the shopper's own logo showed through).
+FX6_KEEP_DRESS = "Keep the person's face, hair, head covering, body, pose and the background unchanged."
+FX6_PLACEMENT_PLAIN = {
+    "tops": "It replaces the current top completely, so nothing of the current top stays visible; the pants or skirt stay as they are",
+    "bottoms": "It replaces the current pants or skirt completely, so nothing of them stays visible; the top stays as it is",
+    "dresses": "It is worn as a dress and replaces the current outfit completely, at its own length, so nothing of the current outfit stays visible",
+    "outerwear": "It is worn over the current outfit",
+}
+FX6_PLAIN = "It is plain: one solid colour all over, with a clean, blank surface"
+
+
+def fx6_prompt(category=None, name=None, description=None, hint=None, plain: bool = False) -> str:
+    """Caption for fxreal6 = the app's live compact prompt. plain: the garment is one solid colour with no
+    print, pattern or logo (clothes only; shoes, bags and accessories never get the plain wording)."""
+    category = DATASET_CATEGORY.get(category, category)
+    cat = normalize_category(category) or normalize_category(name) or normalize_category(hint)
+    nm = _short(name, 120)
+    details = _short(description)
+    item = f"the {nm}" if nm else "the item"
+    tail = f": {details.rstrip('.!')}." if details else "."
+    parts = [f"Virtual try-on. The person in the camera frame wears {item} from the reference image{tail}"]
+    is_plain = bool(plain) and cat in FX6_PLACEMENT_PLAIN
+    if cat:
+        parts.append(f"{FX6_PLACEMENT_PLAIN[cat] if is_plain else COMPACT_PLACEMENT[cat]}.")
+    sleeves = COMPACT_SLEEVES[infer_sleeve_length(category, name, description, hint)] if cat in SLEEVE_CATEGORIES else ""
+    parts.append(f"{FX6_PLAIN}. Keep its exact colour, fabric and fit{sleeves}." if is_plain
+                 else f"Keep its exact colour, print, pattern, logo, fabric and fit{sleeves}.")
+    parts.append(FX6_KEEP_DRESS if cat == "dresses" else COMPACT_KEEP)
+    return " ".join(parts)
+
