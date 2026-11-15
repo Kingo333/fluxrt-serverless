@@ -242,3 +242,18 @@ def fx6_prompt(category=None, name=None, description=None, hint=None, plain: boo
     parts.append(FX6_KEEP_DRESS if cat == "dresses" else COMPACT_KEEP)
     return " ".join(parts)
 
+
+def fx6_caption(compact_caption: str, plain: bool = False) -> str:
+    """A caption made by compact_prompt() turned into today's live wording: "hijab or head covering" becomes
+    "head covering", and for a plain garment the placement and keep sentences become the plain ones. Equal
+    to fx6_prompt() on the same item (tested), so build_real's sections need no other change."""
+    out = compact_caption.replace(COMPACT_KEEP_DRESS, FX6_KEEP_DRESS)
+    if not plain:
+        return out
+    for cat, plain_text in FX6_PLACEMENT_PLAIN.items():
+        usual = f" {COMPACT_PLACEMENT[cat]}. "
+        if usual in out:
+            return (out.replace(usual, f" {plain_text}. ", 1)
+                    .replace("Keep its exact colour, print, pattern, logo, fabric and fit", f"{FX6_PLAIN}. Keep its exact colour, fabric and fit", 1))
+    return out
+

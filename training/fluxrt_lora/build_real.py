@@ -40,7 +40,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from data_tools.fluxrt_prompt import compact_prompt  # noqa: E402
+from data_tools.fluxrt_prompt import compact_prompt, fx6_caption  # noqa: E402
+from data_tools.logo_stamp import KINDS as STAMP_KINDS, stamp  # noqa: E402
 from data_tools.vivid_motion import motion_items  # noqa: E402
 from fluxrt_lora.make_dataset import _cover, _jpeg, selection_for  # noqa: E402
 
@@ -169,6 +170,54 @@ LONGER_PROMPT = ("Virtual try-on. The person in the camera frame wears the garme
 OUTFIT_PROMPT = ("Virtual try-on. The person in the camera frame wears the top from the reference image with plain, "
                  "full-length dark trousers instead of the dress. Keep the person's face, hair, body, pose and the "
                  "background unchanged.")
+
+
+SLEEVES_PROMPT = ("Virtual try-on. The person in the camera frame wears the garment from the reference image, made "
+                  "with full-length sleeves that cover both arms down to the wrists. Keep the person's face, hair, "
+                  "body, pose and the background unchanged.")
+
+
+def sleeve_band(mask, skin, grow: int = 9, min_frac: float = 0.015):
+    """fxreal6 skin exposure: the bare arms beside a top (skin pixels level with the garment, grown a little,
+    minus the garment itself) as an 'L' image, or None when there is too little bare arm to matter. The
+    re-dresser draws long sleeves there; the answer keeps the real bare arms, so the model learns to bring
+    back the person's own skin, in their own tone, where a shorter sleeve uncovers it."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    m = np.asarray(mask.convert("L")) > 127
+    rows = np.where(m.any(axis=1))[0]
+    if not rows.size:
+        return None
+    sk = np.asarray(skin.convert("L").resize(mask.size)) > 127
+    sk[: int(rows.min())] = False
+    sk[int(rows.max()) + 1:] = False
+    band = Image.fromarray((sk * 255).astype(np.uint8), "L").filter(ImageFilter.MaxFilter(grow))
+    b = (np.asarray(band) > 127) & ~m
+    if b.mean() < min_frac:
+        return None
+    return Image.fromarray((b * 255).astype(np.uint8), "L")
+
+
+def closeup_box(mask, w: int, h: int, share: float = 0.6) -> tuple[int, int, int, int]:
+    """fxreal6 close-up: the top `share` of the picture, as wide as `share` of it, centred on the garment
+    (head and shoulders, the same 9:16 shape), so the face has enough pixels to learn from."""
+    import numpy as np
+    m = np.asarray(mask.convert("L").resize((w, h))) > 127
+    cols = np.where(m.any(axis=0))[0]
+    cx = (int(cols.min()) + int(cols.max())) / 2 if cols.size else w / 2
+    bw, bh = int(round(w * share)), int(round(h * share))
+    x0 = int(min(max(0, round(cx - bw / 2)), w - bw))
+    return x0, 0, x0 + bw, bh
+
+
+def is_plain_photo(garment) -> bool:
+    """The garment photo shows one solid colour (eval.logo_set.plain_score): the caption gets the plain wording."""
+    import numpy as np
+    from eval.logo_set import plain_score
+    im = garment.convert("RGB").copy()
+    im.thumbnail((320, 320))
+    sc = plain_score(np.asarray(im))
+    return bool(sc and sc["plain"])
 
 
 def caption_for(category, description) -> str:
@@ -387,6 +436,14 @@ def main(argv=None) -> dict:
                          "(0.57 = dresses ~35%% more than tops and bottoms together); 0 = the old order, no quota")
     ap.add_argument("--other-live-max", type=int, default=-1,
                     help="cap on non-dress ViViD live stills (-1 = no cap); fxreal5 keeps dresses the bulk")
+    ap.add_argument("--windows", help="data_tools.sequences output (fxreal6): frame pairs from the moments the clothes "
+                                      "move most, every garment type; built like --vivid-pairs, with descriptions")
+    ap.add_argument("--caption-style", choices=("compact", "live"), default="compact",
+                    help="live (fxreal6) = the app's prompt as it is today: 'head covering' not 'hijab or head "
+                         "covering', and the plain wording when the garment photo is plain")
+    ap.add_argument("--logo-frac", type=float, default=0.0, help="fxreal6: share of window rows (tops, dresses) whose INPUT garment gets a sharp mark")
+    ap.add_argument("--closeup-frac", type=float, default=0.0, help="fxreal6: share of window rows (tops, dresses) cropped to head and shoulders")
+    ap.add_argument("--exposure-frac", type=float, default=0.0, help="fxreal6: share of window tops whose INPUT is drawn with long sleeves over the bare arms")
     ap.add_argument("--per-file", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -404,7 +461,9 @@ def main(argv=None) -> dict:
                                  "longer_tried": 0, "longer_kept": 0, "longer_pairs": 0,
                                  "vivid_live_dress": 0, "vivid_live_other_capped": 0, "described": 0,
                                  "motion_clips_tried": 0, "motion_pairs_kept": 0, "motion_singles_kept": 0,
-                                 "motion_outfit_kept": 0, "pair_clips_kept_dress": 0}
+                                 "motion_outfit_kept": 0, "pair_clips_kept_dress": 0,
+                                 "window_pairs_tried": 0, "window_pairs_kept": 0, "window_by_type": {}, "closeups": 0,
+                                 "logos": 0, "exposure_kept": 0, "plain_captions": 0}
     used = set()
 
     def flush(final=False):
@@ -415,11 +474,25 @@ def main(argv=None) -> dict:
 
     counts = {"dress": 0, "other": 0}
 
-    def add(key, caption, person, garment, target, mask, pair="", jitter="auto", dress=False):
+    def add(key, caption, person, garment, target, mask, pair="", jitter="auto", dress=False, extra=None):
         counts["dress" if dress else "other"] += 1
         g = garment.copy()
         if max(g.size) > 1024:
             g.thumbnail((1024, 1024), Image.LANCZOS)
+        if a.caption_style == "live":
+            plain = is_plain_photo(g)
+            caption = fx6_caption(caption, plain)
+            stats["plain_captions"] += int(plain)
+        if extra and extra.get("logo") is not None:  # a mark on the INPUT garment only; the answer stays real
+            import numpy as np
+            area = np.asarray(mask.convert("L").resize(person.size)) > 127
+            arr, _ = stamp(np.asarray(person.convert("RGB")), area, np.random.default_rng(extra["logo"]), kind=extra.get("kind"))
+            person = Image.fromarray(arr)
+            stats["logos"] += 1
+        if extra and extra.get("closeup"):
+            box = closeup_box(mask, *person.size)
+            person, target, mask = person.crop(box), target.resize(person.size).crop(box), mask.resize(person.size).crop(box)
+            stats["closeups"] += 1
         jf = jitter_factors(rng, a.photo_aug) if jitter == "auto" else jitter
         if jf:
             person, target = photo_jitter(person, *jf), photo_jitter(target, *jf)
@@ -441,6 +514,10 @@ def main(argv=None) -> dict:
     by_cat: dict = {}
     for clip, cat, ref, _ in pairs:
         by_cat.setdefault(cat, []).append(ref)
+    windows = list(vivid_pair_items(Path(a.windows))) if a.windows else []
+    win_by_cat: dict = {}
+    for clip, cat, ref, _ in windows:
+        win_by_cat.setdefault(cat, []).append(ref)
     motion = list(motion_items(Path(a.motion))) if a.motion else []
     dress_refs = [m[2] for m in motion]
 
@@ -649,6 +726,62 @@ def main(argv=None) -> dict:
             print(json.dumps({k: stats[k] for k in ("motion_clips_tried", "motion_pairs_kept", "motion_singles_kept",
                                                      "motion_outfit_kept")}), flush=True)
 
+    # 5. fxreal6: frame pairs from the moments the clothes move most, every garment type (data_tools.sequences).
+    #    Each 4-frame window arrives as two pairs; both frames of a pair get the same other garment and seed
+    #    and share a pair id, so the trainer's pair term keeps the answer steady from one live frame to the next.
+    def windows_section():
+        from PIL import ImageChops
+        for clip, cat, ref, frames in windows:
+            stats["window_pairs_tried"] += 1
+            others = [r for r in win_by_cat.get(cat, []) if r != ref]
+            if not others:
+                continue
+            other = Image.open(rng.choice(others)).convert("RGB")
+            seed = a.seed * 100003 + 104729 + stats["window_pairs_tried"]
+            expose = cat == "upper" and a.exposure_frac > 0 and rng.random() < a.exposure_frac
+            built, exposed = [], 0
+            for tpath, mpath in frames:
+                real = _cover(Image.open(tpath).convert("RGB"), gw, gh)
+                mask = Image.open(mpath).convert("L").resize((gw, gh))
+                band = None
+                if expose:
+                    spath = tpath.with_name(tpath.name.replace("_target", "_skin"))
+                    band = sleeve_band(mask, Image.open(spath)) if spath.exists() else None
+                gen = redress(real, other, seed=seed, category=cat, **({"prompt": SLEEVES_PROMPT} if band is not None else {}))
+                soft = soft_mask(ImageChops.lighter(mask, band) if band is not None else mask, grow=13)
+                inp = paste_back(gen, real, soft)
+                if band is not None and not changed_enough(inp, real, band, a.longer_min_change):
+                    soft, band = soft_mask(mask, grow=13), None  # no sleeves were drawn: an ordinary row
+                    inp = paste_back(gen, real, soft)
+                bb = bbox_of(mask)
+                sim = dino(inp.crop(bb), real.crop(bb)) if bb else 1.0
+                if not bb or sim > a.max_sim or not changed_enough(inp, real, mask):
+                    break
+                built.append((inp, real, soft))
+                exposed += int(band is not None)
+            if len(built) != 2:
+                continue
+            jf = jitter_factors(rng, a.photo_aug)
+            garment = Image.open(ref).convert("RGB")
+            desc = meta_description(ref.parent)
+            extra = None
+            if cat != "lower":  # a close-up or a chest mark would leave trousers out of the picture
+                extra = {"closeup": rng.random() < a.closeup_frac,
+                         "logo": seed if rng.random() < a.logo_frac else None, "kind": STAMP_KINDS[seed % len(STAMP_KINDS)]}
+            for tag, (inp, real, soft) in zip("ab", built):
+                add(f"vivid_win_{clip}_{tag}", caption_for(cat, desc), inp, garment, real, soft, pair=f"w_{clip}",
+                    jitter=jf, dress=cat == "dress", extra=extra)
+            used.add("vivid")
+            stats["window_pairs_kept"] += 1
+            stats["window_by_type"][cat] = stats["window_by_type"].get(cat, 0) + 1
+            stats["exposure_kept"] += int(exposed == 2)
+            stats["described"] += 2 * int(bool(desc))
+            if stats["window_pairs_tried"] % 200 == 0:
+                print(json.dumps({"window_progress": stats["window_pairs_tried"], "kept": stats["window_pairs_kept"]}), flush=True)
+        if windows:
+            print(json.dumps({k: stats[k] for k in ("window_pairs_tried", "window_pairs_kept", "window_by_type",
+                                                     "closeups", "logos", "exposure_kept", "plain_captions")}), flush=True)
+
     if a.dress_share > 0:
         # fxreal5 (owner, 2026-11-11): dresses first, then tops and bottoms up to the share the owner set
         # (0.57 = dresses about 35% more than tops and bottoms together). Of the tops-and-bottoms quota, ViViD
@@ -668,6 +801,7 @@ def main(argv=None) -> dict:
         viton_section()
         pairs_section()
         motion_section()
+        windows_section()
     flush(final=True)
 
     sel = selection_for(used)

@@ -74,6 +74,30 @@ Cut to fit $100, and what it costs:
 Kept in full: the logo and plain-garment fixes, the face and skin protection, the head and hair rules.
 They come from the data rules and the loss weights, not from volume.
 
+## Sized to the money in the account: $50 (2026-11-15)
+
+The cap stays $100, but the account holds about $21 and the owner tops up to at least $50, and the
+RTX PRO 6000 costs $2.70 an hour (the 5090 was not available). So the run is sized to finish inside $50:
+
+| Step | Hours | About |
+|---|---|---|
+| Favourite #2 baseline (running) | 1 | $2.70 |
+| Data build: all 1,599 videos x 1 moment (not 2), 1,000 VITON-HD tops | 3.2 | $8.60 |
+| Trial, 200 steps | 0.5 | $1.40 |
+| Training: about 6,400 steps at batch 4 (3 passes over about 8,500 rows) | 2.7 to 3.4 | $7 to $9 |
+| Evaluation and videos | 1.3 | $3.50 |
+| **Expected** | **9 to 10** | **$23 to $26** |
+
+That leaves room for one repeat of the costliest step. No step starts if it would take the total past
+$45. What the smaller size costs: one moment per video instead of two (1,600 motion windows, not 3,200),
+so less variety of movement per garment; every video and every garment is still used. If the owner tops
+up further, the second moment per video and a fourth pass are the first things to add back.
+
+No new training code: the face, skin and hair weights are put into the weight mask by the data step
+(face full, skin and hair half), where the trainer's existing colour, texture, edge and pair terms
+already work; a 4-frame window is stored as two frame pairs, which the existing pair batching reads.
+The run starts from favourite #2 (as fxreal5 did) and the strength dial is a blend back towards it.
+
 ## Data
 
 | Part | Size | Notes |
@@ -122,7 +146,8 @@ existing sets (dress10, set2, cases5, hijab) and a small logo set (information o
 | `eval/face_skin.py` | face match, skin tone, lightness, texture, the pass bar | done, tested |
 | `eval/face_skin_report.py`, `eval/logo_set.py` | the face, skin and logo-leak report on rendered clips | done, tested, run end to end on CPU |
 | `fluxrt_lora/fx6_baseline.sh` | step 4: favourite #2's own numbers | done; first GPU run is the baseline itself |
-| data build (`build_real.py` additions), trainer terms, `fx6.sh` | put it together on the GPU | next |
+| `data_tools/sequences.py` (tool), `build_real.py --windows`, `data_tools/region_weight.py`, `fluxrt_lora/fx6_data.sh` | step 5: the data build | done; tested with a fake re-dresser and end to end on CPU; first GPU run is the build itself |
+| trial, training and evaluation script | steps 6 to 8 | next |
 
 ## Measures and pass bar (against favourite #2, same garments and poses; truth = the camera frame)
 

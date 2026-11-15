@@ -311,3 +311,155 @@ def test_live_prompt_style_and_baseline_script():
     assert "run_train.sh" not in sh and "train_dreambooth" not in sh  # it trains nothing
     import subprocess
     assert subprocess.run(["bash", "-n", str(ROOT / "training/fluxrt_lora/fx6_baseline.sh")]).returncode == 0
+
+
+# ---------------------------------------------------------------- data build: windows, captions, regions
+def test_fx6_caption_turns_a_compact_caption_into_the_live_wording():
+    from data_tools.fluxrt_prompt import compact_prompt, fx6_caption, fx6_prompt
+    for cat in ("upper", "lower", "dress", "outerwear", "shoes", "bags"):
+        for desc in (None, "red satin, long sleeves"):
+            c = compact_prompt(cat, None, desc)
+            assert fx6_caption(c) == fx6_prompt(cat, None, desc), (cat, desc)
+            assert fx6_caption(c, plain=True) == fx6_prompt(cat, None, desc, plain=True), (cat, desc)
+    assert "hijab" not in fx6_caption(compact_prompt("dress", None, "black abaya"))
+
+
+def test_a_window_becomes_two_pairs_the_pair_code_can_read():
+    from data_tools.sequences import pair_folders
+    assert pair_folders([40, 44, 48, 52]) == [("a", (40, 44)), ("b", (48, 52))]
+
+
+def test_sleeve_band_is_the_bare_arms_beside_the_top():
+    from PIL import Image
+    sys.path.insert(0, str(ROOT / "training" / "fluxrt_lora"))
+    from fluxrt_lora.build_real import closeup_box, sleeve_band
+    m = np.zeros((200, 120), dtype=np.uint8)
+    m[60:140, 35:85] = 255                      # a top
+    skin = np.zeros_like(m)
+    skin[70:150, 20:35] = 255                   # left arm, beside and below the top
+    skin[70:150, 85:100] = 255                  # right arm
+    skin[20:55, 45:75] = 255                    # face and neck, above the top
+    band = np.asarray(sleeve_band(Image.fromarray(m, "L"), Image.fromarray(skin, "L"))) > 127
+    assert band[100, 25] and band[100, 92]      # arms level with the top
+    assert not band[30, 60]                     # never the face or neck
+    assert not band[148, 25]                    # nor the hands below the hem
+    assert not (band & (m > 127)).any()         # nor the garment itself
+    assert sleeve_band(Image.fromarray(m, "L"), Image.fromarray(np.zeros_like(m), "L")) is None
+    assert sleeve_band(Image.fromarray(np.zeros_like(m), "L"), Image.fromarray(skin, "L")) is None
+    box = closeup_box(Image.fromarray(m, "L"), 120, 200)
+    assert box == (24, 0, 96, 120)              # top 60%, 60% wide, centred on the garment, same 9:16 shape
+    assert closeup_box(Image.fromarray(np.zeros_like(m), "L"), 120, 200) == (24, 0, 96, 120)
+    m2 = np.zeros_like(m)
+    m2[60:140, 0:30] = 255                      # garment at the left edge: the box stays inside the picture
+    assert closeup_box(Image.fromarray(m2, "L"), 120, 200)[0] == 0
+
+
+def test_region_mask_gives_face_full_weight_and_skin_and_hair_half():
+    from data_tools.region_weight import region_mask, repeats, tone_group
+    cat = np.zeros((60, 40), dtype=np.uint8)
+    cat[5:12, 15:25] = 1       # hair
+    cat[12:22, 15:25] = 3      # face
+    cat[30:50, 2:8] = 2        # arm
+    garment = np.zeros((60, 40), dtype=np.uint8)
+    garment[24:55, 10:30] = 255
+    m = region_mask(garment, cat)
+    assert m[40, 20] == 255 and m[15, 20] == 255 and m[40, 5] == 128 and m[8, 20] == 128 and m[58, 38] == 0
+    rgb = np.zeros((60, 40, 3), dtype=np.uint8)
+    rgb[cat == 3] = (235, 200, 180)
+    rgb[cat == 2] = (235, 200, 180)
+    assert tone_group(rgb, cat) in ("very_light", "light")
+    assert tone_group(rgb, np.zeros_like(cat)) is None
+    units = [(f"pair:{i}", "very_light") for i in range(90)] + [(f"row:{i}", "dark") for i in range(6)] + [("row:x", None)]
+    r = repeats(units, 0.12, 3)
+    assert r["pair:0"] == 1 and r["row:0"] == 2 and r["row:x"] == 1   # 6 x 2 of 102 shown = 12%
+    assert repeats([("a", "very_light")] * 200 + [("b", "dark")], 0.12, 3)["b"] == 3  # never more than max_repeat
+
+
+def test_build_real_has_the_fx6_options_and_runs_the_window_section():
+    src = (ROOT / "training/fluxrt_lora/build_real.py").read_text()
+    for must in ('"--windows"', '"--caption-style"', '"--logo-frac"', '"--closeup-frac"', '"--exposure-frac"',
+                 "def windows_section()", "windows_section()\n    flush(final=True)", 'pair=f"w_{clip}"'):
+        assert must in src, must
+    # the older runs are untouched: without the new options nothing new happens
+    assert 'default="compact"' in src and src.count("default=0.0, help=\"fxreal6") == 3
+
+
+def test_window_rows_are_built_as_pairs_with_live_captions_closeups_marks_and_sleeves(tmp_path):
+    """The real builder, with a fake re-dresser: every window pair becomes two rows that share a pair id."""
+    import io
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image
+    from fluxrt_lora import build_real
+
+    def jb(img):
+        b = io.BytesIO(); img.save(b, format="JPEG"); return {"bytes": b.getvalue(), "path": "x.jpg"}
+    t = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    rows = {"cloth": [], "image": [], "agnostic": []}
+    for i in range(12):
+        person = Image.new("RGB", (768, 1024), (200, 30 + i, 40))
+        agn = person.copy(); agn.paste((128, 128, 128), (200, 300, 560, 700))
+        rows["cloth"].append(jb(Image.new("RGB", (300, 400), (i * 5, 90, 200))))
+        rows["image"].append(jb(person)); rows["agnostic"].append(jb(agn))
+    (tmp_path / "viton").mkdir()
+    pq.write_table(pa.table({k: pa.array(v, type=t) for k, v in rows.items()}), tmp_path / "viton" / "a.parquet")
+    win = tmp_path / "windows"
+    cats = ["upper", "upper", "upper", "dress", "dress", "lower", "lower"]
+    for c, cat in enumerate(cats):
+        for suffix in ("a", "b"):
+            d = win / f"vivid_train_{c:06d}_w1{suffix}"
+            d.mkdir(parents=True)
+            for tag in ("a", "b"):
+                Image.new("RGB", (432, 768), (90 + c, 60, 70)).save(d / f"{tag}_target.png")
+                mk = Image.new("L", (432, 768), 0); mk.paste(255, (130, 220, 300, 520)); mk.save(d / f"{tag}_mask.png")
+                sk = Image.new("L", (432, 768), 0); sk.paste(255, (90, 240, 130, 500)); sk.paste(255, (300, 240, 340, 500))
+                sk.save(d / f"{tag}_skin.png")
+            # a plain garment photo for the tops, a two-colour one for the rest
+            ref = Image.new("RGB", (200, 260), (255, 255, 255)); ref.paste((20, 40, 120), (40, 40, 160, 220))
+            if cat != "upper":
+                ref.paste((230, 200, 40), (40, 40, 160, 130))
+            ref.save(d / "ref.jpg", quality=95)
+            (d / "meta.json").write_text(json.dumps({"category": cat, "split": "train", "garment_description": f"item {c}"}))
+    prompts = []
+
+    class FakeRedress:
+        def __init__(self, *a, **k): pass
+        def __call__(self, person, garment, seed, category="tops", prompt=None):
+            prompts.append(prompt)
+            return Image.new("RGB", (432, 768), (0, 255, 0))
+
+    class FakeDino:
+        def __call__(self, a, b): return 0.5
+
+    old = build_real.Redresser, build_real.DinoSim
+    build_real.Redresser, build_real.DinoSim = FakeRedress, FakeDino
+    try:
+        s = build_real.main(["--out", str(tmp_path / "data"), "--viton-dir", str(tmp_path / "viton"), "--klein", "x",
+                             "--test-out", str(tmp_path / "pairs"), "--viton-n", "0", "--holdout", "2", "--test-items", "0",
+                             "--windows", str(win), "--caption-style", "live", "--closeup-frac", "1.0", "--logo-frac", "1.0",
+                             "--exposure-frac", "1.0", "--nochange-frac", "0"])
+    finally:
+        build_real.Redresser, build_real.DinoSim = old
+    assert s["window_pairs_tried"] == 14 and s["window_pairs_kept"] == 14 and s["samples"] == 28
+    assert s["window_by_type"] == {"upper": 6, "dress": 4, "lower": 4}
+    assert s["closeups"] == 20 and s["logos"] == 20          # tops and dresses only, never trousers
+    assert s["exposure_kept"] == 6                           # long-sleeve inputs: tops only
+    assert s["plain_captions"] == 12                         # the tops' photo is plain
+    assert any(p and "full-length sleeves" in p for p in prompts)
+    tabs = [pq.read_table(f) for f in sorted((tmp_path / "data" / "data").glob("*.parquet"))]
+    keys = sum((x.column("key").to_pylist() for x in tabs), [])
+    pairs = sum((x.column("pair").to_pylist() for x in tabs), [])
+    caps = sum((x.column("caption").to_pylist() for x in tabs), [])
+    assert all(k.startswith("vivid_win_") for k in keys)
+    from collections import Counter
+    assert set(Counter(pairs).values()) == {2}               # every pair id is on exactly two rows
+    top = next(c for k, c in zip(keys, caps) if "000000" in k)
+    assert "It is plain: one solid colour all over" in top and "item 0" in top and "logo" not in top
+    dress = next(c for k, c in zip(keys, caps) if "000003" in k)
+    assert "head covering" in dress and "hijab" not in dress and "print, pattern, logo" in dress
+    row = {c: tabs[0].column(c)[0].as_py() for c in ("person", "target", "mask")}
+    sizes = {c: Image.open(io.BytesIO(row[c]["bytes"])).size for c in row}
+    assert sizes == {"person": (288, 512), "target": (288, 512), "mask": (288, 512)}
+    person, target = (np.asarray(Image.open(io.BytesIO(row[c]["bytes"])).convert("RGB")).astype(int) for c in ("person", "target"))
+    assert np.abs(person - target).mean() > 5                # the input differs from the answer (re-dressed, marked)
