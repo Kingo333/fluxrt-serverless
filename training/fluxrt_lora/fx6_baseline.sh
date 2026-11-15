@@ -26,8 +26,6 @@ stop_pod() {
   echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true
 }
 trap stop_pod EXIT
-[ -e "$GUARD" ] && [ "${AZ_FORCE:-0}" != "1" ] && { echo "GUARD: $GUARD exists (already ran); AZ_FORCE=1 to run again"; exit 0; }
-touch "$GUARD"
 for i in $(seq 60); do curl -fsS -m 5 https://raw.githubusercontent.com >/dev/null 2>&1 && break; echo "waiting for network"; sleep 10; done
 C="$AZ_ROOT/checkpoints"; S="$AZ_ROOT/data/staging"; E="$AZ_ROOT/eval/fxa"; R="$E/results"
 PY="$AZ_ROOT/venv-fluxlora/bin/python"; MP="$AZ_ROOT/venv-mp/bin/python"
@@ -45,10 +43,27 @@ T="$AZ_ROOT/azyah-code/training"
 export PYTHONPATH="$T"
 command -v ffmpeg >/dev/null || { apt-get update -qq && apt-get install -y -qq ffmpeg; }
 [ -x "$PY" ] && "$PY" -c "import torch, diffusers, av" 2>/dev/null || { echo "NO_RENDER_VENV: $PY (fx5 made it; rerun its setup)"; exit 1; }
-[ -x "$MP" ] && "$MP" -c "import mediapipe, av, numpy" 2>/dev/null || { echo "NO_MEDIAPIPE_VENV: $MP"; exit 1; }
+# The MediaPipe venv: rebuilt when it does not work on this image. It gets its own Python 3.11 through uv,
+# kept on the volume, so it no longer depends on the Pod template's Python.
+mp_ok() { [ -x "$MP" ] && "$MP" -c "import mediapipe, av, numpy, pyarrow, PIL" 2>/dev/null; }
+if ! mp_ok; then
+  echo "rebuilding the MediaPipe venv ($(mins))"
+  [ -e "$AZ_ROOT/venv-mp" ] && mv "$AZ_ROOT/venv-mp" "$AZ_ROOT/venv-mp-stale-$(date -u +%Y%m%dT%H%M%SZ)"
+  export UV_PYTHON_INSTALL_DIR="$AZ_ROOT/uv-python"
+  python3 -m pip install -q uv 2>/dev/null || pip install -q uv 2>/dev/null || true
+  if python3 -m uv venv --python 3.11 "$AZ_ROOT/venv-mp" >/dev/null 2>&1; then
+    python3 -m uv pip install -q --python "$MP" mediapipe==0.10.21 av pillow "numpy<2" "pyarrow==17.0.0" || true
+  else
+    python3 -m venv "$AZ_ROOT/venv-mp" && "$AZ_ROOT/venv-mp/bin/pip" install -q mediapipe==0.10.21 av pillow "numpy<2" "pyarrow==17.0.0" || true
+  fi
+  # MediaPipe's OpenCV needs these two system libraries; a bare image may lack them.
+  mp_ok || { apt-get update -qq && apt-get install -y -qq libgl1 libglib2.0-0 >/dev/null 2>&1; }
+fi
+mp_ok || { echo "NO_MEDIAPIPE_VENV: $MP"; "$MP" -c "import mediapipe, av, numpy, pyarrow, PIL" 2>&1 | tail -3; exit 1; }
 [ -f "$INIT" ] || { echo "NO_FAVOURITE2: $INIT"; exit 1; }
 sha256sum "$INIT"
 [ -d "$C/FLUX.2-klein-4B" ] || { echo "NO_MODEL: $C/FLUX.2-klein-4B"; exit 1; }
+rm -f "$GUARD"   # renders and reports are kept and skipped when already there, so a rerun is cheap
 
 echo "== 1. test sets ($(mins))"
 [ -f "$E/fx6test.json" ] || ( cd "$T" && "$PY" -m eval.step_a pick "$AZ_ROOT" --set fx6test --n 24 --auto-describe ) || echo "PICK_EXIT=$?"

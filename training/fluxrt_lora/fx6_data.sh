@@ -44,7 +44,23 @@ T="$AZ_ROOT/azyah-code/training"
 export PYTHONPATH="$T"
 command -v ffmpeg >/dev/null || { apt-get update -qq && apt-get install -y -qq ffmpeg; }
 [ -x "$PY" ] && "$PY" -c "import torch, diffusers, pyarrow" 2>/dev/null || { echo "NO_RENDER_VENV: $PY"; exit 1; }
-[ -x "$MP" ] && "$MP" -c "import mediapipe, av, pyarrow" 2>/dev/null || { echo "NO_MEDIAPIPE_VENV: $MP"; exit 1; }
+# The MediaPipe venv: rebuilt when it does not work on this image. It gets its own Python 3.11 through uv,
+# kept on the volume, so it no longer depends on the Pod template's Python.
+mp_ok() { [ -x "$MP" ] && "$MP" -c "import mediapipe, av, numpy, pyarrow, PIL" 2>/dev/null; }
+if ! mp_ok; then
+  echo "rebuilding the MediaPipe venv ($(mins))"
+  [ -e "$AZ_ROOT/venv-mp" ] && mv "$AZ_ROOT/venv-mp" "$AZ_ROOT/venv-mp-stale-$(date -u +%Y%m%dT%H%M%SZ)"
+  export UV_PYTHON_INSTALL_DIR="$AZ_ROOT/uv-python"
+  python3 -m pip install -q uv 2>/dev/null || pip install -q uv 2>/dev/null || true
+  if python3 -m uv venv --python 3.11 "$AZ_ROOT/venv-mp" >/dev/null 2>&1; then
+    python3 -m uv pip install -q --python "$MP" mediapipe==0.10.21 av pillow "numpy<2" "pyarrow==17.0.0" || true
+  else
+    python3 -m venv "$AZ_ROOT/venv-mp" && "$AZ_ROOT/venv-mp/bin/pip" install -q mediapipe==0.10.21 av pillow "numpy<2" "pyarrow==17.0.0" || true
+  fi
+  # MediaPipe's OpenCV needs these two system libraries; a bare image may lack them.
+  mp_ok || { apt-get update -qq && apt-get install -y -qq libgl1 libglib2.0-0 >/dev/null 2>&1; }
+fi
+mp_ok || { echo "NO_MEDIAPIPE_VENV: $MP"; "$MP" -c "import mediapipe, av, numpy, pyarrow, PIL" 2>&1 | tail -3; exit 1; }
 [ -f "$D/raw/viton_hd/.downloaded" ] || { echo "NO_VITON: $D/raw/viton_hd"; exit 1; }
 FREE_GB=$(df -BG --output=avail /workspace | tail -1 | tr -dc '0-9')
 [ "${FREE_GB:-0}" -ge 40 ] || { echo "LOW_SPACE: ${FREE_GB} GB free on the volume (need 40)"; exit 1; }

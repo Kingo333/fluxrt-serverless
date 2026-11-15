@@ -463,3 +463,23 @@ def test_window_rows_are_built_as_pairs_with_live_captions_closeups_marks_and_sl
     assert sizes == {"person": (288, 512), "target": (288, 512), "mask": (288, 512)}
     person, target = (np.asarray(Image.open(io.BytesIO(row[c]["bytes"])).convert("RGB")).astype(int) for c in ("person", "target"))
     assert np.abs(person - target).mean() > 5                # the input differs from the answer (re-dressed, marked)
+
+
+def test_pod_scripts_rebuild_the_tools_venv_and_train_with_the_fx5_recipe():
+    import subprocess
+    for name in ("fx6_baseline.sh", "fx6_data.sh", "fx6_train.sh"):
+        sh = (ROOT / "training/fluxrt_lora" / name).read_text()
+        assert subprocess.run(["bash", "-n", str(ROOT / "training/fluxrt_lora" / name)]).returncode == 0, name
+        # the venv is rebuilt with its own Python 3.11 and versions that work together (numpy < 2 for MediaPipe)
+        for must in ("mp_ok()", "uv venv --python 3.11", 'mediapipe==0.10.21 av pillow "numpy<2" "pyarrow==17.0.0"', "NO_MEDIAPIPE_VENV"):
+            assert must in sh, (name, must)
+    tr = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
+    for must in ("AZ_INIT_LORA=$INIT", "AZ_LORA_RANK=64", "AZ_BATCH=4", "AZ_MASK_WEIGHT:-3.0", "AZ_PAIR_COLUMN=pair",
+                 "AZ_TIME_SHIFT_MU=2.01", "528x704:3,384x512:1", "FLUX.2-klein-base-4B", "--prompt-style live",
+                 "--blend 0.75", "FACESKIN", "FX6_TRIAL_DONE", "FX6_TRAIN_DONE", "FX6_EVAL_DONE", "TRIAL {passes} passes"):
+        assert must in tr, must
+    data = (ROOT / "training/fluxrt_lora/fx6_data.sh").read_text()
+    for must in ("data_tools.sequences", "--windows", "--caption-style live", "data_tools.region_weight", "FX6_DATA_DONE", "AZ_MAX_MINUTES"):
+        assert must in data, must
+    base = (ROOT / "training/fluxrt_lora/fx6_baseline.sh").read_text()
+    assert 'rm -f "$GUARD"' in base and "touch \"$GUARD\"" not in base  # an early stop never blocks the rerun
