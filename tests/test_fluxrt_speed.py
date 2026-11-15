@@ -276,3 +276,34 @@ def test_a_failing_practice_still_ends_ready(monkeypatch, tmp_path, caplog):
     s.STATE["processor"].stop()
     assert s.STATE["status"] == "ready"
     assert "compile practice failed (practice broke); continuing without it" in caplog.text
+
+
+def test_compile_practice_also_with_the_earlier_frame_when_the_anchor_is_on(monkeypatch, tmp_path, caplog):
+    """FLUXRT_ANCHOR=1: the same practice again with a stand-in earlier frame (more tokens per multiply), then it is
+    cleared, so a session's first anchor never makes the compiler stall in front of a shopper."""
+    s = load(monkeypatch, tmp_path, FLUXRT_COMPILE="1", FLUXRT_CACHE_MASK="seg", FLUXRT_ANCHOR="1")
+    proc = _PracticeProc(h=320, w=160)
+    anchors = []
+    proc.set_anchor_image = lambda a: anchors.append(None if a is None else a.shape)
+    try:
+        with caplog.at_level("INFO", logger="fluxrt-lb"):
+            s.compile_warmup(proc, 4, 60.0)
+    finally:
+        proc.stop()
+    assert anchors == [(320, 160, 3), None]                             # a stand-in at the camera size, then cleared
+    shares = [round(float((m == 2).mean()), 2) for m in proc.masks]
+    assert shares == [0.6, 0.15, 0.0, 0.85, 0.6, 0.15, 0.0, 0.85, 1.0]  # the practice twice, then a full mask
+    assert "compile practice with the earlier frame 4/4" in caplog.text
+    assert "compile practice done: 4 passes in" in caplog.text and "(+4 with the earlier frame)" in caplog.text
+    # anchor off (release #29 / #33): exactly as before, set_anchor_image never called
+    monkeypatch.delenv("FLUXRT_ANCHOR")
+    s = load(monkeypatch, tmp_path, FLUXRT_COMPILE="1", FLUXRT_CACHE_MASK="seg")
+    proc = _PracticeProc(h=320, w=160)
+    anchors.clear()
+    proc.set_anchor_image = lambda a: anchors.append(a)
+    try:
+        s.compile_warmup(proc, 4, 60.0)
+    finally:
+        proc.stop()
+    assert anchors == [] and len(proc.masks) == 5
+

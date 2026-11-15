@@ -11,6 +11,8 @@ on:
       - feat/fluxrt-fp8
       # The FP4 / tighter-compile test branch (owner, 2026-11-15): its own commit tags only.
       - feat/fluxrt-fp4
+      # FP4 reference + compile practice with the earlier frame (FLUXRT_ANCHOR), for fxreal6: its own commit tags only.
+      - feat/fluxrt-fp4-anchor
     paths:
       - Dockerfile.livecam-fluxrt
       - Dockerfile.livecam

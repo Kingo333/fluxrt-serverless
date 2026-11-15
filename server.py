@@ -760,14 +760,42 @@ def compile_warmup(proc: Any, passes: int, budget_s: float) -> None:
             log.info("warmup: compile practice %d/%d (%d%% changing): 3 frames in %.1f s, slowest %.1f s",
                      i + 1, passes, round(share * 100), secs, slowest)
         done += 1
+    # The earlier frame (FLUXRT_ANCHOR, owner 2026-11-15): with it FluxRT gets a third picture, so every multiply
+    # has more tokens and the compiler meets new sizes. Practise those too, with a stand-in earlier frame, or the
+    # first anchor of a session would stall the shopper's picture while it compiles. Then the anchor is cleared.
+    anchored = 0
+    if ANCHOR and hasattr(proc, "set_anchor_image"):
+        try:
+            proc.set_anchor_image(rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8))
+            for i, share in enumerate(COMPILE_WARMUP_CHANGE[:passes]):
+                left = budget_s - (time.time() - t0)
+                if left <= 5:
+                    log.warning("warmup: compile practice with the earlier frame stopped after %d of %d passes "
+                                "(warm-up time used up)", anchored, passes)
+                    break
+                if manual:
+                    proc.set_mask(_practice_mask(h // 16, w // 16, share))
+                    frame = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+                else:
+                    frame = _changed_frame(base, share, rng)
+                input_t.copy_from(frame)
+                seen, secs, slowest = _wait_frames(proc, 3, min(left, 600.0))
+                log.info("warmup: compile practice with the earlier frame %d/%d (%d%% changing): %d frames in %.1f s, "
+                         "slowest %.1f s", i + 1, passes, round(share * 100), seen, secs, slowest)
+                anchored += 1
+        except Exception as e:  # noqa: BLE001 - practice is optional
+            log.warning("warmup: compile practice with the earlier frame: %s", e)
     try:
+        if anchored or (ANCHOR and hasattr(proc, "set_anchor_image")):
+            proc.set_anchor_image(None)
         if manual:
             proc.set_mask(_practice_mask(h // 16, w // 16, 1.0))
         if ENABLE_REFERENCE_IMAGE:
             proc.set_reference_image(None)
     except Exception as e:  # noqa: BLE001
         log.warning("warmup: compile practice reset: %s", e)
-    log.info("warmup: compile practice done: %d passes in %.0f s", done, time.time() - t0)
+    log.info("warmup: compile practice done: %d passes in %.0f s%s", done, time.time() - t0,
+             f" (+{anchored} with the earlier frame)" if anchored else "")
 
 
 def warmup_blocking() -> None:
