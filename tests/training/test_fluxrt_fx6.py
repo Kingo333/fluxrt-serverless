@@ -681,3 +681,66 @@ esac
 def test_trial_speed_reads_only_the_training_bar():
     text = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
     assert 'startswith("Steps:")' in text and "Caching latents" in text
+
+
+def test_overnight_eval_only_skips_training_and_stops_inside_the_cap(tmp_path):
+    """2026-11-16: evaluate the finished weights again without training again."""
+    import os
+    import subprocess
+    ws = tmp_path / "ws"
+    root = ws / "azyah-vton"
+    out = root / "outputs/fluxrt_lora/fxreal6"
+    out.mkdir(parents=True)
+    (out / "pytorch_lora_weights.safetensors").write_bytes(b"w")
+    (root / "reports").mkdir(parents=True)
+    calls = ws / "calls.txt"
+    (ws / "fx6_train.sh").write_text(f"""#!/usr/bin/env bash
+echo "$AZ_STAGE label=${{AZ_EVAL_LABEL:-}}" >> {calls}
+echo "evaluating weights abcd1234 as fx6s5800_r528 and fx6anchors5800_r528"
+echo "render fx6test/fx6s5800_r528: 24 new clips, 24 in total"; echo "FX6_EVAL_DONE after 90 min"
+""")
+    env = {**os.environ, "AZ_REF": "x", "AZ_SPENT": "34", "AZ_WS": str(ws), "AZ_SKIP_FETCH": "1", "AZ_NO_STOP": "1",
+           "AZ_EVAL_ONLY": "1", "AZ_EVAL_LABEL": "s5800"}
+    r = subprocess.run(["bash", str(ROOT / "training/fluxrt_lora/fx6_overnight.sh")], capture_output=True, text=True,
+                       env=env, timeout=60)
+    text = r.stdout + r.stderr
+    assert r.returncode == 0, text
+    assert calls.read_text().splitlines() == ["eval label=s5800"]          # nothing but the evaluation, label passed on
+    assert "evaluation only" in text and "24 new clips, 24 in total" in text and "evaluating weights" in text
+    limit = int(text.split("evaluation, time limit ")[1].split()[0])
+    assert 20 <= limit <= 150 and limit / 60 * 2.70 <= 45 - 34 - 2 + 0.1   # never past the cap
+    # no weights at all: stop before spending anything
+    (out / "pytorch_lora_weights.safetensors").unlink()
+    r = subprocess.run(["bash", str(ROOT / "training/fluxrt_lora/fx6_overnight.sh")], capture_output=True, text=True,
+                       env=env, timeout=60)
+    assert r.returncode != 0 and "no trained weights" in r.stdout + r.stderr
+
+
+def test_eval_names_its_renders_after_the_weights_and_refuses_a_reused_label(tmp_path):
+    """The renders are cached per model name, so the name must follow the weights (step-1000 videos were scored
+    as step-5800). The naming block of fx6_train.sh is run here on its own."""
+    import subprocess
+    text = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
+    start = text.index('  SUM=$(sha256sum "$FX"')
+    end = text.index('  echo "evaluating weights')
+    block = text[start:end] + 'echo "NAMES $NEW $ANC $MIX"\n'
+    fx = tmp_path / "w.safetensors"
+    res = tmp_path / "results"
+
+    def run(content, label=None):
+        fx.write_bytes(content)
+        env = {"FX": str(fx), "R": str(res), "TAG": "r528", "PATH": "/usr/bin:/bin"}
+        if label:
+            env["AZ_EVAL_LABEL"] = label
+        return subprocess.run(["bash", "-c", block], capture_output=True, text=True, env=env)
+
+    a = run(b"weights-step-1000")
+    b = run(b"weights-step-5800")
+    assert a.returncode == 0 and b.returncode == 0
+    assert a.stdout != b.stdout and "NAMES fx6" in a.stdout                # different weights: different names
+    c = run(b"weights-step-5800", "s5800")
+    assert c.returncode == 0 and "NAMES fx6s5800_r528 fx6anchors5800_r528 fx6b75s5800_r528" in c.stdout
+    assert run(b"weights-step-5800", "s5800").returncode == 0               # same weights, same label: carries on
+    d = run(b"other-weights", "s5800")
+    assert d.returncode != 0 and "STALE_EVAL_LABEL" in d.stdout             # other weights under a used label: refused
+    assert "NO_RENDERS" in text and "in total" in text

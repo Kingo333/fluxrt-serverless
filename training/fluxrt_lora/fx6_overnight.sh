@@ -55,6 +55,9 @@ newest_train_log() { ls -t "$REPORTS"/fluxlora_fxreal6_*.log 2>/dev/null | head 
 say "start: cap \$$CAP, price \$$PRICE/h, already spent \$$SPENT0"
 fetch fx6_train.sh
 RESUME="${AZ_RESUME:-0}"   # 1: the data and a training run exist; carry on training from the newest save
+EVAL_ONLY="${AZ_EVAL_ONLY:-0}"   # 1: the training is done; only the evaluation (step 5), then the Pod stops
+
+if [ "$EVAL_ONLY" != "1" ]; then
 
 # ---- resume: no data build, no trial; the speed comes from the training bar of the earlier run ----------------------
 if [ "$RESUME" = "1" ]; then
@@ -141,13 +144,23 @@ grep -qiE "loss=(nan|inf)" "$TLOG" 2>/dev/null && say "4. WARNING: NaN/inf in th
 ls "$OUT" 2>/dev/null | grep -qE "checkpoint-|pytorch_lora_weights" || fail "training left no save"
 say "4. training finished or stopped at its limit"
 
+fi
+
 # ---- 5. evaluation -----------------------------------------------------------------------------------------------
+if [ "$EVAL_ONLY" = "1" ]; then
+  say "evaluation only: no data build, no trial, no training"
+  HAVE=0
+  for f in "$OUT"/pytorch_lora_weights.safetensors "$OUT"/checkpoint-*/pytorch_lora_weights.safetensors; do
+    [ -f "$f" ] && HAVE=1
+  done
+  [ "$HAVE" = "1" ] || fail "no trained weights in $OUT"
+fi
 EVAL_MIN=$(awk -v l="$(left_dollars)" -v pr="$PRICE" -v m="$MARGIN" 'BEGIN { t = (l - m) / pr * 60; if (t > 150) t = 150; printf "%d", t }')
 [ "$EVAL_MIN" -ge 20 ] || fail "no money left for the evaluation (the trained LoRA is saved; evaluate later)"
 say "5. evaluation, time limit $EVAL_MIN min"
 timeout -s INT "${EVAL_MIN}m" env AZ_REF="$AZ_REF" AZ_STAGE=eval AZ_NO_STOP=1 AZ_PRICE="$PRICE" bash "$WS/fx6_train.sh" \
   > "$WS/fx6_eval.log" 2>&1
-grep -hE "^(render|FACESKIN|LOGO_LEAK|PRIORITY|GATE|HIJAB|STEADY)|_EXIT=|FX6_EVAL_DONE|NO_FX6_LORA|using the newest save" \
+grep -hE "^(render|FACESKIN|LOGO_LEAK|PRIORITY|GATE|HIJAB|STEADY)|_EXIT=|FX6_EVAL_DONE|NO_FX6_LORA|using the newest save|using the final file|evaluating weights|STALE_EVAL_LABEL|NO_RENDERS|FX6_EVAL_NO_RENDERS" \
   "$WS/fx6_eval.log" | cut -c1-400
 if grep -q "FX6_EVAL_DONE" "$WS/fx6_eval.log"; then
   say "5. evaluation done"

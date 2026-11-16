@@ -143,7 +143,23 @@ eval)
   [ -f "$FX" ] || { echo "NO_FX6_LORA: $FX"; exit 1; }
   cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true
   sha256sum "$FX"
-  FAV="fav2_$TAG"; NEW="fx6_$TAG"; MIX="fx6b75_$TAG"; ANC="fx6anchor_$TAG"
+  # The renders are kept per model NAME and an existing render is never made again. So the name must change when
+  # the weights change, or an evaluation silently scores the videos of an older save (2026-11-16: the step-5800
+  # weights were "evaluated" on the step-1000 videos, every render line said "0 new clips"). The name carries a
+  # label: AZ_EVAL_LABEL (e.g. s5800), or by default the first 8 characters of the weights' checksum. A label that
+  # was already used with different weights is refused: nothing is deleted or overwritten.
+  SUM=$(sha256sum "$FX" | cut -c1-64)
+  LABEL=$(printf '%s' "${AZ_EVAL_LABEL:-${SUM:0:8}}" | tr -cd 'A-Za-z0-9')
+  [ -n "$LABEL" ] || { echo "BAD_AZ_EVAL_LABEL"; exit 1; }
+  FAV="fav2_$TAG"; NEW="fx6${LABEL}_$TAG"; MIX="fx6b75${LABEL}_$TAG"; ANC="fx6anchor${LABEL}_$TAG"
+  MARK="$R/.weights_fx6${LABEL}_$TAG"
+  mkdir -p "$R"
+  if [ -f "$MARK" ] && [ "$(cat "$MARK")" != "$SUM" ]; then
+    echo "STALE_EVAL_LABEL: the label $LABEL was used for other weights ($(cut -c1-8 "$MARK")...), these are ${SUM:0:8}...; choose another AZ_EVAL_LABEL"
+    exit 1
+  fi
+  echo "$SUM" > "$MARK"
+  echo "evaluating weights ${SUM:0:8} as $NEW and $ANC"
   # Sets and models are trimmed to keep the scoring inside the budget (the baseline's scoring alone took 66 min for
   # one model): AZ_EVAL_SETS (default the 24 new test clips, the owner's 5 cases, the hijab set, the 10 dresses);
   # AZ_EVAL_BLEND=1 adds the 75% blend back towards favourite #2.
@@ -156,9 +172,13 @@ eval)
     local s="$1" n="$2"; shift 2
     ( cd "$T" && timeout -s INT 40m $G "$@" --name "$n" --clip-list "$E/$s.json" --staging "$S/vivid" --out "$R/$s" --max-items 30 ) \
       > "$E/render_fx6_${s}_$n.log" 2>&1
-    echo "render $s/$n: $(grep -c '"model"' "$E/render_fx6_${s}_$n.log") new clips ($(mins))"
-    grep -iE "error|traceback" "$E/render_fx6_${s}_$n.log" | tail -3; return 0
+    local have; have=$(ls "$R/$s"/*/out_"$n".mp4 2>/dev/null | wc -l)
+    echo "render $s/$n: $(grep -c '"model"' "$E/render_fx6_${s}_$n.log") new clips, $have in total ($(mins))"
+    grep -iE "error|traceback" "$E/render_fx6_${s}_$n.log" | tail -3
+    [ "$have" -gt 0 ] || { echo "NO_RENDERS: $s/$n has no videos; the scores would mean nothing"; RENDER_MISSING=1; }
+    return 0
   }
+  RENDER_MISSING=0
   for s in $SETS; do
     render "$s" "$FAV" --lora "$INIT/pytorch_lora_weights.safetensors"      # kept from the baseline: nothing new to render
     render "$s" "$NEW" --lora "$FX"
@@ -166,6 +186,7 @@ eval)
     render "$s" "$ANC" --lora "$FX" --anchor-after 8 --anchor-every 12
     [ "${AZ_EVAL_BLEND:-0}" = "1" ] && render "$s" "$MIX" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend 0.75
   done
+  [ "$RENDER_MISSING" = "0" ] || { echo "FX6_EVAL_NO_RENDERS: stopped before scoring"; exit 1; }
   # Scoring runs on the CPU, one process per set at the same time (the Pod has many cores; the GPU is free now).
   echo "== scoring: face and skin, background and steadiness, head covering, garment and colour; sets in parallel ($(mins))"
   score_set() {
