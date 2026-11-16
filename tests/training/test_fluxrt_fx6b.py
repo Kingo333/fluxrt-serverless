@@ -169,7 +169,9 @@ def _diskcache_code() -> str:
 
 def test_text_rows_on_disk_give_the_same_tensors_as_in_ram(tmp_path):
     import hashlib
-    import torch
+
+    import pytest
+    torch = pytest.importorskip("torch")
     ns = {"torch": torch, "os": os, "hashlib": hashlib}
     exec(compile(_diskcache_code(), "diskcache", "exec"), ns)
     cache = ns["_AzRowCache"]
@@ -192,12 +194,17 @@ def test_text_rows_on_disk_give_the_same_tensors_as_in_ram(tmp_path):
     assert (tmp_path / "sub" / "text_cache.bin").stat().st_size == disk.nbytes
 
 
-def test_free_ram_reads_the_container_limit_not_only_the_host():
-    import psutil
+def test_free_ram_reads_the_container_limit_not_only_the_host(monkeypatch):
+    import types
+    host = 10 ** 15                                          # a host that claims a petabyte free
+    fake = types.SimpleNamespace(virtual_memory=lambda: types.SimpleNamespace(available=host))
+    monkeypatch.setitem(sys.modules, "psutil", fake)
     ns = {"os": os}
     exec(compile(_diskcache_code().split("class _AzRowCache")[0], "free", "exec"), ns)
     free = ns["_az_free_ram"]()
-    assert 0 < free <= psutil.virtual_memory().available
+    assert 0 <= free <= host
+    if Path("/sys/fs/cgroup/memory.max").exists() and Path("/sys/fs/cgroup/memory.max").read_text().strip() != "max":
+        assert free < host                                   # the container limit wins over the host's figure
     patch = (ROOT / "training/patches/flux2-klein-diskcache.patch").read_text()
     assert "inactive_file" in patch and "_az_free = _az_free_ram()" in patch and 'os.environ.get("AZ_TEXT_CACHE_DIR")' in patch
 
