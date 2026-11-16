@@ -21,6 +21,11 @@ it, else everything but the photo's backdrop. Frames where the camera shows almo
                             garment on the person (higher)
   CONSISTENCY  jitter       garment shape change between frames minus the person's own (lower: no jumps)
                flicker_de   colour change of the garment between frames (lower: no flicker)
+  LENGTH       length_err   dresses only (owner, 2026-11-16: long dresses came out shorter): |log| of the ratio of
+                            the dress's length-to-waist-width proportion on the person to the same proportion on the
+                            photo (lower; 0 = same length). length_ratio keeps the direction (under 1 = shorter).
+                            Measured only on frames where the whole dress is in the picture (hem above the frame's
+                            bottom edge, top below its top edge); a clip with fewer than 3 such frames has none.
 
 Then a scorecard: per priority, on how many clips each model beats --baseline.
 """
@@ -35,10 +40,13 @@ import numpy as np
 
 BACKGROUND, HAIR, BODY_SKIN, FACE, CLOTHES, OTHERS = 0, 1, 2, 3, 4, 5
 MIN_PERSON = 0.08
-EPS = {"colour_de": 0.5, "likeness": 0.005, "fabric": 0.02, "follow_px": 0.2, "jitter": 0.002, "flicker_de": 0.1}
-LOWER_BETTER = {"colour_de": True, "likeness": False, "fabric": True, "follow_px": True, "jitter": True, "flicker_de": True}
+EPS = {"colour_de": 0.5, "likeness": 0.005, "fabric": 0.02, "follow_px": 0.2, "jitter": 0.002, "flicker_de": 0.1,
+       "length_err": 0.03}
+LOWER_BETTER = {"colour_de": True, "likeness": False, "fabric": True, "follow_px": True, "jitter": True, "flicker_de": True,
+                "length_err": True}
 PRIORITIES = (("COLOUR", "colour_de"), ("DETAIL", "likeness"), ("FABRIC", "fabric"), ("MOVEMENT", "follow_px"),
-              ("CONSISTENCY", "jitter"), ("CONSISTENCY", "flicker_de"))
+              ("CONSISTENCY", "jitter"), ("CONSISTENCY", "flicker_de"), ("LENGTH", "length_err"))
+MIN_LENGTH_FRAMES = 3
 
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
@@ -81,6 +89,61 @@ def iou(a: np.ndarray, b: np.ndarray) -> float:
 def centroid(m: np.ndarray):
     ys, xs = np.nonzero(m)
     return (float(xs.mean()), float(ys.mean())) if len(xs) else None
+
+
+def main_part(mask: np.ndarray) -> np.ndarray:
+    """The largest connected piece of a mask (4-neighbour): the dress without the shoes or a bag below it."""
+    if not mask.any():
+        return mask
+    try:
+        from scipy import ndimage
+        lab, n = ndimage.label(mask)
+        if n <= 1:
+            return mask
+        sizes = np.bincount(lab.ravel())[1:]
+        return lab == (int(np.argmax(sizes)) + 1)
+    except ImportError:
+        from collections import deque
+        h, w = mask.shape
+        seen = np.zeros_like(mask, dtype=bool)
+        best, best_px = None, 0
+        for y0, x0 in zip(*np.nonzero(mask)):
+            if seen[y0, x0]:
+                continue
+            q, px = deque([(y0, x0)]), []
+            seen[y0, x0] = True
+            while q:
+                y, x = q.popleft()
+                px.append((y, x))
+                for yy, xx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= yy < h and 0 <= xx < w and mask[yy, xx] and not seen[yy, xx]:
+                        seen[yy, xx] = True
+                        q.append((yy, xx))
+            if len(px) > best_px:
+                best, best_px = px, len(px)
+        out = np.zeros_like(mask, dtype=bool)
+        ys, xs = zip(*best)
+        out[list(ys), list(xs)] = True
+        return out
+
+
+def length_proportion(mask: np.ndarray, edge: int | None = None):
+    """A dress's length over its waist width (the narrowest row between 15% and 55% of its height), or None when
+    the dress touches the picture's top or bottom edge (cut off: its length cannot be read) or is too small."""
+    m = main_part(np.asarray(mask, bool))
+    rows = np.nonzero(m.any(axis=1))[0]
+    if len(rows) < 20:
+        return None
+    top, bottom = int(rows.min()), int(rows.max())
+    edge = max(3, round(0.01 * m.shape[0])) if edge is None else edge
+    if top < edge or bottom > m.shape[0] - 1 - edge:
+        return None
+    h = bottom - top + 1
+    widths = m[top + int(0.15 * h): top + int(0.55 * h) + 1].sum(axis=1)
+    widths = widths[widths > 0]
+    if not len(widths):
+        return None
+    return h / float(widths.min())
 
 
 def band_mask(clothes: np.ndarray, person: np.ndarray, category) -> np.ndarray:
@@ -207,6 +270,13 @@ def clip_metrics(cam_frames, out_frames, cam_cats, out_cats, ref_rgb, ref_mask, 
         res["jitter"] = round(float(np.mean(jit) - np.mean(pj)), 4)
     if flick:
         res["flicker_de"] = round(float(np.mean(flick)), 3)
+    if str(category or "").lower().startswith("dress"):
+        ref_p = length_proportion(ref_mask)
+        props = [p for p in (length_proportion(garm[t]) for t in valid) if p is not None]
+        if ref_p and len(props) >= MIN_LENGTH_FRAMES:
+            ratio = float(np.median(props)) / ref_p
+            res["length_ratio"] = round(ratio, 4)
+            res["length_err"] = round(abs(float(np.log(ratio))), 4)
     if dino is not None:
         picks = [valid[int(i)] for i in np.linspace(0, len(valid) - 1, min(n_dino, len(valid)))]
         ref_cut = cutout(ref_rgb, ref_mask)
@@ -347,7 +417,7 @@ def score_stage(root: Path, models: list[str], baseline: str, out: Path | None, 
     result = {"baseline": baseline, "models": models, "scorecard": card, "items": per_item}
     (json_out or root / "garment_report.json").write_text(json.dumps(result, indent=1))
     if out:
-        keys = ("colour_de", "likeness", "fabric", "follow_px", "on_body", "jitter", "flicker_de")
+        keys = ("colour_de", "likeness", "fabric", "follow_px", "on_body", "jitter", "flicker_de", "length_ratio")
         lines = ["| clip | model | " + " | ".join(keys) + " |", "|---|---|" + "---|" * len(keys)]
         for item, ms in per_item.items():
             for m, r in ms.items():
