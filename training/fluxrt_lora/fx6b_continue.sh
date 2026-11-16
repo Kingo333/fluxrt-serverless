@@ -2,6 +2,11 @@
 # fxreal6b (owner, 2026-11-16): carry on training fxreal6 from its step-5800 weights at half the learning rate, check
 # every save against favourite #2 while the training goes on, and keep the BEST save, not the last one.
 #
+#   0. blend test FIRST (owner, 2026-11-16): step 5800 mixed with favourite #2 at AZ_BLENDS percent of the new
+#      weights (default "75 50"), each merged into one LoRA file (fluxrt_lora.merge_lora: exact, loads like any
+#      LoRA), rendered on the three test sets before the training starts and scored like the saves. If the money
+#      runs short, the blend test still finishes first; the training then gets what is left.
+#
 #   1. start: the step-5800 weights (sha 0ab25649...) are copied to outputs/fluxrt_lora/fxreal6_s5800 and the new
 #      run fxreal6b starts from them (fxreal6 itself is never touched); same data as fxreal6 (linked, not copied),
 #      same recipe, learning rate 2.5e-5 (fxreal6: 5e-5), AZ_MAX_STEPS more steps (default 2000), a save every 500.
@@ -33,7 +38,8 @@
 set -uo pipefail
 AZ_REF="${AZ_REF:?set AZ_REF to the pinned commit}"
 SPENT0="${AZ_SPENT:?set AZ_SPENT to the dollars already spent on training (e.g. 37.08)}"
-export AZ_REF AZ_ROOT=/workspace/azyah-vton
+AZ_ROOT="${AZ_ROOT:-/workspace/azyah-vton}"   # the volume; another root only for tests
+export AZ_REF AZ_ROOT
 export HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1
 CAP="${AZ_CAP:-55}"
 PRICE="${AZ_PRICE:-2.79}"
@@ -230,12 +236,12 @@ score_set() {  # set, name, dest
   [ -f "$d/garment.json" ] && [ -f "$d/face_skin.json" ] && [ -f "$d/preserve_check.json" ]
 }
 # A save to check: EV/<id>/meta.json. Step 5800 itself is "s0" (its videos exist already).
-register() {  # id, step, name, weights
+register() {  # id, step, name, weights, kind (start/blend/save), label
   local id="$1"
   [ -f "$EV/$id/meta.json" ] && return 0
   mkdir -p "$EV/$id"
-  "$PY" -c "import json, sys; json.dump({'step': int(sys.argv[1]), 'name': sys.argv[2], 'weights': sys.argv[3], 'sha256': sys.argv[4]}, open(sys.argv[5], 'w'))" \
-    "$2" "$3" "$4" "$(sha256sum "$4" | cut -c1-64)" "$EV/$id/meta.json"
+  "$PY" -c "import json, sys; json.dump({'step': int(sys.argv[1]), 'name': sys.argv[2], 'weights': sys.argv[3], 'sha256': sys.argv[4], 'kind': sys.argv[6], 'label': sys.argv[7]}, open(sys.argv[5], 'w'))" \
+    "$2" "$3" "$4" "$(sha256sum "$4" | cut -c1-64)" "$EV/$id/meta.json" "${5:-save}" "${6:-step $2}"
 }
 meta() { "$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$EV/$1/meta.json" "$2"; }
 register_saves() {  # every finished checkpoint of this run (its file unchanged for a minute)
@@ -246,7 +252,7 @@ register_saves() {  # every finished checkpoint of this run (its file unchanged 
     sum=$(sha256sum "$f" | cut -c1-8)
     [ -f "$EV/s${n}x$sum/meta.json" ] && continue
     cp "$f" "$SAVES/step${n}_$sum.safetensors"
-    register "s${n}x$sum" "$n" "fx6b${n}x${sum}_$TAG" "$SAVES/step${n}_$sum.safetensors"
+    register "s${n}x$sum" "$n" "fx6b${n}x${sum}_$TAG" "$SAVES/step${n}_$sum.safetensors" save "fxreal6b step $n"
     say "save at step $n registered for checking (s${n}x$sum)"
   done
 }
@@ -297,7 +303,7 @@ score_loop() {
       if [ "$ok" = 1 ]; then
         touch "$EV/$id/.scored"
         ( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" ) > "$EV/pick.log" 2>&1
-        grep -E "^SAVE step $(meta "$id" step) " "$EV/pick.log" | sed 's/^/FX6B check: /'
+        grep -F "($(meta "$id" name))" "$EV/pick.log" | grep "^SAVE" | sed 's/^/FX6B check: /'
       else
         say "SCORING_FAILED for $id (see $EV/$id/*/*.log): will try again"
         sleep 60
@@ -312,8 +318,29 @@ best_step() {  # the best checked save's step (0 = step 5800 itself), empty when
   "$PY" -c "import json, sys; b = json.load(open(sys.argv[1])).get('best'); print('' if not b else b['step'])" "$EV/best.json" 2>/dev/null
 }
 
-register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors"
+register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors" start "fxreal6 step 5800"
 rm -f "$EV/.training_done" "$EV/.waiting_note"
+
+# ---- 2. the blend test first: step 5800 mixed with favourite #2, one merged file per percentage
+BLENDS="${AZ_BLENDS-75 50}"
+for b in $BLENDS; do
+  case "$b" in [1-9][0-9]) ;; *) say "BAD_AZ_BLENDS: $b (two-digit percentages, 10 to 99): skipped"; continue;; esac
+  bdir="$OUT/blends/b$b"
+  if [ ! -f "$bdir/pytorch_lora_weights.safetensors" ]; then
+    ( cd "$T" && "$PY" -m fluxrt_lora.merge_lora --inputs "$START_DIR/pytorch_lora_weights.safetensors" \
+        "$INIT/pytorch_lora_weights.safetensors" --weights "0.$b" "0.$(( 100 - b ))" --scale 1.0 --out "$bdir" \
+        --selection-from "$SRC_OUT" --note "fxreal6 step 5800 at $b% + favourite #2 at $(( 100 - b ))%" ) > "$EV/merge_b$b.log" 2>&1 \
+      || { say "BLEND_MERGE_FAILED for $b% (see $EV/merge_b$b.log): left out"; continue; }
+  fi
+  bsum=$(sha256sum "$bdir/pytorch_lora_weights.safetensors" | cut -c1-8)
+  register "b${b}x$bsum" "-$b" "fx6blend${b}x${bsum}_$TAG" "$bdir/pytorch_lora_weights.safetensors" blend \
+    "blend: step 5800 at $b% + favourite #2"
+done
+if [ -n "$(pending .rendered)" ]; then
+  say "2. blend test: rendering $(pending .rendered | tr '\n' ' ')before the training (scored beside it)"
+  touch "$EV/.training_done"; render_loop; rm -f "$EV/.training_done"
+  say "2. blend renders done"
+fi
 
 # ---- 3. a restart: check what an earlier run left unchecked, then carry on from the best save
 if ls -d "$OUT"/checkpoint-* >/dev/null 2>&1; then
@@ -397,13 +424,24 @@ else
   mkdir -p "$OUT/best"
   cp "$BW" "$OUT/best/pytorch_lora_weights.safetensors" && cp "$EV/best.json" "$OUT/best/best.json"
   cp -f "$DATA_SRC/selection.json" "$OUT/best/selection.json" 2>/dev/null || true
-  NOTE=""; [ "$B" = 0 ] && NOTE=" = fxreal6 step 5800 itself: no new save beat it"
-  say "BEST_SAVE step $B$NOTE -> $OUT/best/pytorch_lora_weights.safetensors $(sha256sum "$OUT/best/pytorch_lora_weights.safetensors" | cut -c1-16)..."
+  BL=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['best'].get('label') or 'step ' + str(json.load(open(sys.argv[1]))['best']['step']))" "$EV/best.json")
+  say "BEST_SAVE $BL -> $OUT/best/pytorch_lora_weights.safetensors $(sha256sum "$OUT/best/pytorch_lora_weights.safetensors" | cut -c1-16)..."
+  grep -E "^VERDICT" "$EV/pick.log" | sed 's/^/FX6B /'
+  # the best of each kind, for the videos
+  read -r BB_N BB_L BS_N BS_L < <("$PY" -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+def top(kind):
+    xs = [s for s in d['saves'] if s.get('kind') == kind and s.get('score') is not None]
+    xs.sort(key=lambda s: (s['gate_sets'], s['score']), reverse=True)
+    return (xs[0]['name'], (xs[0].get('label') or '').replace(' ', '_')) if xs else ('-', '-')
+print(*top('blend'), *top('save'))" "$EV/best.json")
   if [ "$(left_min)" -gt 4 ]; then
     for s in cases5 dress10; do
       case " $SETS " in *" $s "*) ;; *) continue;; esac
       PANELS=("$FAV=favourite #2 (today)" "$S5800=fxreal6 step 5800")
-      [ "$BN" != "$S5800" ] && PANELS+=("$BN=fxreal6b step $B (best)")
+      [ "$BB_N" != "-" ] && PANELS+=("$BB_N=${BB_L//_/ } (best blend)")
+      [ "$BS_N" != "-" ] && PANELS+=("$BS_N=${BS_L//_/ } (best save)")
       ( cd "$T" && timeout 10m "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
           --panels "${PANELS[@]}" ) > "$EV/video_$s.log" 2>&1 || true
       [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$EV/fx6b_${s}_best.mp4" && say "video: $EV/fx6b_${s}_best.mp4"

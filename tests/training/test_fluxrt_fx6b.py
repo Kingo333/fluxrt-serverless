@@ -155,7 +155,7 @@ def test_fx6b_money_limit_is_the_smaller_of_cap_and_balance():
 
 def test_fx6b_refuses_to_start_without_enough_money(tmp_path):
     env = {"PATH": os.environ["PATH"], "AZ_REF": "abc", "AZ_SPENT": "37.08", "AZ_BALANCE": "3", "AZ_NO_STOP": "1",
-           "HOME": str(tmp_path)}
+           "HOME": str(tmp_path), "AZ_ROOT": str(tmp_path / "azyah-vton")}
     r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode != 0 and "top up" in r.stdout and "STOPPED" in r.stdout
 
@@ -242,3 +242,29 @@ def test_text_cache_size_uses_distinct_captions_and_a_volume_hint():
     sh = SCRIPT.read_text()
     assert "column('caption')" in sh and 'NEED_LIKELY=$(( DISTINCT * 9 / 1000 + 5 ))' in sh
     assert 'for need in "$NEED_MAX" "$NEED_LIKELY"; do' in sh and "AZ_VOLUME_FREE_GB" in sh
+
+
+# ---------------------------------------------------------------- blend test first (owner, 2026-11-16)
+def test_blends_are_merged_files_checked_before_the_training_and_ranked_with_the_saves(tmp_path, capsys):
+    sh = SCRIPT.read_text()
+    blend, train = sh.index("# ---- 2. the blend test first"), sh.index("# ---- 4. training")
+    assert blend < sh.index("# ---- 3. a restart") < train
+    for s in ('BLENDS="${AZ_BLENDS-75 50}"', "fluxrt_lora.merge_lora", '--weights "0.$b" "0.$(( 100 - b ))" --scale 1.0',
+              'touch "$EV/.training_done"; render_loop; rm -f "$EV/.training_done"', '"fx6blend${b}x${bsum}_$TAG"',
+              "(best blend)", "(best save)", "^VERDICT"):
+        assert s in sh, s
+    from fluxrt_lora.pick_best_save import main
+    ev = tmp_path / "fx6b"
+    _save(ev, "s0", 0, "fx6s5800", {"cases5": (16.0, False), "fx6test": (13.0, False), "dress10": (10.0, False)})
+    _save(ev, "b75", -75, "fx6blend75", {"cases5": (11.0, True), "fx6test": (11.5, True), "dress10": (10.5, True)})
+    for d, kind, label in (("s0", "start", "fxreal6 step 5800"), ("b75", "blend", "blend 75%")):
+        m = json.loads((ev / d / "meta.json").read_text()); m.update(kind=kind, label=label)
+        (ev / d / "meta.json").write_text(json.dumps(m))
+    r = main([str(ev), "--baseline", "fav2"])
+    out = capsys.readouterr().out
+    assert r["best"]["kind"] == "blend" and "VERDICT blend 75% beats favourite #2" in out and "SAVE blend 75% (fx6blend75)" in out
+    m = json.loads((ev / "b75" / "meta.json").read_text()); m["name"] = "fx6blend75"
+    _save(ev, "s500", 500, "fx6b500", {"cases5": (13.0, False), "fx6test": (12.5, False), "dress10": (12.5, False)})
+    (ev / "b75" / ".scored").unlink()                     # only weaker candidates left: keep favourite #2
+    main([str(ev), "--baseline", "fav2"])
+    assert "VERDICT nothing beats favourite #2 on every set: keep favourite #2 live" in capsys.readouterr().out

@@ -109,6 +109,7 @@ def judge(root: Path, base: str, weights: dict) -> list[dict]:
             gates += nums["gate"] is True
             face_gates += nums["face_gate"] is True
         rows.append({"save": d.name, "step": meta.get("step"), "name": name, "weights": meta.get("weights"),
+                     "kind": meta.get("kind", "save"), "label": meta.get("label") or f"step {meta.get('step')}",
                      "sha256": meta.get("sha256"), "score": round(total / wsum, 4) if wsum else None,
                      "gate_sets": gates, "face_gate_sets": face_gates, "sets": len(per_set), "per_set": per_set})
     return rows
@@ -133,12 +134,17 @@ def main(argv=None) -> dict:
                          + (f", colour {v['colour'][0]} vs {v['colour'][1]}" if v["colour"] and None not in v["colour"] else "")
                          + (f", length {v['length_err'][0]} vs {v['length_err'][1]}" if v["length_err"] and None not in v["length_err"] else "")
                          for s, v in r["per_set"].items())
-        print(f"SAVE step {r['step']} ({r['name']}): score {fmt(r['score'])} vs favourite #2; GATE {r['gate_sets']}/{r['sets']} sets; {sets}")
+        print(f"SAVE {r['label']} ({r['name']}): score {fmt(r['score'])} vs favourite #2; GATE {r['gate_sets']}/{r['sets']} sets; {sets}")
     best = max(rows, key=rank_key) if rows else None
     result = {"baseline": a.baseline, "weights": weights, "saves": rows, "best": best}
     (root / "best.json").write_text(json.dumps(result, indent=1))
     if best:
-        print(f"BEST step {best['step']} ({best['name']}): score {fmt(best['score'])}, GATE {best['gate_sets']}/{best['sets']} sets"
+        full = best["gate_sets"] == best["sets"] and (best["score"] or 0) > 0
+        print("VERDICT " + (f"{best['label']} beats favourite #2 (GATE on every set and a better score): a candidate for live"
+                            if full else
+                            f"nothing beats favourite #2 on every set: keep favourite #2 live (closest: {best['label']}, "
+                            f"score {fmt(best['score'])}, GATE {best['gate_sets']}/{best['sets']} sets)"))
+        print(f"BEST {best['label']} ({best['name']}): score {fmt(best['score'])}, GATE {best['gate_sets']}/{best['sets']} sets"
               + ("; beats favourite #2 on the weighted score" if (best["score"] or 0) > 0 else "; does NOT beat favourite #2 on the weighted score"))
     else:
         print("BEST none: no save has been scored yet")
