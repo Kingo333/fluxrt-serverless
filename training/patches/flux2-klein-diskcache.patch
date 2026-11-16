@@ -1,0 +1,461 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index b8f0ab5..c001370 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -1,80 +1,81 @@
+ #!/usr/bin/env python
+ # coding=utf-8
+ # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+ #
+ #     http://www.apache.org/licenses/LICENSE-2.0
+ #
+ # Unless required by applicable law or agreed to in writing, software
+ # distributed under the License is distributed on an "AS IS" BASIS,
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ # /// script
+ # dependencies = [
+ #     "diffusers @ git+https://github.com/huggingface/diffusers.git",
+ #     "torch>=2.0.0",
+ #     "accelerate>=0.31.0",
+ #     "transformers>=4.41.2",
+ #     "ftfy",
+ #     "tensorboard",
+ #     "Jinja2",
+ #     "peft>=0.11.1",
+ #     "sentencepiece",
+ #     "torchvision",
+ #     "datasets",
+ #     "bitsandbytes",
+ #     "prodigyopt",
+ # ]
+ # ///
+ 
+ import argparse
++import hashlib
+ import copy
+ import itertools
+ import json
+ import logging
+ import math
+ import os
+ import random
+ import shutil
+ from contextlib import nullcontext
+ from pathlib import Path
+ from typing import Any
+ 
+ import numpy as np
+ import torch
+ import transformers
+ from accelerate import Accelerator
+ from accelerate.logging import get_logger
+ from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+ from huggingface_hub import create_repo, upload_folder
+ from peft import LoraConfig, prepare_model_for_kbit_training, set_peft_model_state_dict
+ from peft.utils import get_peft_model_state_dict
+ from PIL import Image
+ from PIL.ImageOps import exif_transpose
+ from torch.utils.data import Dataset
+ from torch.utils.data.sampler import BatchSampler
+ from torchvision import transforms
+ from torchvision.transforms import functional as TF
+ from tqdm.auto import tqdm
+ from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
+ 
+ import diffusers
+ from diffusers import (
+     AutoencoderKLFlux2,
+     BitsAndBytesConfig,
+     FlowMatchEulerDiscreteScheduler,
+     Flux2KleinPipeline,
+     Flux2Transformer2DModel,
+ )
+ from diffusers.optimization import get_scheduler
+ from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
+ from diffusers.training_utils import (
+     _collate_lora_metadata,
+     _to_cpu_contiguous,
+     cast_training_params,
+     compute_density_for_timestep_sampling,
+@@ -1144,119 +1145,182 @@ class DreamBoothDataset(Dataset):
+ _AZ_REF_SIZES = None
+ _AZ_REF_RNG = random.Random(0)
+ 
+ 
+ def _azyah_parse_ref_sizes(spec):
+     sizes = []
+     for part in str(spec).split(","):
+         part = part.strip()
+         if not part:
+             continue
+         size, _, weight = part.partition(":")
+         w, h = (int(v) for v in size.lower().split("x"))
+         if w % 16 or h % 16:  # the FluxRT worker rounds FLUXRT_REF_WIDTH/HEIGHT to multiples of 16
+             raise ValueError(f"--cond_2_sizes: {size} is not a multiple of 16")
+         if float(weight or 1) <= 0:
+             raise ValueError(f"--cond_2_sizes: weight of {size} must be positive")
+         sizes.append((w, h, float(weight or 1)))
+     if not sizes:
+         raise ValueError("--cond_2_sizes is empty")
+     return sizes
+ 
+ 
+ def _azyah_pick_ref_size():
+     total = sum(wt for _, _, wt in _AZ_REF_SIZES)
+     r = _AZ_REF_RNG.uniform(0, total)
+     for w, h, wt in _AZ_REF_SIZES:
+         r -= wt
+         if r <= 0:
+             return w, h
+     return _AZ_REF_SIZES[-1][0], _AZ_REF_SIZES[-1][1]
+ 
+ 
+ class _AzCpuLatent:
+     """Azyah (32 GB GPUs): a cached VAE latent kept in CPU RAM. Only .mode() is kept (the latent's mean, the one value
+     the training loop reads) and it is moved to the GPU when a step reads it: the same numbers as keeping the
+     latent_dist on the GPU, a quarter of the memory, and none of it on the GPU."""
+ 
+     def __init__(self, dist, device):
+         self.value = dist.mode().detach().to("cpu").contiguous()
+         self.device = device
+ 
+     def mode(self):
+         return self.value.to(self.device, non_blocking=True)
+ 
+ 
++def _az_free_ram():
++    """CPU RAM really free for this process: the smaller of what the machine reports and what the container's
++    memory limit leaves (cgroup v2 or v1). psutil alone reports the whole host, so on a 94 GB Pod of a 282 GB
++    machine the fail-fast check below never fired (2026-11-16: the Pod was killed instead)."""
++    import psutil
++    free = psutil.virtual_memory().available
++    for limit_f, used_f, stat_f, key in (
++            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
++            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
++             "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")):
++        try:
++            limit = open(limit_f).read().strip()
++            if limit == "max":
++                continue
++            limit, used = int(limit), int(open(used_f).read().strip())
++            # file pages the kernel can drop (the disk text cache, the dataset) are not "used": the working set
++            stat = dict(line.split() for line in open(stat_f) if len(line.split()) == 2)
++            used -= int(stat.get(key, 0))
++            if 0 < limit < (1 << 60):
++                free = min(free, max(0, limit - used))
++            break
++        except (OSError, ValueError):
++            continue
++    return free
++
++
+ class _AzRowCache:
+     """Azyah (32 GB GPUs): per-step text embeddings kept in CPU RAM and moved to the GPU when a step reads them
+     (~8 MB per sample, ~27 GB for a 3,372-sample run, used to sit on the GPU while caching). Rows are kept once per
+     caption and shared only when bit-for-bit equal to a row already kept, so every step gets exactly the tensor it
+     had before."""
+ 
+-    def __init__(self, device):
++    def __init__(self, device, path=None):
+         self.device = device
+         self.rows = {}
+         self.steps = []
+         self.nbytes = 0
++        # Azyah (2026-11-16, 94 GB Pods): with a path, the rows live in one file on disk instead of CPU RAM (~60 GB
++        # of text rows for fxreal6). The exact bytes are written and read back, so every step gets the same tensor.
++        self.path = path
++        self.ram_nbytes = 0
++        self._file = None
++        if path:
++            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++            self._file = open(path, "w+b")
++            self._file.truncate(0)
++            self._shape = self._dtype = None
++
++    def _keep(self, row):
++        if self._file is None:
++            same = row.clone()
++            self.ram_nbytes += same.numel() * same.element_size()
++            return same
++        if self._shape is None:
++            self._shape, self._dtype = tuple(row.shape), row.dtype
++        assert tuple(row.shape) == self._shape and row.dtype == self._dtype, "text rows of different shapes"
++        raw = row.contiguous().view(torch.uint8).numpy().tobytes()
++        off = self._file.seek(0, 2)
++        self._file.write(raw)
++        return (off, len(raw), hashlib.blake2b(raw, digest_size=16).digest())
++
++    def _same(self, kept, row):
++        if self._file is None:
++            return torch.equal(kept, row)
++        return kept[2] == hashlib.blake2b(row.contiguous().view(torch.uint8).numpy().tobytes(), digest_size=16).digest()
++
++    def _load(self, kept):
++        if self._file is None:
++            return kept
++        off, n, _ = kept
++        raw = bytearray(os.pread(self._file.fileno(), n, off))
++        return torch.frombuffer(raw, dtype=torch.uint8).view(self._dtype).reshape(self._shape)
+ 
+     def add(self, prompts, batch_tensor):
+         picked = []
+         for prompt, row in zip(prompts, batch_tensor.detach().to("cpu").unbind(0)):
+             kept = self.rows.setdefault(prompt, [])
+-            same = next((r for r in kept if torch.equal(r, row)), None)
++            same = next((r for r in kept if self._same(r, row)), None)
+             if same is None:
+-                same = row.clone()
++                same = self._keep(row)
+                 kept.append(same)
+-                self.nbytes += same.numel() * same.element_size()
++                self.nbytes += row.numel() * row.element_size()
+             picked.append(same)
+         self.steps.append(picked)
+ 
+     def repeat(self, step):
+         self.steps.append(self.steps[step])
+ 
+     def __getitem__(self, step):
+-        return torch.stack(self.steps[step]).to(self.device, non_blocking=True)
++        if self._file is not None:
++            self._file.flush()
++        return torch.stack([self._load(r) for r in self.steps[step]]).to(self.device, non_blocking=True)
+ 
+     def __len__(self):
+         return len(self.steps)
+ 
+     def distinct(self):
+         return sum(len(v) for v in self.rows.values())
+ 
+ 
+ def _azyah_pad_to(image, width, height):
+     """Fit inside width x height and pad with white (no stretch, no crop, no flip)."""
+     image = exif_transpose(image)
+     if image.mode != "RGB":
+         image = image.convert("RGB")
+     scale = min(width / image.width, height / image.height)
+     w, h = max(1, round(image.width * scale)), max(1, round(image.height * scale))
+     image = image.resize((w, h), Image.LANCZOS)
+     canvas = Image.new("RGB", (width, height), (255, 255, 255))
+     canvas.paste(image, ((width - w) // 2, (height - h) // 2))
+     return TF.normalize(TF.to_tensor(canvas), [0.5], [0.5])
+ 
+ 
+ # Azyah fxreal6: the earlier frame ("anchor"): the same size and framing as the answer, used per batch.
+ _AZ_COND3_PROB = 1.0
+ _AZ_COND3_RNG = random.Random(6)
+ _AZ_COND3_COUNTS = {"with": 0, "without": 0}
+ 
+ 
+ def _azyah_anchor_tensor(image, width, height):
+     """The anchor picture as the trainer's tensors: RGB, resized to the answer's size (it was stored at that size)."""
+     image = exif_transpose(image)
+     if image.mode != "RGB":
+         image = image.convert("RGB")
+     if image.size != (width, height):
+         image = image.resize((width, height), Image.BILINEAR)
+     return TF.normalize(TF.to_tensor(image), [0.5], [0.5])
+ 
+ 
+ def _azyah_use_anchor(examples):
+     """A batch uses its anchors only when every row has one (the tokens are concatenated per batch), and then with
+     probability --cond_3_prob."""
+     if not examples or not all("cond_images_3" in e for e in examples):
+         return False
+     return _AZ_COND3_RNG.random() < _AZ_COND3_PROB
+ 
+ 
+@@ -1839,177 +1903,181 @@ def main(args):
+     # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
+     # the redundant encoding.
+     if not train_dataset.custom_instance_prompts:
+         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+             instance_prompt_hidden_states, instance_text_ids = compute_text_embeddings(
+                 args.instance_prompt, text_encoding_pipeline
+             )
+ 
+     if args.validation_prompt is not None:
+         validation_image = load_image(args.validation_image).convert("RGB")
+         validation_kwargs = {"image": validation_image}
+         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+             validation_kwargs["prompt_embeds"], _text_ids = compute_text_embeddings(
+                 args.validation_prompt, text_encoding_pipeline
+             )
+             validation_kwargs["negative_prompt_embeds"], _text_ids = compute_text_embeddings(
+                 "", text_encoding_pipeline
+             )
+ 
+     # Init FSDP for text encoder
+     if args.fsdp_text_encoder:
+         fsdp_kwargs = get_fsdp_kwargs_from_accelerator(accelerator)
+         text_encoder_fsdp = wrap_with_fsdp(
+             model=text_encoding_pipeline.text_encoder,
+             device=accelerator.device,
+             offload=args.offload,
+             limit_all_gathers=True,
+             use_orig_params=True,
+             fsdp_kwargs=fsdp_kwargs,
+         )
+ 
+         text_encoding_pipeline.text_encoder = text_encoder_fsdp
+         dist.barrier()
+ 
+     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
+     # pack the statically computed variables appropriately here. This is so that we don't
+     # have to pass them to the dataloader.
+     if not train_dataset.custom_instance_prompts:
+         prompt_embeds = instance_prompt_hidden_states
+         text_ids = instance_text_ids
+ 
+     # if cache_latents is set to True, we encode images to latents and store them.
+     # Similar to pre-encoding in the case of a single instance prompt, if custom prompts are provided
+     # we encode them in advance as well.
+     if precompute_latents:
+-        prompt_embeds_cache = _AzRowCache(accelerator.device)  # Azyah: CPU RAM, see _AzRowCache
++        _az_text_dir = os.environ.get("AZ_TEXT_CACHE_DIR")  # Azyah: text rows on disk when set (see _AzRowCache)
++        prompt_embeds_cache = _AzRowCache(
++            accelerator.device, os.path.join(_az_text_dir, "text_cache.bin") if _az_text_dir else None)
++        if _az_text_dir:
++            print(f"TEXT_CACHE_DISK {os.path.join(_az_text_dir, 'text_cache.bin')}", flush=True)
+         text_ids_cache = _AzRowCache(accelerator.device)
+         latents_cache = []
+         cond_latents_cache = []
+         cond_2_latents_cache = []
+         cond_3_latents_cache = []  # Azyah fxreal6: one entry per batch, None when that batch has no anchor
+         loss_mask_cache = []
+         pair_cache = []
+         _azyah_prompt_memo = {}
+         _az_ref_size_counts = {}
+         for batch in tqdm(train_dataloader, desc="Caching latents"):
+             with torch.no_grad():
+                 if args.cache_latents:
+                     with offload_models(vae, device=accelerator.device, offload=args.offload):
+                         batch["pixel_values"] = batch["pixel_values"].to(
+                             accelerator.device, non_blocking=True, dtype=vae.dtype
+                         )
+                         latents_cache.append(_AzCpuLatent(vae.encode(batch["pixel_values"]).latent_dist, accelerator.device))
+                         batch["cond_pixel_values"] = batch["cond_pixel_values"].to(
+                             accelerator.device, non_blocking=True, dtype=vae.dtype
+                         )
+                         cond_latents_cache.append(
+                             _AzCpuLatent(vae.encode(batch["cond_pixel_values"]).latent_dist, accelerator.device)
+                         )
+                         if "cond_2_pixel_values" in batch:
+                             batch["cond_2_pixel_values"] = batch["cond_2_pixel_values"].to(
+                                 accelerator.device, non_blocking=True, dtype=vae.dtype
+                             )
+                             cond_2_latents_cache.append(
+                                 _AzCpuLatent(vae.encode(batch["cond_2_pixel_values"]).latent_dist, accelerator.device)
+                             )
+                         if "cond_3_pixel_values" in batch:
+                             batch["cond_3_pixel_values"] = batch["cond_3_pixel_values"].to(
+                                 accelerator.device, non_blocking=True, dtype=vae.dtype
+                             )
+                             cond_3_latents_cache.append(
+                                 _AzCpuLatent(vae.encode(batch["cond_3_pixel_values"]).latent_dist, accelerator.device)
+                             )
+                         else:
+                             cond_3_latents_cache.append(None)
+                         _AZ_COND3_COUNTS["with" if "cond_3_pixel_values" in batch else "without"] += 1
+                     if "loss_mask" in batch:
+                         loss_mask_cache.append(batch["loss_mask"])
+                     pair_cache.append(batch.get("pair_ids"))
+                     if "cond_2_size" in batch:
+                         _az_ref_size_counts[batch["cond_2_size"]] = _az_ref_size_counts.get(batch["cond_2_size"], 0) + 1
+                 if train_dataset.custom_instance_prompts:
+                     # Azyah: identical batches share one entry; the embeddings go to CPU RAM (_AzRowCache).
+                     memo_key = tuple(batch["prompts"])
+                     if memo_key in _azyah_prompt_memo:
+                         prompt_embeds_cache.repeat(_azyah_prompt_memo[memo_key])
+                         text_ids_cache.repeat(_azyah_prompt_memo[memo_key])
+                     else:
+                         if args.fsdp_text_encoder:
+                             prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
+                         else:
+                             with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+                                 prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
+                         _azyah_prompt_memo[memo_key] = len(prompt_embeds_cache)
+                         prompt_embeds_cache.add(batch["prompts"], prompt_embeds)
+                         text_ids_cache.add(batch["prompts"], text_ids)
+                         del prompt_embeds, text_ids
+                 _az_n = len(latents_cache) or len(prompt_embeds_cache)
+                 if _az_n in (50, 200, 400, 600):  # fail fast instead of a host out-of-memory kill much later
+-                    import psutil
+-                    _az_used = prompt_embeds_cache.nbytes + text_ids_cache.nbytes + sum(
++                    _az_used = prompt_embeds_cache.ram_nbytes + text_ids_cache.ram_nbytes + sum(
+                         c.value.numel() * c.value.element_size()
+                         for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache, cond_3_latents_cache)
+                         for c in cache if c is not None)
+                     _az_need = _az_used / _az_n * (len(train_dataloader) - _az_n)
+-                    _az_free = psutil.virtual_memory().available
++                    _az_free = _az_free_ram()
+                     print(f"CACHE_RAM {_az_used / 1e9:.1f} GB after {_az_n} batches, about {_az_need / 1e9:.1f} GB "
+                           f"more to come, {_az_free / 1e9:.1f} GB of CPU RAM free", flush=True)
+                     if _az_need > 0.9 * _az_free:
+                         raise RuntimeError(f"NOT_ENOUGH_CPU_RAM for the latent cache: need about {_az_need / 1e9:.1f} GB "
+                                            f"more, {_az_free / 1e9:.1f} GB free")
+ 
+         if _az_ref_size_counts:
+             logger.info(f"Azyah garment-photo sizes per batch: {_az_ref_size_counts}")
+             print(f"REF_SIZES {_az_ref_size_counts}", flush=True)
+         _az_lat = sum(c.value.numel() * c.value.element_size()
+                       for cache in (latents_cache, cond_latents_cache, cond_2_latents_cache, cond_3_latents_cache)
+                       for c in cache if c is not None)
+         if getattr(args, "cond_image_column_3", None):
+             print(f"ANCHOR_BATCHES {_AZ_COND3_COUNTS['with']} with the earlier frame, {_AZ_COND3_COUNTS['without']} without",
+                   flush=True)
+-        print(f"CACHE_CPU text {prompt_embeds_cache.nbytes / 1e9:.1f} GB ({prompt_embeds_cache.distinct()} distinct "
++        print(f"CACHE_CPU text {prompt_embeds_cache.nbytes / 1e9:.1f} GB"
++              f"{' on disk' if prompt_embeds_cache.path else ''} ({prompt_embeds_cache.distinct()} distinct "
+               f"caption rows for {len(prompt_embeds_cache)} batches), latents {_az_lat / 1e9:.1f} GB; GPU memory in use "
+               f"{torch.cuda.memory_allocated() / 1e9:.1f} GB", flush=True)
+ 
+     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+     if args.cache_latents:
+         vae = vae.to("cpu")
+         del vae
+ 
+     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+     text_encoding_pipeline = text_encoding_pipeline.to("cpu")
+     del text_encoder, tokenizer
+     text_encoding_pipeline = None  # Azyah: not used after caching; frees its CPU RAM too
+     free_memory()
+ 
+     # Scheduler and math around the number of training steps.
+     # Check the PR https://github.com/huggingface/diffusers/pull/8312 for detailed explanation.
+     num_warmup_steps_for_scheduler = args.lr_warmup_steps * accelerator.num_processes
+     if args.max_train_steps is None:
+         len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
+         num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / args.gradient_accumulation_steps)
+         num_training_steps_for_scheduler = (
+             args.num_train_epochs * accelerator.num_processes * num_update_steps_per_epoch
+         )
+     else:
+         num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
+ 
+     lr_scheduler = get_scheduler(
+         args.lr_scheduler,
+         optimizer=optimizer,
+         num_warmup_steps=num_warmup_steps_for_scheduler,
+         num_training_steps=num_training_steps_for_scheduler,
+         num_cycles=args.lr_num_cycles,
+         power=args.lr_power,
+     )
+ 
+     # Prepare everything with our `accelerator`.
+     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+         transformer, optimizer, train_dataloader, lr_scheduler
+     )
+ 
+     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+     if args.max_train_steps is None:
+         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+         if num_training_steps_for_scheduler != args.max_train_steps:

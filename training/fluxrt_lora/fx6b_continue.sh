@@ -20,8 +20,13 @@
 #      from the BEST save (later, worse saves are moved to set_aside/, never deleted; AZ_RESUME_FROM=newest keeps
 #      them). When no save has beaten step 5800 yet, it carries on from the newest save.
 #
-# Needs an RTX PRO 6000 (96 GB: the training and the check renders share it) and the azyah-vton-train volume at
-# /workspace. Never touches an endpoint.
+#   6. memory (2026-11-16: a 94 GB-RAM Pod was killed while caching): the trainer's text rows (~8 MB each, up to
+#      ~60 GB) go to a file on disk (AZ_TEXT_CACHE_DIR; the container disk when it has room, else the volume;
+#      deleted at the end), and a check render only starts while the GPU and the CPU RAM have room for it
+#      (AZ_RENDER_MIN_GPU_GB, default 22; AZ_RENDER_MIN_RAM_GB, default 30), otherwise it waits for the training.
+#
+# GPU: an RTX PRO 6000 (96 GB) or an RTX 5090 (32 GB: the checks then wait until the training ends). Needs the
+# azyah-vton-train volume at /workspace. Never touches an endpoint.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fx6b_continue.sh -o /workspace/fx6b_continue.sh
 #   AZ_REF=<SHA> AZ_SPENT=37.08 AZ_CAP=55 AZ_PRICE=2.79 AZ_BALANCE=11.35 nohup bash /workspace/fx6b_continue.sh > /workspace/fx6b.log 2>&1 &
@@ -81,6 +86,26 @@ stop_pod() {
 }
 trap stop_pod EXIT
 fail() { say "STOPPED: $*"; exit 1; }
+ram_free_gb() {  # free CPU RAM for this container: the smaller of the host's and the container limit's
+  local avail lim="" used=0
+  avail=$(awk '/MemAvailable/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+  # the working set: what the container uses minus file pages the kernel can drop (disk cache, dataset)
+  if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; then
+    lim=$(cat /sys/fs/cgroup/memory.max)
+    used=$(( $(cat /sys/fs/cgroup/memory.current) - $(awk '$1 == "inactive_file" { print $2 }' /sys/fs/cgroup/memory.stat) ))
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    lim=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+    used=$(( $(cat /sys/fs/cgroup/memory/memory.usage_in_bytes) - $(awk '$1 == "total_inactive_file" { print $2 }' /sys/fs/cgroup/memory/memory.stat) ))
+  fi
+  if [ -n "$lim" ] && [ "${#lim}" -lt 19 ]; then
+    local c=$(( (lim - used) / 1073741824 )); [ "$c" -lt "$avail" ] && avail=$c
+  fi
+  echo "${avail:-0}"
+}
+gpu_free_gb() {  # 0 when unknown: a render then waits for the training
+  local v; v=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{ printf "%d", $1 / 1024 }')
+  echo "${v:-0}"
+}
 
 say "start: cap \$$CAP, already spent \$$SPENT0, price \$$PRICE/h${BALANCE:+, RunPod balance \$$BALANCE (keeping \$$KEEP)}: $ALLOWED min allowed"
 [ -n "$BALANCE" ] || say "NOTE: AZ_BALANCE not given: only the cap limits this run; if the RunPod balance runs out first, the Pod stops without picking the best save (run the same line again after a top-up)"
@@ -120,6 +145,19 @@ case "$START_SUM" in "$START_SHA"*) ;; *) fail "WRONG_START_WEIGHTS: $START_DIR 
 say "1. start weights: step 5800 of fxreal6 (${START_SUM:0:8}...)"
 [ -f "$DATA_SRC/dataset_summary.json" ] && [ -f "$DATA_SRC/region_weight.json" ] || fail "NO_DATASET: $DATA_SRC"
 [ -e "$DATA" ] || ln -s "$DATA_SRC" "$DATA"
+ROWS=$("$PY" -c "import json; print(json.load(open('$DATA_SRC/region_weight.json')).get('rows_written', 0))" 2>/dev/null || echo 0)
+# The trainer's text rows (~8.1 MB each at most) go to disk: the container disk when it has room, else the volume.
+NEED_GB=$(( ROWS * 9 / 1000 + 5 ))
+if [ -n "${AZ_TEXT_CACHE_DIR:-}" ]; then TEXT_DIR="$AZ_TEXT_CACHE_DIR"
+else
+  TEXT_DIR=""
+  for dir in /root/az_text_cache "$AZ_ROOT/tmp_text_cache"; do
+    mkdir -p "$dir" 2>/dev/null || continue
+    [ "$(df -BG --output=avail "$dir" | tail -1 | tr -dc '0-9')" -ge "$NEED_GB" ] && { TEXT_DIR="$dir"; break; }
+  done
+  [ -n "$TEXT_DIR" ] || fail "NO_DISK_FOR_TEXT_CACHE: need about $NEED_GB GB free on the container disk (/root) or the volume; deploy with a bigger container disk (e.g. 100 GB)"
+fi
+say "memory: $(ram_free_gb) GB CPU RAM free, $(gpu_free_gb) GB GPU free; $ROWS rows, text cache (up to $NEED_GB GB) on disk at $TEXT_DIR"
 [ "$(readlink -f "$DATA")" = "$(readlink -f "$DATA_SRC")" ] || fail "DATA_MISMATCH: $DATA is not fxreal6's data"
 SETS_OK=""
 for s in $SETS; do
@@ -196,6 +234,13 @@ render_loop() {
     register_saves
     for id in $(pending .rendered); do
       eval_deadline_passed && break
+      # while the training runs, a render starts only when the GPU and the CPU RAM have room for it
+      if [ ! -f "$EV/.training_done" ] && [ "$(meta "$id" step)" != 0 ]; then
+        if [ "$(gpu_free_gb)" -lt "${AZ_RENDER_MIN_GPU_GB:-22}" ] || [ "$(ram_free_gb)" -lt "${AZ_RENDER_MIN_RAM_GB:-30}" ]; then
+          [ -f "$EV/.waiting_note" ] || { say "check renders wait for the training to end ($(gpu_free_gb) GB GPU, $(ram_free_gb) GB RAM free)"; touch "$EV/.waiting_note"; }
+          break
+        fi
+      fi
       n=$(meta "$id" name); w=$(meta "$id" weights); ok=1
       for s in $SETS; do render "$s" "$n" "$w" || ok=0; done
       if [ "$ok" = 1 ]; then touch "$EV/$id/.rendered"
@@ -237,7 +282,7 @@ best_step() {  # the best checked save's step (0 = step 5800 itself), empty when
 }
 
 register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors"
-rm -f "$EV/.training_done"
+rm -f "$EV/.training_done" "$EV/.waiting_note"
 
 # ---- 3. a restart: check what an earlier run left unchecked, then carry on from the best save
 if ls -d "$OUT"/checkpoint-* >/dev/null 2>&1; then
@@ -280,10 +325,12 @@ else
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
     AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
     AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor} AZ_ANCHOR_PROB=${AZ_ANCHOR_PROB:-1.0} \
-    AZ_INIT_LORA=$START_DIR bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
+    AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$START_DIR bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
   TRAIN_EXIT=$?
   TLOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
-  grep -hE "LoRA initialised from|OutOfMemoryError|CUDA out of memory|Traceback" "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -4
+  grep -hE "LoRA initialised from|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
+    "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -8 | sed 's/^/FX6B trainer: /'
+  rm -f "$TEXT_DIR/text_cache.bin"   # the trainer's own scratch file (made again at every start)
   grep -oE "(loss|detail|pair|colour|texture)=[0-9.e+-]+" "$TLOG" 2>/dev/null | tail -5 | tr '\n' ' '; echo
   LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
   [ "$TRAIN_EXIT" = 124 ] && say "training stopped by the money limit at step ${LAST:-none} (exit 124); the saves are kept" \

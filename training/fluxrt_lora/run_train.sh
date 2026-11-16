@@ -94,6 +94,10 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-cpucache.patch"
 # fxreal6: a third input, an earlier frame of the same video (--cond_image_column_3; off unless AZ_ANCHOR_COLUMN is set).
 curl -fsSL "$RAW/patches/flux2-klein-anchor.patch" -o "$AZ_ROOT/flux2-klein-anchor.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-anchor.patch"
+# 2026-11-16 (94 GB Pods): the text rows of the cache can live on disk (AZ_TEXT_CACHE_DIR; off unless set: same
+# bytes, same numbers), and the CPU RAM check reads the container's memory limit, not only the host's.
+curl -fsSL "$RAW/patches/flux2-klein-diskcache.patch" -o "$AZ_ROOT/flux2-klein-diskcache.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-diskcache.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 

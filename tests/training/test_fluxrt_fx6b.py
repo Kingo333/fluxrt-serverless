@@ -158,3 +158,56 @@ def test_fx6b_refuses_to_start_without_enough_money(tmp_path):
            "HOME": str(tmp_path)}
     r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode != 0 and "top up" in r.stdout and "STOPPED" in r.stdout
+
+
+# ---------------------------------------------------------------- 94 GB Pods: text rows on disk, real memory limit
+def _diskcache_code() -> str:
+    lines = (ROOT / "training/patches/flux2-klein-diskcache.patch").read_text().splitlines()
+    src = "\n".join(line[1:] for line in lines if line[:1] in (" ", "+") and not line.startswith("+++"))
+    return src[src.index("def _az_free_ram():"):src.index("def _azyah_pad_to(")]
+
+
+def test_text_rows_on_disk_give_the_same_tensors_as_in_ram(tmp_path):
+    import hashlib
+    import torch
+    ns = {"torch": torch, "os": os, "hashlib": hashlib}
+    exec(compile(_diskcache_code(), "diskcache", "exec"), ns)
+    cache = ns["_AzRowCache"]
+    ram, disk = cache("cpu"), cache("cpu", str(tmp_path / "sub" / "text_cache.bin"))
+    g = torch.Generator().manual_seed(0)
+    prev = None
+    for i in range(6):
+        b = torch.randn(4, 32, 16, generator=g).to(torch.bfloat16)
+        if prev is not None and i % 2:
+            b[1] = prev[1]                                   # the same caption and row again: kept once
+        prompts = [f"p{i % 3}", "same", f"q{i}", "same"]
+        ram.add(prompts, b); disk.add(prompts, b)
+        prev = b
+    ram.repeat(2); disk.repeat(2)
+    assert len(ram) == len(disk) == 7 and ram.distinct() == disk.distinct()
+    for k in range(len(ram)):
+        a, d = ram[k], disk[k]
+        assert d.dtype == torch.bfloat16 and torch.equal(a.view(torch.int16), d.view(torch.int16))
+    assert disk.ram_nbytes == 0 and ram.ram_nbytes == ram.nbytes == disk.nbytes
+    assert (tmp_path / "sub" / "text_cache.bin").stat().st_size == disk.nbytes
+
+
+def test_free_ram_reads_the_container_limit_not_only_the_host():
+    import psutil
+    ns = {"os": os}
+    exec(compile(_diskcache_code().split("class _AzRowCache")[0], "free", "exec"), ns)
+    free = ns["_az_free_ram"]()
+    assert 0 < free <= psutil.virtual_memory().available
+    patch = (ROOT / "training/patches/flux2-klein-diskcache.patch").read_text()
+    assert "inactive_file" in patch and "_az_free = _az_free_ram()" in patch and 'os.environ.get("AZ_TEXT_CACHE_DIR")' in patch
+
+
+def test_trainer_applies_the_disk_cache_patch_last_and_fx6b_uses_it():
+    rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
+    assert rt.index("flux2-klein-anchor.patch") < rt.index("flux2-klein-diskcache.patch")
+    sh = SCRIPT.read_text()
+    assert "AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$START_DIR" in sh and "NO_DISK_FOR_TEXT_CACHE" in sh
+    assert 'AZ_RENDER_MIN_GPU_GB:-22' in sh and 'AZ_RENDER_MIN_RAM_GB:-30' in sh and 'rm -f "$TEXT_DIR/text_cache.bin"' in sh
+    fn = sh[sh.index("ram_free_gb() {"):sh.index("gpu_free_gb() {")]
+    r = subprocess.run(["bash", "-c", fn + "ram_free_gb"], capture_output=True, text=True)
+    assert r.returncode == 0 and int(r.stdout) >= 0
