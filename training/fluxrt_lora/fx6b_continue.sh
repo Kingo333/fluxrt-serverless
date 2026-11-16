@@ -75,11 +75,25 @@ allowed_minutes() {  # cap spent0 price balance keep -> minutes (0 if nothing is
     m = c - s; if (b != "") { bb = b - k; if (bb < m) m = bb }
     t = m / p * 60; if (t < 0) t = 0; printf "%d", t }'
 }
+# Spend record on the volume (2026-11-16, Pods started by "Deploy when available" run this line again after any
+# restart): every start of the SAME line (same AZ_SPENT and AZ_BALANCE) adds what the earlier starts spent, so a
+# restart never gets a fresh budget. A line with a new AZ_SPENT/AZ_BALANCE (already counting those) starts clean.
+SPENT_GIVEN="$SPENT0"; BALANCE_GIVEN="${BALANCE:-none}"
+LEDGER="$AZ_ROOT/eval/fxa/fx6b/spend"
+mkdir -p "$LEDGER" 2>/dev/null || true
+PRIOR=$(cat "$LEDGER"/*.run 2>/dev/null | awk -v a="$SPENT_GIVEN" -v b="$BALANCE_GIVEN" '$1 == a && $2 == b { s += $3 } END { printf "%.2f", s + 0 }')
+SPENT0=$(awk -v a="$SPENT_GIVEN" -v p="$PRIOR" 'BEGIN { printf "%.2f", a + p }')
+[ -n "$BALANCE" ] && BALANCE=$(awk -v a="$BALANCE" -v p="$PRIOR" 'BEGIN { printf "%.2f", a - p }')
+RUN_FILE="$LEDGER/$START.run"
+record_spend() { echo "$SPENT_GIVEN $BALANCE_GIVEN $(spent_run)" > "$RUN_FILE.tmp" 2>/dev/null && mv -f "$RUN_FILE.tmp" "$RUN_FILE"; }
 ALLOWED=$(allowed_minutes "$CAP" "$SPENT0" "$PRICE" "$BALANCE" "$KEEP")
 left_min() { echo $(( ALLOWED - $(mins) )); }
+( while :; do record_spend; sleep 60; done ) >/dev/null 2>&1 &
+SPEND_PID=$!
 
 stop_pod() {
   for p in ${LOOP_PIDS:-}; do kill "$p" 2>/dev/null; done
+  kill "$SPEND_PID" 2>/dev/null; record_spend
   say "end: \$$(spent_run) this run (cap \$$CAP${BALANCE:+, balance at start \$$BALANCE})"
   if [ "${AZ_NO_STOP:-0}" = "1" ]; then echo "== AZ_NO_STOP=1: Pod left RUNNING (billing) - stop it by hand"; return; fi
   echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true
@@ -107,6 +121,7 @@ gpu_free_gb() {  # 0 when unknown: a render then waits for the training
   echo "${v:-0}"
 }
 
+[ "$PRIOR" != "0.00" ] && say "earlier starts of this same line spent \$$PRIOR (counted)"
 say "start: cap \$$CAP, already spent \$$SPENT0, price \$$PRICE/h${BALANCE:+, RunPod balance \$$BALANCE (keeping \$$KEEP)}: $ALLOWED min allowed"
 [ -n "$BALANCE" ] || say "NOTE: AZ_BALANCE not given: only the cap limits this run; if the RunPod balance runs out first, the Pod stops without picking the best save (run the same line again after a top-up)"
 [ "$ALLOWED" -ge $(( RESERVE_MIN + END_MIN + 30 )) ] || fail "only $ALLOWED minutes of money left (need at least $(( RESERVE_MIN + END_MIN + 30 ))): top up and/or raise AZ_CAP"
@@ -146,18 +161,34 @@ say "1. start weights: step 5800 of fxreal6 (${START_SUM:0:8}...)"
 [ -f "$DATA_SRC/dataset_summary.json" ] && [ -f "$DATA_SRC/region_weight.json" ] || fail "NO_DATASET: $DATA_SRC"
 [ -e "$DATA" ] || ln -s "$DATA_SRC" "$DATA"
 ROWS=$("$PY" -c "import json; print(json.load(open('$DATA_SRC/region_weight.json')).get('rows_written', 0))" 2>/dev/null || echo 0)
-# The trainer's text rows (~8.1 MB each at most) go to disk: the container disk when it has room, else the volume.
-NEED_GB=$(( ROWS * 9 / 1000 + 5 ))
+# The trainer's text rows (~8.1 MB each) go to disk. A row is kept once per caption, so the file is about one row per
+# distinct caption; the worst case is one per row. The container disk is used when it has room, else the volume.
+# A network volume's df can show the whole storage pool, not its quota: AZ_VOLUME_FREE_GB (from the RunPod
+# console) overrides it.
+DISTINCT=$("$PY" -c "
+import glob, pyarrow.parquet as pq
+s = set()
+for f in glob.glob('$DATA_SRC/data/*.parquet'):
+    s.update(pq.read_table(f, columns=['caption']).column('caption').to_pylist())
+print(len(s))" 2>/dev/null || echo 0)
+[ "${DISTINCT:-0}" -gt 0 ] || DISTINCT=$ROWS
+NEED_MAX=$(( ROWS * 9 / 1000 + 5 )); NEED_LIKELY=$(( DISTINCT * 9 / 1000 + 5 ))
+free_gb_of() {  # dir -> free GB (the volume: AZ_VOLUME_FREE_GB when given)
+  case "$1" in "$AZ_ROOT"/*) [ -n "${AZ_VOLUME_FREE_GB:-}" ] && { echo "$AZ_VOLUME_FREE_GB"; return; };; esac
+  df -BG --output=avail "$1" | tail -1 | tr -dc '0-9'
+}
 if [ -n "${AZ_TEXT_CACHE_DIR:-}" ]; then TEXT_DIR="$AZ_TEXT_CACHE_DIR"
 else
   TEXT_DIR=""
-  for dir in /root/az_text_cache "$AZ_ROOT/tmp_text_cache"; do
-    mkdir -p "$dir" 2>/dev/null || continue
-    [ "$(df -BG --output=avail "$dir" | tail -1 | tr -dc '0-9')" -ge "$NEED_GB" ] && { TEXT_DIR="$dir"; break; }
+  for need in "$NEED_MAX" "$NEED_LIKELY"; do
+    for dir in /root/az_text_cache "$AZ_ROOT/tmp_text_cache"; do
+      mkdir -p "$dir" 2>/dev/null || continue
+      [ "$(free_gb_of "$dir")" -ge "$need" ] && { TEXT_DIR="$dir"; break 2; }
+    done
   done
-  [ -n "$TEXT_DIR" ] || fail "NO_DISK_FOR_TEXT_CACHE: need about $NEED_GB GB free on the container disk (/root) or the volume; deploy with a bigger container disk (e.g. 100 GB)"
+  [ -n "$TEXT_DIR" ] || fail "NO_DISK_FOR_TEXT_CACHE: need about $NEED_LIKELY GB (at most $NEED_MAX GB) free on the container disk (/root: $(free_gb_of /root/az_text_cache) GB) or the volume ($(free_gb_of "$AZ_ROOT/tmp_text_cache") GB)"
 fi
-say "memory: $(ram_free_gb) GB CPU RAM free, $(gpu_free_gb) GB GPU free; $ROWS rows, text cache (up to $NEED_GB GB) on disk at $TEXT_DIR"
+say "memory: $(ram_free_gb) GB CPU RAM free, $(gpu_free_gb) GB GPU free; $ROWS rows, $DISTINCT distinct captions: text cache about $NEED_LIKELY GB (at most $NEED_MAX GB) on disk at $TEXT_DIR ($(free_gb_of "$TEXT_DIR") GB free)"
 [ "$(readlink -f "$DATA")" = "$(readlink -f "$DATA_SRC")" ] || fail "DATA_MISMATCH: $DATA is not fxreal6's data"
 SETS_OK=""
 for s in $SETS; do

@@ -218,3 +218,27 @@ def test_trainer_applies_the_disk_cache_patch_last_and_fx6b_uses_it():
     fn = sh[sh.index("ram_free_gb() {"):sh.index("gpu_free_gb() {")]
     r = subprocess.run(["bash", "-c", fn + "ram_free_gb"], capture_output=True, text=True)
     assert r.returncode == 0 and int(r.stdout) >= 0
+
+
+# ---------------------------------------------------------------- unattended starts ("Deploy when available")
+def test_a_restart_of_the_same_line_counts_what_earlier_starts_spent(tmp_path):
+    text = SCRIPT.read_text()
+    block = text[text.index('SPENT_GIVEN="$SPENT0"'):text.index('ALLOWED=$(allowed_minutes')]
+    spend = tmp_path / "azyah-vton/eval/fxa/fx6b/spend"
+    spend.mkdir(parents=True)
+    (spend / "100.run").write_text("38.00 8.87 2.10\n")          # an earlier start of the same line
+    (spend / "50.run").write_text("37.08 11.35 0.90\n")          # the crashed run of an older line: already in 38.00
+    script = ('spent_run() { echo 0.00; }\nSPENT0=38.00; BALANCE=8.87; START=200; AZ_ROOT="$1"\n' + block +
+              'echo "S=$SPENT0 B=$BALANCE P=$PRIOR"; record_spend; cat "$RUN_FILE"\n')
+    r = subprocess.run(["bash", "-c", script, "x", str(tmp_path / "azyah-vton")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "S=40.10 B=6.77 P=2.10" in r.stdout and "38.00 8.87 0.00" in r.stdout
+    assert (spend / "200.run").exists()
+    sh = text
+    assert 'kill "$SPEND_PID" 2>/dev/null; record_spend' in sh          # the last figure is written when it stops
+
+
+def test_text_cache_size_uses_distinct_captions_and_a_volume_hint():
+    sh = SCRIPT.read_text()
+    assert "column('caption')" in sh and 'NEED_LIKELY=$(( DISTINCT * 9 / 1000 + 5 ))' in sh
+    assert 'for need in "$NEED_MAX" "$NEED_LIKELY"; do' in sh and "AZ_VOLUME_FREE_GB" in sh
