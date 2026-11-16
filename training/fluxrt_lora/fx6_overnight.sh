@@ -54,7 +54,27 @@ newest_train_log() { ls -t "$REPORTS"/fluxlora_fxreal6_*.log 2>/dev/null | head 
 
 say "start: cap \$$CAP, price \$$PRICE/h, already spent \$$SPENT0"
 fetch fx6_train.sh
+RESUME="${AZ_RESUME:-0}"   # 1: the data and a training run exist; carry on training from the newest save
 
+# ---- resume: no data build, no trial; the speed comes from the training bar of the earlier run ----------------------
+if [ "$RESUME" = "1" ]; then
+  TLOG=$(newest_train_log)
+  [ -n "$TLOG" ] || fail "no earlier training log to measure the speed from"
+  SEC=$(python3 - "$TLOG" <<'PYEOF'
+import re, statistics, sys
+text = open(sys.argv[1], errors="ignore").read()
+segs = [x for x in re.split(r"[\r\n]", text) if x.lstrip().startswith("Steps:")]
+secs = [float(x) for seg in segs for x in re.findall(r"([0-9.]+)s/it", seg)]
+secs += [1 / float(x) for seg in segs for x in re.findall(r"([0-9.]+)it/s", seg) if float(x) > 0]
+secs = secs[len(secs) // 3:]
+print(f"{statistics.median(secs):.2f}" if secs else "")
+PYEOF
+)
+  ROWS=$(python3 -c "import json; print(json.load(open('$ROOT_DIR/data/fluxrt_lora/fxreal6/region_weight.json')).get('rows_written', 0))" 2>/dev/null)
+  DONE_STEP=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
+  [ -n "$SEC" ] && [ -n "$ROWS" ] && [ "$ROWS" -gt 0 ] || fail "could not read the training speed or the row count"
+  say "resume: $SEC s per step measured on the training bar, $ROWS rows, newest save step ${DONE_STEP:-none}"
+else
 # ---- 1. data build -----------------------------------------------------------------------------------------------
 say "1. waiting for the data build ($DATA_LOG)"
 while true; do
@@ -91,16 +111,20 @@ ROWS=$(grep -oE "^TRIAL [0-9.]+ s per step \(batch 4\), [0-9]+ rows" "$WS/fx6_tr
 [ -n "$SEC" ] && [ -n "$ROWS" ] || fail "no step time in the trial log"
 say "2. trial ok: $SEC s per step, $ROWS rows"
 
+fi
+
 # ---- 3. size the training ----------------------------------------------------------------------------------------
 FULL=$(awk -v r="$ROWS" -v p="$PASSES" 'BEGIN { printf "%d", int(p * r / 4 / 100) * 100 }')
 AFFORD=$(awk -v l="$(left_dollars)" -v e="$EVAL_HOURS" -v pr="$PRICE" -v m="$MARGIN" -v s="$SEC" \
   'BEGIN { h = (l - m) / pr - e; if (h < 0) h = 0; printf "%d", int(h * 3600 / s / 100) * 100 }')
+DONE_STEP="${DONE_STEP:-0}"
 STEPS=$FULL
-[ "$AFFORD" -lt "$STEPS" ] && STEPS=$AFFORD
+[ $((DONE_STEP + AFFORD)) -lt "$STEPS" ] && STEPS=$((DONE_STEP + AFFORD))
+TODO=$((STEPS - DONE_STEP))
 say "3. $PASSES passes = $FULL steps; the money left (\$$(left_dollars), keeping $EVAL_HOURS h for evaluation and \$$MARGIN spare) pays for $AFFORD; training to $STEPS"
-[ "$STEPS" -ge "$MIN_STEPS" ] || fail "only $STEPS steps fit in the budget (under $MIN_STEPS): not worth training; top up or raise AZ_CAP"
+[ "$TODO" -ge "$MIN_STEPS" ] || fail "only $TODO more steps fit in the budget (under $MIN_STEPS): not worth training; top up or raise AZ_CAP"
 # time limit: the steps at the measured speed plus 20 minutes of loading and saving, never past the money
-MINUTES=$(awk -v n="$STEPS" -v s="$SEC" -v l="$(left_dollars)" -v e="$EVAL_HOURS" -v pr="$PRICE" -v m="$MARGIN" \
+MINUTES=$(awk -v n="$TODO" -v s="$SEC" -v l="$(left_dollars)" -v e="$EVAL_HOURS" -v pr="$PRICE" -v m="$MARGIN" \
   'BEGIN { t = n * s / 60 + 20; cap = ((l - m) / pr - e) * 60; if (t > cap) t = cap; printf "%d", t }')
 say "3. training time limit $MINUTES min (at most about \$$(awk -v t="$MINUTES" -v p="$PRICE" 'BEGIN { printf "%.0f", t / 60 * p }'))"
 

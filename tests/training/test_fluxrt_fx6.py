@@ -636,3 +636,48 @@ def test_overnight_stops_on_a_bad_trial(tmp_path):
     assert code != 0 and "NaN" in out and calls == ["trial steps= minutes="]
     code, out, calls = _overnight(tmp_path / "b", spent=20, trial_extra="torch.OutOfMemoryError: CUDA out of memory")
     assert code != 0 and "the trial hit an error" in out and len(calls) == 1
+
+
+def test_overnight_resume_measures_the_training_bar_not_the_caching_bar_and_counts_only_steps_left(tmp_path):
+    """2026-11-15: the trial read the "Caching latents" speed (0.20 s) as the step time, so the time limit came out
+    about 6x too short. The resume run must read the "Steps:" bar only, and pay only for the steps still to do."""
+    import os
+    import subprocess
+    ws = tmp_path / "ws"
+    root = ws / "azyah-vton"
+    out = root / "outputs/fluxrt_lora/fxreal6"
+    (out / "checkpoint-1000").mkdir(parents=True)
+    (root / "reports").mkdir(parents=True)
+    data = root / "data/fluxrt_lora/fxreal6"
+    data.mkdir(parents=True)
+    (data / "region_weight.json").write_text('{"rows_written": 7815}')
+    bars = "".join(f"\rCaching latents:  {k}%|##| {k}/1954 [00:10<00:00,  5.00it/s]" for k in range(1, 60))
+    bars += "".join(f"\rSteps:  {k}%|#| {k}/5800 [10:00<2:00:00,  3.50s/it, loss=0.3]" for k in range(1, 60))
+    (root / "reports/fluxlora_fxreal6_x.log").write_text(bars + "\n")
+    calls = ws / "calls.txt"
+    (ws / "fx6_train.sh").write_text(f"""#!/usr/bin/env bash
+echo "$AZ_STAGE steps=${{AZ_MAX_STEPS:-}} minutes=${{AZ_MAX_MINUTES:-}}" >> {calls}
+case "$AZ_STAGE" in
+train) mkdir -p {out}/checkpoint-2000; echo "FX6_TRAIN_DONE" ;;
+eval)  echo "FX6_EVAL_DONE after 60 min" ;;
+esac
+""")
+    env = {**os.environ, "AZ_REF": "x", "AZ_SPENT": "24.75", "AZ_WS": str(ws), "AZ_SKIP_FETCH": "1", "AZ_NO_STOP": "1",
+           "AZ_RESUME": "1"}
+    r = subprocess.run(["bash", str(ROOT / "training/fluxrt_lora/fx6_overnight.sh")], capture_output=True, text=True,
+                       env=env, timeout=60)
+    text = r.stdout + r.stderr
+    lines = calls.read_text().splitlines()
+    assert r.returncode == 0, text
+    assert lines[0].startswith("train") and lines[1].startswith("eval")   # no data build, no trial
+    assert "3.50 s per step" in text and "newest save step 1000" in text
+    steps = int(lines[0].split("steps=")[1].split()[0])
+    minutes = int(lines[0].split("minutes=")[1])
+    assert 1000 < steps <= 5800
+    assert (steps - 1000) * 3.5 / 60 + 20 >= minutes                 # the time limit covers the steps left
+    assert minutes <= ((45 - 24.75 - 2) / 2.70 - 1.5) * 60           # and can never spend past the cap
+
+
+def test_trial_speed_reads_only_the_training_bar():
+    text = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
+    assert 'startswith("Steps:")' in text and "Caching latents" in text

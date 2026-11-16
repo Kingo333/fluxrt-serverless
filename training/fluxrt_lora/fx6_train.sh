@@ -100,7 +100,11 @@ trial)
 import re, statistics, sys
 text = open(sys.argv[1], errors="ignore").read() if sys.argv[1] else ""
 rows, price = int(sys.argv[2] or 0), float(sys.argv[3])
-secs = [float(x) for x in re.findall(r"([0-9.]+)s/it", text)] + [1 / float(x) for x in re.findall(r"([0-9.]+)it/s", text) if float(x) > 0]
+# Only the training bar ("Steps: ..."). The "Caching latents" bar runs about 5 batches a second and must never be
+# read as the training speed (2026-11-15: it was, the time limit came out about 6x too short).
+segs = [x for x in re.split(r"[\r\n]", text) if x.lstrip().startswith("Steps:")]
+secs = [float(x) for seg in segs for x in re.findall(r"([0-9.]+)s/it", seg)]
+secs += [1 / float(x) for seg in segs for x in re.findall(r"([0-9.]+)it/s", seg) if float(x) > 0]
 secs = secs[len(secs) // 3:]  # the first steps include start-up
 if not secs or not rows:
     print("TRIAL no step times found in the log (or no row count): send the last 40 lines")
@@ -128,10 +132,13 @@ train)
   ;;
 eval)
   FX="$OUT/pytorch_lora_weights.safetensors"
-  if [ ! -f "$FX" ]; then  # a training run stopped by its time limit: use its newest save
-    LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
-    [ -n "$LAST" ] && [ -f "$OUT/checkpoint-$LAST/pytorch_lora_weights.safetensors" ] \
-      && cp "$OUT/checkpoint-$LAST/pytorch_lora_weights.safetensors" "$FX" && echo "using the newest save, step $LAST"
+  # A training run stopped by its time limit leaves no final file, or an older one: use the newest save then.
+  LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
+  LASTF="$OUT/checkpoint-$LAST/pytorch_lora_weights.safetensors"
+  if [ -n "$LAST" ] && [ -f "$LASTF" ] && { [ ! -f "$FX" ] || [ "$LASTF" -nt "$FX" ]; }; then
+    cp "$LASTF" "$FX" && echo "using the newest save, step $LAST"
+  else
+    echo "using the final file of the training (newest save: step ${LAST:-none})"
   fi
   [ -f "$FX" ] || { echo "NO_FX6_LORA: $FX"; exit 1; }
   cp -f "$DATA/selection.json" "$OUT/selection.json" 2>/dev/null || true
