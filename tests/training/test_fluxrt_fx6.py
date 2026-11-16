@@ -482,7 +482,7 @@ def test_pod_scripts_rebuild_the_tools_venv_and_train_with_the_fx5_recipe():
     tr = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
     for must in ("AZ_INIT_LORA=$INIT", "AZ_LORA_RANK=64", "AZ_BATCH=4", "AZ_MASK_WEIGHT:-3.0", "AZ_PAIR_COLUMN=pair",
                  "AZ_TIME_SHIFT_MU=2.01", "528x704:3,384x512:1", "FLUX.2-klein-base-4B", "--prompt-style live",
-                 "--blend 0.75", "FACESKIN", "FX6_TRIAL_DONE", "FX6_TRAIN_DONE", "FX6_EVAL_DONE", "TRIAL {passes} passes"):
+                 "--blend \"0.$(printf", "FACESKIN", "FX6_TRIAL_DONE", "FX6_TRAIN_DONE", "FX6_EVAL_DONE", "TRIAL {passes} passes"):
         assert must in tr, must
     data = (ROOT / "training/fluxrt_lora/fx6_data.sh").read_text()
     for must in ("data_tools.sequences", "--windows", "--caption-style live", "data_tools.region_weight", "FX6_DATA_DONE", "AZ_MAX_MINUTES"):
@@ -723,13 +723,13 @@ def test_eval_names_its_renders_after_the_weights_and_refuses_a_reused_label(tmp
     text = (ROOT / "training/fluxrt_lora/fx6_train.sh").read_text()
     start = text.index('  SUM=$(sha256sum "$FX"')
     end = text.index('  echo "evaluating weights')
-    block = text[start:end] + 'echo "NAMES $NEW $ANC $MIX"\n'
+    block = text[start:end] + 'echo "NAMES $NEW $ANC $MIX"\necho "MIXES[$MIXES] BLENDS[$BLENDS] ANC[$USE_ANC]"\n'
     fx = tmp_path / "w.safetensors"
     res = tmp_path / "results"
 
-    def run(content, label=None):
+    def run(content, label=None, **extra):
         fx.write_bytes(content)
-        env = {"FX": str(fx), "R": str(res), "TAG": "r528", "PATH": "/usr/bin:/bin"}
+        env = {"FX": str(fx), "R": str(res), "TAG": "r528", "PATH": "/usr/bin:/bin", **extra}
         if label:
             env["AZ_EVAL_LABEL"] = label
         return subprocess.run(["bash", "-c", block], capture_output=True, text=True, env=env)
@@ -744,3 +744,13 @@ def test_eval_names_its_renders_after_the_weights_and_refuses_a_reused_label(tmp
     d = run(b"other-weights", "s5800")
     assert d.returncode != 0 and "STALE_EVAL_LABEL" in d.stdout             # other weights under a used label: refused
     assert "NO_RENDERS" in text and "in total" in text
+    # blends back towards favourite #2: none by default, the old switch means 75%, a list gives one model per strength
+    assert "MIXES[] BLENDS[] ANC[1]" in c.stdout
+    e = run(b"weights-step-5800", "s5800", AZ_EVAL_BLEND="1")
+    assert "MIXES[ fx6b75s5800_r528] BLENDS[75] ANC[1]" in e.stdout
+    f = run(b"weights-step-5800", "s5800", AZ_EVAL_BLENDS="75,50 05", AZ_EVAL_ANCHOR="0")
+    assert "MIXES[ fx6b75s5800_r528 fx6b50s5800_r528 fx6b5s5800_r528] BLENDS[75 50 5] ANC[0]" in f.stdout
+    g = run(b"weights-step-5800", "s5800", AZ_EVAL_BLENDS="100")
+    assert g.returncode != 0 and "BAD_AZ_EVAL_BLENDS" in g.stdout
+    assert '--blend "0.$(printf \'%02d\' "$b")"' in text and 'PANELS+=("fx6b${b}${LABEL}_$TAG=fxreal6 at ${b}%")' in text
+    assert '[ "$USE_ANC" = "1" ] && render "$s" "$ANC"' in text

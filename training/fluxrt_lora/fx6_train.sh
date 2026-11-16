@@ -152,6 +152,18 @@ eval)
   LABEL=$(printf '%s' "${AZ_EVAL_LABEL:-${SUM:0:8}}" | tr -cd 'A-Za-z0-9')
   [ -n "$LABEL" ] || { echo "BAD_AZ_EVAL_LABEL"; exit 1; }
   FAV="fav2_$TAG"; NEW="fx6${LABEL}_$TAG"; MIX="fx6b75${LABEL}_$TAG"; ANC="fx6anchor${LABEL}_$TAG"
+  # Blends back towards favourite #2, as whole percentages of the NEW weights: AZ_EVAL_BLENDS="75 50" (AZ_EVAL_BLEND=1
+  # is the old spelling of "75"). AZ_EVAL_ANCHOR=0 leaves out the earlier-frame variant.
+  BLENDS=$(printf '%s' "${AZ_EVAL_BLENDS:-}" | tr -c '0-9' ' ')
+  [ -z "${BLENDS// /}" ] && [ "${AZ_EVAL_BLEND:-0}" = "1" ] && BLENDS="75"
+  NORM=""; MIXES=""
+  for b in $BLENDS; do
+    b=$((10#$b))
+    [ "$b" -ge 1 ] && [ "$b" -le 99 ] || { echo "BAD_AZ_EVAL_BLENDS: $b (whole percentages, 1 to 99)"; exit 1; }
+    NORM="$NORM $b"; MIXES="$MIXES fx6b${b}${LABEL}_$TAG"
+  done
+  BLENDS="${NORM# }"
+  USE_ANC="${AZ_EVAL_ANCHOR:-1}"
   MARK="$R/.weights_fx6${LABEL}_$TAG"
   mkdir -p "$R"
   if [ -f "$MARK" ] && [ "$(cat "$MARK")" != "$SUM" ]; then
@@ -160,12 +172,15 @@ eval)
   fi
   echo "$SUM" > "$MARK"
   echo "evaluating weights ${SUM:0:8} as $NEW and $ANC"
+  [ "$USE_ANC" = "1" ] || echo "the earlier-frame variant ($ANC) is left out (AZ_EVAL_ANCHOR=0)"
+  [ -z "$MIXES" ] || echo "blends with favourite #2 (share of the new weights: $BLENDS %):$MIXES"
   # Sets and models are trimmed to keep the scoring inside the budget (the baseline's scoring alone took 66 min for
   # one model): AZ_EVAL_SETS (default the 24 new test clips, the owner's 5 cases, the hijab set, the 10 dresses);
-  # AZ_EVAL_BLEND=1 adds the 75% blend back towards favourite #2.
+  # AZ_EVAL_BLENDS="75 50" adds blends back towards favourite #2; AZ_EVAL_ANCHOR=0 drops the earlier-frame variant.
   SETS=""
   for s in ${AZ_EVAL_SETS:-fx6test cases5 hijab dress10}; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
-  CANDS="$NEW $ANC"; [ "${AZ_EVAL_BLEND:-0}" = "1" ] && CANDS="$CANDS $MIX"
+  CANDS="$NEW"; [ "$USE_ANC" = "1" ] && CANDS="$CANDS $ANC"
+  CANDS="$CANDS$MIXES"
   echo "== renders at garment size $REF_SIZE on:$SETS; models: favourite #2 (kept from the baseline), $CANDS ($(mins))"
   G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --steps 2 --prompt-style live --ref-size $REF_SIZE"
   render() {  # set, name, extra args...
@@ -183,8 +198,10 @@ eval)
     render "$s" "$FAV" --lora "$INIT/pytorch_lora_weights.safetensors"      # kept from the baseline: nothing new to render
     render "$s" "$NEW" --lora "$FX"
     # with its own earlier picture as the third image, as live with FLUXRT_ANCHOR=1 (taken after 8 frames, renewed every 12)
-    render "$s" "$ANC" --lora "$FX" --anchor-after 8 --anchor-every 12
-    [ "${AZ_EVAL_BLEND:-0}" = "1" ] && render "$s" "$MIX" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend 0.75
+    [ "$USE_ANC" = "1" ] && render "$s" "$ANC" --lora "$FX" --anchor-after 8 --anchor-every 12
+    for b in $BLENDS; do
+      render "$s" "fx6b${b}${LABEL}_$TAG" --lora "$FX" --lora2 "$INIT/pytorch_lora_weights.safetensors" --blend "0.$(printf '%02d' "$b")"
+    done
   done
   [ "$RENDER_MISSING" = "0" ] || { echo "FX6_EVAL_NO_RENDERS: stopped before scoring"; exit 1; }
   # Scoring runs on the CPU, one process per set at the same time (the Pod has many cores; the GPU is free now).
@@ -241,8 +258,9 @@ PYEOF
   ) || true
   echo "== labelled videos: garment | camera | favourite #2 (today) | fxreal6 | fxreal6 + earlier frame ($(mins))"
   for s in $SETS; do
-    PANELS=("$FAV=favourite #2 (today)" "$NEW=fxreal6" "$ANC=fxreal6 + earlier frame")
-    [ "${AZ_EVAL_BLEND:-0}" = "1" ] && PANELS+=("$MIX=fxreal6 at 75%")
+    PANELS=("$FAV=favourite #2 (today)" "$NEW=fxreal6")
+    [ "$USE_ANC" = "1" ] && PANELS+=("$ANC=fxreal6 + earlier frame")
+    for b in $BLENDS; do PANELS+=("fx6b${b}${LABEL}_$TAG=fxreal6 at ${b}%"); done
     ( cd "$T" && "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
         --panels "${PANELS[@]}" ) > "$E/video_fx6_$s.log" 2>&1 || echo "VIDEO_${s}_EXIT=$?"
     [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$E/fx6_${s}_${TAG}.mp4"

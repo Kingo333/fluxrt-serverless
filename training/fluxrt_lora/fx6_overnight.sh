@@ -160,7 +160,7 @@ EVAL_MIN=$(awk -v l="$(left_dollars)" -v pr="$PRICE" -v m="$MARGIN" 'BEGIN { t =
 say "5. evaluation, time limit $EVAL_MIN min"
 timeout -s INT "${EVAL_MIN}m" env AZ_REF="$AZ_REF" AZ_STAGE=eval AZ_NO_STOP=1 AZ_PRICE="$PRICE" bash "$WS/fx6_train.sh" \
   > "$WS/fx6_eval.log" 2>&1
-grep -hE "^(render|FACESKIN|LOGO_LEAK|PRIORITY|GATE|HIJAB|STEADY)|_EXIT=|FX6_EVAL_DONE|NO_FX6_LORA|using the newest save|using the final file|evaluating weights|STALE_EVAL_LABEL|NO_RENDERS|FX6_EVAL_NO_RENDERS" \
+grep -hE "^(render|FACESKIN|LOGO_LEAK|PRIORITY|GATE|HIJAB|STEADY)|_EXIT=|FX6_EVAL_DONE|NO_FX6_LORA|using the newest save|using the final file|evaluating weights|blends with favourite|is left out|BAD_AZ_EVAL_BLENDS|STALE_EVAL_LABEL|NO_RENDERS|FX6_EVAL_NO_RENDERS" \
   "$WS/fx6_eval.log" | cut -c1-400
 if grep -q "FX6_EVAL_DONE" "$WS/fx6_eval.log"; then
   say "5. evaluation done"
