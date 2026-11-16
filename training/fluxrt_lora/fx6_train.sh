@@ -175,10 +175,11 @@ eval)
   [ "$USE_ANC" = "1" ] || echo "the earlier-frame variant ($ANC) is left out (AZ_EVAL_ANCHOR=0)"
   [ -z "$MIXES" ] || echo "blends with favourite #2 (share of the new weights: $BLENDS %):$MIXES"
   # Sets and models are trimmed to keep the scoring inside the budget (the baseline's scoring alone took 66 min for
-  # one model): AZ_EVAL_SETS (default the 24 new test clips, the owner's 5 cases, the hijab set, the 10 dresses);
+  # one model): AZ_EVAL_SETS (default the 24 new test clips, the owner's 5 cases, the 10 dresses; the hijab set was
+  # dropped on the owner's word, 2026-11-16: no head coverings for this product, so it is in neither the scores nor the GATE);
   # AZ_EVAL_BLENDS="75 50" adds blends back towards favourite #2; AZ_EVAL_ANCHOR=0 drops the earlier-frame variant.
   SETS=""
-  for s in ${AZ_EVAL_SETS:-fx6test cases5 hijab dress10}; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
+  for s in ${AZ_EVAL_SETS:-fx6test cases5 dress10}; do [ -f "$E/$s.json" ] && SETS="$SETS $s"; done
   CANDS="$NEW"; [ "$USE_ANC" = "1" ] && CANDS="$CANDS $ANC"
   CANDS="$CANDS$MIXES"
   echo "== renders at garment size $REF_SIZE on:$SETS; models: favourite #2 (kept from the baseline), $CANDS ($(mins))"

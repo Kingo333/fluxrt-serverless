@@ -754,3 +754,5 @@ def test_eval_names_its_renders_after_the_weights_and_refuses_a_reused_label(tmp
     assert g.returncode != 0 and "BAD_AZ_EVAL_BLENDS" in g.stdout
     assert '--blend "0.$(printf \'%02d\' "$b")"' in text and 'PANELS+=("fx6b${b}${LABEL}_$TAG=fxreal6 at ${b}%")' in text
     assert '[ "$USE_ANC" = "1" ] && render "$s" "$ANC"' in text
+    # owner, 2026-11-16: no head coverings for this product: the hijab set is out of the default scores and the GATE
+    assert "${AZ_EVAL_SETS:-fx6test cases5 dress10}" in text and "cases5 hijab" not in text
