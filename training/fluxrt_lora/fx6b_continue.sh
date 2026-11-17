@@ -2,6 +2,11 @@
 # fxreal6b (owner, 2026-11-16): carry on training fxreal6 from its step-5800 weights at half the learning rate, check
 # every save against favourite #2 while the training goes on, and keep the BEST save, not the last one.
 #
+#   AZ_TRAIN_FROM=best_blend (owner, 2026-11-17): the blends are scored BEFORE the training, and the training
+#      starts from the best blend (exactly: at the blend file's own rank, 128, with alpha = rank) into a new run,
+#      AZ_EXP (default fxreal6c; saves named fx6c...). It is skipped when no blend could be made, or when the best
+#      blend scores below step 5800 itself (AZ_TRAIN_ALWAYS=1 trains anyway). The videos and the review file of
+#      an earlier run are copied to EVAL/fx6b/backup_before_<run>/ first; this run's own get the run's prefix.
 #   0. blend test FIRST (owner, 2026-11-16): step 5800 mixed with favourite #2 at AZ_BLENDS percent of the new
 #      weights (default "75 50"), each merged into one LoRA file (fluxrt_lora.merge_lora: exact, loads like any
 #      LoRA), rendered on the three test sets before the training starts and scored like the saves. If the money
@@ -52,7 +57,10 @@ RESERVE_MIN="${AZ_RESERVE_MIN:-45}"   # kept after the training to check its las
 END_MIN="${AZ_END_MIN:-8}"            # kept at the very end: pick the best, videos, stop
 RESUME_FROM="${AZ_RESUME_FROM:-best}"
 START_SHA="${AZ_START_SHA:-0ab25649}"
-EXP=fxreal6b
+TRAIN_FROM="${AZ_TRAIN_FROM:-s5800}"
+case "$TRAIN_FROM" in s5800) EXP="${AZ_EXP:-fxreal6b}";; best_blend) EXP="${AZ_EXP:-fxreal6c}";;
+  *) echo "BAD_AZ_TRAIN_FROM: $TRAIN_FROM (s5800 or best_blend)"; exit 1;; esac
+PFX="fx6${EXP#fxreal6}"          # fxreal6b -> fx6b (saves, videos), fxreal6c -> fx6c
 REF_SIZE=528x704
 REF_SIZES=528x704:3,384x512:1
 TAG=r528
@@ -252,7 +260,7 @@ register_saves() {  # every finished checkpoint of this run (its file unchanged 
     sum=$(sha256sum "$f" | cut -c1-8)
     [ -f "$EV/s${n}x$sum/meta.json" ] && continue
     cp "$f" "$SAVES/step${n}_$sum.safetensors"
-    register "s${n}x$sum" "$n" "fx6b${n}x${sum}_$TAG" "$SAVES/step${n}_$sum.safetensors" save "fxreal6b step $n"
+    register "${PFX}s${n}x$sum" "$n" "${PFX}${n}x${sum}_$TAG" "$SAVES/step${n}_$sum.safetensors" save "$EXP step $n"
     say "save at step $n registered for checking (s${n}x$sum)"
   done
 }
@@ -317,6 +325,23 @@ best_step() {  # the best checked save's step (0 = step 5800 itself), empty when
   ( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" ) > "$EV/pick.log" 2>&1
   "$PY" -c "import json, sys; b = json.load(open(sys.argv[1])).get('best'); print('' if not b else b['step'])" "$EV/best.json" 2>/dev/null
 }
+best_of() {  # kind [name prefix] -> "score gate_sets sets weights name" of the best checked entry of that kind
+  ( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" ) > "$EV/pick.log" 2>&1
+  "$PY" -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+xs = [s for s in d['saves'] if s.get('kind') == sys.argv[2] and s['name'].startswith(sys.argv[3]) and s.get('score') is not None]
+xs.sort(key=lambda s: (s['gate_sets'], s['score']), reverse=True)
+print(*(xs[0][k] for k in ('score', 'gate_sets', 'sets', 'weights', 'name', 'step')) if xs else '')" "$EV/best.json" "$1" "${2:-}" 2>/dev/null
+}
+
+# A run that would overwrite an earlier run's videos and review file keeps a copy first.
+BACKUP="$EV/backup_before_$EXP"
+if [ "$PFX" != "fx6b" ] && [ ! -d "$BACKUP" ] && { ls "$EV"/fx6b_*_best.mp4 >/dev/null 2>&1 || [ -f "$AZ_ROOT/eval/fx6b_review.tar" ]; }; then
+  mkdir -p "$BACKUP"
+  cp -p "$EV"/fx6b_*_best.mp4 "$EV/best.json" "$EV/pick.log" "$AZ_ROOT/eval/fx6b_review.tar" "$BACKUP/" 2>/dev/null
+  say "1. earlier videos, picks and review file copied to $BACKUP"
+fi
 
 register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors" start "fxreal6 step 5800"
 rm -f "$EV/.training_done" "$EV/.waiting_note"
@@ -337,9 +362,36 @@ for b in $BLENDS; do
     "blend: step 5800 at $b% + favourite #2"
 done
 if [ -n "$(pending .rendered)" ]; then
-  say "2. blend test: rendering $(pending .rendered | tr '\n' ' ')before the training (scored beside it)"
+  say "2. blend test: rendering $(pending .rendered | tr '\n' ' ')before the training"
   touch "$EV/.training_done"; render_loop; rm -f "$EV/.training_done"
   say "2. blend renders done"
+fi
+TRAIN_RANK=64
+TRAIN_INIT="$START_DIR"
+if [ "$TRAIN_FROM" = "best_blend" ]; then
+  # the blends are scored now: the training starts from the best one
+  if [ -n "$(pending .scored)" ]; then
+    say "2. scoring the blends before the training"
+    touch "$EV/.training_done"; score_loop; rm -f "$EV/.training_done"
+  fi
+  grep -E "^SAVE (blend|fxreal6 step 5800)" "$EV/pick.log" 2>/dev/null | sed 's/^/FX6B check: /'
+  read -r BB_SCORE BB_GATE BB_SETS BB_W BB_NAME BB_STEP < <(best_of blend)
+  read -r S0_SCORE _ < <(best_of start)
+  if [ -z "${BB_W:-}" ]; then
+    say "2. NO_BLEND: no blend could be made and checked: NOT TRAINING"; SKIP_TRAIN=1
+  elif [ "${AZ_TRAIN_ALWAYS:-0}" != "1" ] && awk -v a="$BB_SCORE" -v b="${S0_SCORE:--1}" 'BEGIN { exit !(a < b) }'; then
+    say "2. the best blend ($BB_NAME, score $BB_SCORE) is below step 5800 itself ($S0_SCORE): NOT TRAINING (AZ_TRAIN_ALWAYS=1 trains anyway)"; SKIP_TRAIN=1
+  else
+    TRAIN_INIT=$(dirname "$BB_W")
+    TRAIN_RANK=$("$PY" -c "
+import sys
+from safetensors import safe_open
+with safe_open(sys.argv[1], 'pt') as f:
+    k = next(k for k in f.keys() if '.lora_A.' in k)
+    print(f.get_slice(k).get_shape()[0])" "$BB_W" 2>/dev/null)
+    [ -n "$TRAIN_RANK" ] || fail "BAD_BLEND_FILE: no rank in $BB_W"
+    say "2. training starts from the best blend: $BB_NAME (score $BB_SCORE vs favourite #2, GATE $BB_GATE/$BB_SETS), rank $TRAIN_RANK"
+  fi
 fi
 
 # ---- 3. a restart: check what an earlier run left unchecked, then carry on from the best save
@@ -351,7 +403,7 @@ if ls -d "$OUT"/checkpoint-* >/dev/null 2>&1; then
     render_loop; score_loop
     rm -f "$EV/.training_done"
   fi
-  B=$(best_step)
+  read -r _ _ _ _ _ B < <(best_of save "$PFX")      # the best save of THIS run
   if [ "$RESUME_FROM" = "best" ] && [ -n "$B" ] && [ "$B" -gt 0 ]; then
     ASIDE="$OUT/set_aside/$(date -u +%Y%m%dT%H%M%SZ)"
     for n in $(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n); do
@@ -369,21 +421,23 @@ LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n
 TRAIN_MIN=$(( $(left_min) - RESERVE_MIN - END_MIN ))
 render_loop & LOOP_PIDS="$!"
 score_loop & LOOP_PIDS="$LOOP_PIDS $!"
-if [ "${LAST:-0}" -ge "$STEPS" ]; then
+if [ "${SKIP_TRAIN:-0}" = "1" ]; then
+  say "4. no training (see above): only the checks and the final pick"
+elif [ "${LAST:-0}" -ge "$STEPS" ]; then
   say "4. training already at step $LAST of $STEPS: only the checks"
 elif [ "$TRAIN_MIN" -lt 20 ]; then
   say "4. NOT TRAINING: only $TRAIN_MIN minutes of money left after the checks; top up to carry on"
 else
-  say "4. training from step ${LAST:-0} to $STEPS at learning rate $LR, a save every $EVERY, time limit $TRAIN_MIN min"
+  say "4. training $EXP from step ${LAST:-0} to $STEPS at learning rate $LR, rank $TRAIN_RANK, from $TRAIN_INIT, a save every $EVERY, time limit $TRAIN_MIN min"
   timeout -s INT "${TRAIN_MIN}m" bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/fluxrt_lora/run_train.sh | \
     AZ_REF=$AZ_REF AZ_MANIFEST_DIR=$AZ_ROOT/manifests/research-train AZ_EXP=$EXP \
     KLEIN_REPO=black-forest-labs/FLUX.2-klein-base-4B AZ_TIME_SHIFT_MU=2.01 AZ_REF_SIZE=$REF_SIZE AZ_REF_SIZES=$REF_SIZES \
-    AZ_MAX_STEPS=$STEPS AZ_BATCH=4 AZ_LORA_RANK=64 AZ_LR=$LR \
+    AZ_MAX_STEPS=$STEPS AZ_BATCH=4 AZ_LORA_RANK=$TRAIN_RANK AZ_LR=$LR \
     AZ_CKPT_INTERVAL=$EVERY AZ_CKPT_LIMIT=40 AZ_MASK_COLUMN=mask AZ_MASK_WEIGHT=${AZ_MASK_WEIGHT:-3.0} \
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
     AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
     AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor} AZ_ANCHOR_PROB=${AZ_ANCHOR_PROB:-1.0} \
-    AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$START_DIR bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
+    AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
   TRAIN_EXIT=$?
   TLOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
   grep -hE "LoRA initialised from|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
@@ -444,9 +498,9 @@ print(*top('blend'), *top('save'))" "$EV/best.json")
       [ "$BS_N" != "-" ] && PANELS+=("$BS_N=${BS_L//_/ } (best save)")
       ( cd "$T" && timeout 10m "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
           --panels "${PANELS[@]}" ) > "$EV/video_$s.log" 2>&1 || true
-      [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$EV/fx6b_${s}_best.mp4" && say "video: $EV/fx6b_${s}_best.mp4"
+      [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$EV/${PFX}_${s}_best.mp4" && say "video: $EV/${PFX}_${s}_best.mp4"
     done
   fi
 fi
-( cd "$EV" && tar cf "$AZ_ROOT/eval/fx6b_review.tar" best.json pick.log */*/*.md fx6b_*_best.mp4 2>/dev/null )
-say "FX6B_DONE: reports $AZ_ROOT/eval/fx6b_review.tar"
+( cd "$EV" && tar cf "$AZ_ROOT/eval/${PFX}_review.tar" best.json pick.log */*/*.md "${PFX}"_*_best.mp4 2>/dev/null )
+say "FX6B_DONE: reports $AZ_ROOT/eval/${PFX}_review.tar"

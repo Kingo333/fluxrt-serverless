@@ -125,7 +125,7 @@ def test_gain_is_relative_capped_and_direction_aware():
 def test_fx6b_script_continues_from_step_5800_at_half_rate_into_a_new_run_without_hijab():
     sh = SCRIPT.read_text()
     for s in ('LR="${AZ_LR:-2.5e-5}"', 'CAP="${AZ_CAP:-55}"', 'STEPS="${AZ_MAX_STEPS:-2000}"', 'EVERY="${AZ_SAVE_EVERY:-500}"',
-              'START_SHA="${AZ_START_SHA:-0ab25649}"', "EXP=fxreal6b", "AZ_INIT_LORA=$START_DIR", 'ln -s "$DATA_SRC" "$DATA"',
+              'START_SHA="${AZ_START_SHA:-0ab25649}"', "EXP=\"${AZ_EXP:-fxreal6b}\"", "AZ_INIT_LORA=$TRAIN_INIT", 'ln -s "$DATA_SRC" "$DATA"',
               'SETS="${AZ_EVAL_SETS:-fx6test cases5 dress10}"', "fluxrt_lora.pick_best_save", "AZ_CKPT_INTERVAL=$EVERY",
               "AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5}", "AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3}",
               'mv "$OUT/checkpoint-$n" "$ASIDE/"', 'RESUME_FROM="${AZ_RESUME_FROM:-best}"', "WRONG_START_WEIGHTS"):
@@ -213,7 +213,7 @@ def test_trainer_applies_the_disk_cache_patch_last_and_fx6b_uses_it():
     rt = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
     assert rt.index("flux2-klein-anchor.patch") < rt.index("flux2-klein-diskcache.patch")
     sh = SCRIPT.read_text()
-    assert "AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$START_DIR" in sh and "NO_DISK_FOR_TEXT_CACHE" in sh
+    assert "AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT" in sh and "NO_DISK_FOR_TEXT_CACHE" in sh
     assert 'AZ_RENDER_MIN_GPU_GB:-22' in sh and 'AZ_RENDER_MIN_RAM_GB:-30' in sh and 'rm -f "$TEXT_DIR/text_cache.bin"' in sh
     fn = sh[sh.index("ram_free_gb() {"):sh.index("gpu_free_gb() {")]
     r = subprocess.run(["bash", "-c", fn + "ram_free_gb"], capture_output=True, text=True)
@@ -268,3 +268,18 @@ def test_blends_are_merged_files_checked_before_the_training_and_ranked_with_the
     (ev / "b75" / ".scored").unlink()                     # only weaker candidates left: keep favourite #2
     main([str(ev), "--baseline", "fav2"])
     assert "VERDICT nothing beats favourite #2 on every set: keep favourite #2 live" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- train from the best blend (owner, 2026-11-17)
+def test_best_blend_mode_scores_blends_first_trains_from_the_best_at_its_rank_and_backs_up_old_outputs():
+    sh = SCRIPT.read_text()
+    for s in ('TRAIN_FROM="${AZ_TRAIN_FROM:-s5800}"', 'best_blend) EXP="${AZ_EXP:-fxreal6c}"', 'PFX="fx6${EXP#fxreal6}"',
+              'BACKUP="$EV/backup_before_$EXP"', 'cp -p "$EV"/fx6b_*_best.mp4', 'touch "$EV/.training_done"; score_loop',
+              "read -r BB_SCORE BB_GATE BB_SETS BB_W BB_NAME BB_STEP < <(best_of blend)", 'TRAIN_INIT=$(dirname "$BB_W")',
+              "AZ_LORA_RANK=$TRAIN_RANK", "AZ_INIT_LORA=$TRAIN_INIT", 'NOT TRAINING (AZ_TRAIN_ALWAYS=1 trains anyway)',
+              'read -r _ _ _ _ _ B < <(best_of save "$PFX")', '"$EV/${PFX}_${s}_best.mp4"', '"$AZ_ROOT/eval/${PFX}_review.tar"'):
+        assert s in sh, s
+    # the blends are scored, and the start chosen, before the training block
+    assert sh.index("best_of blend)") < sh.index("# ---- 3. a restart") < sh.index("# ---- 4. training")
+    # the default mode is unchanged: s5800 start, rank 64, the fxreal6b names
+    assert "TRAIN_RANK=64\nTRAIN_INIT=\"$START_DIR\"" in sh
