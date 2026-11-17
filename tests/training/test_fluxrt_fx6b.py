@@ -283,3 +283,11 @@ def test_best_blend_mode_scores_blends_first_trains_from_the_best_at_its_rank_an
     assert sh.index("best_of blend)") < sh.index("# ---- 3. a restart") < sh.index("# ---- 4. training")
     # the default mode is unchanged: s5800 start, rank 64, the fxreal6b names
     assert "TRAIN_RANK=64\nTRAIN_INIT=\"$START_DIR\"" in sh
+
+
+def test_the_score_loop_waits_only_for_its_own_scorers_not_the_spend_recorder():
+    sh = SCRIPT.read_text()
+    loop = sh[sh.index("score_loop() {"):sh.index("best_step() {")]
+    assert "wait $pids || true" in loop and "\n      wait || true" not in loop
+    # the spend recorder runs for the whole run: a bare wait in the main script would never return
+    assert "( while :; do record_spend; sleep 60; done ) >/dev/null 2>&1 &" in sh

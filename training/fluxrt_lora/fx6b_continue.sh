@@ -305,8 +305,11 @@ score_loop() {
       [ -f "$EV/$id/.rendered" ] || break               # in step order: wait for this one's videos
       eval_deadline_passed && break
       n=$(meta "$id" name); ok=1
-      for s in $SETS; do score_set "$s" "$n" "$EV/$id/$s" & done
-      wait || true
+      # wait for THESE scorers only: a bare "wait" also waits for the spend recorder, which never ends when this
+      # loop runs in the main script (2026-11-17: the blend scoring in best_blend mode hung there for 40 minutes)
+      local pids=""
+      for s in $SETS; do score_set "$s" "$n" "$EV/$id/$s" & pids="$pids $!"; done
+      wait $pids || true
       for s in $SETS; do [ -f "$EV/$id/$s/garment.json" ] && [ -f "$EV/$id/$s/preserve_check.json" ] || ok=0; done
       if [ "$ok" = 1 ]; then
         touch "$EV/$id/.scored"
