@@ -124,7 +124,7 @@ def test_gain_is_relative_capped_and_direction_aware():
 # ---------------------------------------------------------------- the Pod script
 def test_fx6b_script_continues_from_step_5800_at_half_rate_into_a_new_run_without_hijab():
     sh = SCRIPT.read_text()
-    for s in ('LR="${AZ_LR:-2.5e-5}"', 'CAP="${AZ_CAP:-55}"', 'STEPS="${AZ_MAX_STEPS:-2000}"', 'EVERY="${AZ_SAVE_EVERY:-500}"',
+    for s in ('else D_LR=2.5e-5;', 'LR="${AZ_LR:-$D_LR}"', 'CAP="${AZ_CAP:-55}"', 'STEPS="${AZ_MAX_STEPS:-2000}"', 'EVERY="${AZ_SAVE_EVERY:-500}"',
               'START_SHA="${AZ_START_SHA:-0ab25649}"', "EXP=\"${AZ_EXP:-fxreal6b}\"", "AZ_INIT_LORA=$TRAIN_INIT", 'ln -s "$DATA_SRC" "$DATA"',
               'SETS="${AZ_EVAL_SETS:-fx6test cases5 dress10}"', "fluxrt_lora.pick_best_save", "AZ_CKPT_INTERVAL=$EVERY",
               "AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5}", "AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3}",
@@ -249,9 +249,10 @@ def test_blends_are_merged_files_checked_before_the_training_and_ranked_with_the
     sh = SCRIPT.read_text()
     blend, train = sh.index("# ---- 2. the blend test first"), sh.index("# ---- 4. training")
     assert blend < sh.index("# ---- 3. a restart") < train
-    for s in ('BLENDS="${AZ_BLENDS-75 50}"', "fluxrt_lora.merge_lora", '--weights "0.$b" "0.$(( 100 - b ))" --scale 1.0',
+    for s in ('D_BLENDS="75 50"', 'BLENDS="${AZ_BLENDS-$D_BLENDS}"', "fluxrt_lora.merge_lora", '--weights "0.$b" "0.$(( 100 - b ))" --scale 1.0',
               'touch "$EV/.training_done"; render_loop; rm -f "$EV/.training_done"', '"fx6blend${b}x${bsum}_$TAG"',
-              "(best blend)", "(best save)", "^VERDICT"):
+              "top(lambda s: s.get('kind') == 'blend')", "top(lambda s: s.get('kind') == 'save' and s['name'].startswith(pfx))",
+              "^VERDICT"):
         assert s in sh, s
     from fluxrt_lora.pick_best_save import main
     ev = tmp_path / "fx6b"
@@ -273,8 +274,8 @@ def test_blends_are_merged_files_checked_before_the_training_and_ranked_with_the
 # ---------------------------------------------------------------- train from the best blend (owner, 2026-11-17)
 def test_best_blend_mode_scores_blends_first_trains_from_the_best_at_its_rank_and_backs_up_old_outputs():
     sh = SCRIPT.read_text()
-    for s in ('TRAIN_FROM="${AZ_TRAIN_FROM:-s5800}"', 'best_blend) EXP="${AZ_EXP:-fxreal6c}"', 'PFX="fx6${EXP#fxreal6}"',
-              'BACKUP="$EV/backup_before_$EXP"', 'cp -p "$EV"/fx6b_*_best.mp4', 'touch "$EV/.training_done"; score_loop',
+    for s in ('TRAIN_FROM="${AZ_TRAIN_FROM:-s5800}"', 'best_blend) EXP="${AZ_EXP:-fxreal6c}"', 'PFX="fx${EXP#fxreal}"',
+              'BACKUP="$EV/backup_before_$EXP"', 'cp -p "$EV"/fx*_best.mp4', 'touch "$EV/.training_done"; score_now',
               "read -r BB_SCORE BB_GATE BB_SETS BB_W BB_NAME BB_STEP < <(best_of blend)", 'TRAIN_INIT=$(dirname "$BB_W")',
               "AZ_LORA_RANK=$TRAIN_RANK", "AZ_INIT_LORA=$TRAIN_INIT", 'NOT TRAINING (AZ_TRAIN_ALWAYS=1 trains anyway)',
               'read -r _ _ _ _ _ B < <(best_of save "$PFX")', '"$EV/${PFX}_${s}_best.mp4"', '"$AZ_ROOT/eval/${PFX}_review.tar"'):
