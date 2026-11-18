@@ -22,6 +22,10 @@ Chance (owner, 2026-11-17): an entry of kind "aa" is favourite #2 itself rendere
 never a candidate. Its score is the size of chance differences, and the number of sets where it passes the GATE
 against favourite #2 is the most any candidate is asked to pass (a model cannot be asked to be cleaner against
 favourite #2 than favourite #2 is against itself). Without such an entry the bar is every set and chance is 0.
+
+Run-time steadiness (owner, 2026-11-18): an entry of kind "runtime" is favourite #2's own file rendered with the
+run-time steadiness filter (eval.steady_filter). It is never the pick either (its file is favourite #2's; the
+filter is not in it): it gets a RUNTIME line instead, with its score against chance and its flicker and movement.
 """
 
 from __future__ import annotations
@@ -184,17 +188,27 @@ def main(argv=None) -> dict:
         if areas:
             print(f"AREAS {r['label']}: {areas}")
     aa = next((r for r in rows if r["kind"] == "aa"), None)
-    cands = [r for r in rows if r["kind"] != "aa"]
+    runtime = sorted((r for r in rows if r["kind"] == "runtime"), key=lambda r: (r["step"] if r["step"] is not None else 0))
+    cands = [r for r in rows if r["kind"] not in ("aa", "runtime")]
     bar = aa["gate_sets"] if aa else None
     noise = chance_size(aa, weights) if aa else 0.0
     best = max(cands, key=lambda r: rank_key(r, bar)) if cands else None
     result = {"baseline": a.baseline, "weights": weights, "saves": rows, "best": best,
               "chance": None if aa is None else {"score": aa["score"], "size": round(noise, 4),
-                                                 "gate_sets": aa["gate_sets"], "sets": aa["sets"]}}
+                                                 "gate_sets": aa["gate_sets"], "sets": aa["sets"]},
+              "runtime": [{"label": r["label"], "name": r["name"], "score": r["score"], "areas": r["areas"],
+                           "beyond_chance": (r["score"] or 0) > noise} for r in runtime]}
     (root / "best.json").write_text(json.dumps(result, indent=1))
     if aa:
         print(f"CHANCE favourite #2 with another random seed: score {fmt(aa['score'])} against itself, "
               f"GATE {aa['gate_sets']}/{aa['sets']} sets; differences up to {fmt(noise)} mean nothing")
+    for r in runtime:
+        ar = r["areas"]
+        beyond = (r["score"] or 0) > noise
+        print(f"RUNTIME {r['label']}: score {fmt(r['score'])} vs favourite #2 ({'beyond' if beyond else 'within'} chance "
+              f"{fmt(noise)}); flicker {fmt(ar.get('flicker'))}, movement {fmt(ar.get('movement'))}, detail "
+              f"{fmt(ar.get('detail'))}, colour {fmt(ar.get('colour'))}: "
+              + ("worth a live test (watch its video for smearing on moving arms)" if beyond else "no clear gain"))
     if best:
         need = best["sets"] if bar is None else min(bar, best["sets"])
         full = best["gate_sets"] >= need and (best["score"] or 0) > noise

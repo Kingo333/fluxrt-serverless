@@ -98,6 +98,11 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-anchor.patch"
 # bytes, same numbers), and the CPU RAM check reads the container's memory limit, not only the host's.
 curl -fsSL "$RAW/patches/flux2-klein-diskcache.patch" -o "$AZ_ROOT/flux2-klein-diskcache.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-diskcache.patch"
+# fxreal8 (2026-11-18): a LoRA merged into the frozen weights with a small add-on on top (--frozen_init_lora), a
+# steadiness term between the two frames of a pair (--steady_ratio), a reference term to the frozen model's own
+# prediction (--ref_weight) and a check of the first steps (--safety_steps). All off unless set.
+curl -fsSL "$RAW/patches/flux2-klein-fx8.patch" -o "$AZ_ROOT/flux2-klein-fx8.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx8.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -155,6 +160,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   ${AZ_TEXTURE_WEIGHT:+--texture_weight="$AZ_TEXTURE_WEIGHT"} \
   ${AZ_REF_SIZES:+--cond_2_sizes="$AZ_REF_SIZES"} \
   ${AZ_ANCHOR_COLUMN:+--cond_image_column_3="$AZ_ANCHOR_COLUMN" --cond_3_prob="${AZ_ANCHOR_PROB:-1.0}"} \
+  ${AZ_FROZEN_LORA:+--frozen_init_lora="$AZ_FROZEN_LORA"} \
+  ${AZ_STEADY_RATIO:+--steady_ratio="$AZ_STEADY_RATIO"} ${AZ_STEADY_WEIGHT:+--steady_weight="$AZ_STEADY_WEIGHT"} \
+  ${AZ_REF_WEIGHT:+--ref_weight="$AZ_REF_WEIGHT"} ${AZ_SAFETY_STEPS:+--safety_steps="$AZ_SAFETY_STEPS"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

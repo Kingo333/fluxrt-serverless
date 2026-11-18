@@ -2,6 +2,23 @@
 # fxreal6b (owner, 2026-11-16): carry on training fxreal6 from its step-5800 weights at half the learning rate, check
 # every save against favourite #2 while the training goes on, and keep the BEST save, not the last one.
 #
+#   AZ_TRAIN_FROM=fav2_addon (owner, 2026-11-18) = fxreal8: favourite #2 stays as it is and a small add-on learns
+#      on top. fxreal7 lost 14-19% on flicker and 7-9% on fabric at every save: nothing in the training rewarded
+#      steadiness where the live model works (the frame-pair term only compared the garment's average colour and
+#      was turned off at the live noise levels).
+#        a. favourite #2 un-scaled (as fxreal7, sha checked, strength measured) is merged into the FROZEN model;
+#           a rank-16 LoRA add-on starts as an exact zero on top (training/patches/flux2-klein-fx8.patch).
+#        b. steadiness term: the change between the two predicted pictures of a frame pair must match the change
+#           between the two real frames, counted where the real frames barely change, at every noise level;
+#           its weight is set from the first steps to AZ_STEADY_RATIO (0.25) of the loss.
+#        c. reference term: the distance from favourite #2's own prediction for the same input (AZ_REF_WEIGHT,
+#           1.0), so the add-on only moves where the real frames pull harder (garment and face count 3x there).
+#        d. a 20-step safety check (AZ_SAFETY_STEPS): the add-on starts exactly at favourite #2, every term is
+#           finite, frame pairs are present; otherwise the trainer stops with FX8_SAFETY_FAILED.
+#        e. 1,000 steps at 1e-4, a save every 250; each save = favourite #2 + the add-on in ONE file, turned down
+#           to 0.65 (it loads at scale 1.0 like favourite #2).
+#        f. before the training: favourite #2 with the run-time steadiness filter (eval.steady_filter) at
+#           AZ_RUNTIME percent (default "30 50"), kind "runtime": reported (RUNTIME lines), never the pick.
 #   AZ_TRAIN_FROM=fav2 (owner, 2026-11-17) = fxreal7: train favourite #2 ITSELF, at the strength it was made at.
 #      Favourite #2 is 0.5 x fxreal3 + 0.5 x fxreal4 turned DOWN to strength 0.65 on the live model. fxreal5,
 #      fxreal6, 6b and 6c all started from that file, trained on the base model (which pulls the strength back
@@ -70,18 +87,24 @@ CAP="${AZ_CAP:-55}"
 PRICE="${AZ_PRICE:-2.79}"
 BALANCE="${AZ_BALANCE:-}"
 KEEP="${AZ_BALANCE_KEEP:-1.50}"
-STEPS="${AZ_MAX_STEPS:-2000}"
-EVERY="${AZ_SAVE_EVERY:-500}"
 RESERVE_MIN="${AZ_RESERVE_MIN:-45}"   # kept after the training to check its last save
 END_MIN="${AZ_END_MIN:-8}"            # kept at the very end: pick the best, videos, stop
 RESUME_FROM="${AZ_RESUME_FROM:-best}"
 START_SHA="${AZ_START_SHA:-0ab25649}"
 TRAIN_FROM="${AZ_TRAIN_FROM:-s5800}"
 case "$TRAIN_FROM" in s5800) EXP="${AZ_EXP:-fxreal6b}";; best_blend) EXP="${AZ_EXP:-fxreal6c}";; fav2) EXP="${AZ_EXP:-fxreal7}";;
-  *) echo "BAD_AZ_TRAIN_FROM: $TRAIN_FROM (s5800, best_blend or fav2)"; exit 1;; esac
-PFX="fx${EXP#fxreal}"            # fxreal6b -> fx6b (saves, videos), fxreal6c -> fx6c, fxreal7 -> fx7
-if [ "$TRAIN_FROM" = "fav2" ]; then D_LR=5e-5; D_SCALE=65; D_ANCHOR=0; D_SCALED="65 80"; D_AA=1; D_BLENDS=""
-else D_LR=2.5e-5; D_SCALE=100; D_ANCHOR=1; D_SCALED=""; D_AA=0; D_BLENDS="75 50"; fi
+  fav2_addon) EXP="${AZ_EXP:-fxreal8}";;
+  *) echo "BAD_AZ_TRAIN_FROM: $TRAIN_FROM (s5800, best_blend, fav2 or fav2_addon)"; exit 1;; esac
+PFX="fx${EXP#fxreal}"            # fxreal6b -> fx6b (saves, videos), fxreal6c -> fx6c, fxreal7 -> fx7, fxreal8 -> fx8
+FAV2_MODE=0; case "$TRAIN_FROM" in fav2|fav2_addon) FAV2_MODE=1;; esac   # favourite #2 is the start
+case "$TRAIN_FROM" in
+  fav2_addon) D_LR=1e-4; D_SCALE=65; D_ANCHOR=0; D_SCALED=""; D_AA=1; D_BLENDS=""; D_STEPS=1000; D_EVERY=250; D_RANK=16; D_RUNTIME="30 50";;
+  fav2) D_LR=5e-5; D_SCALE=65; D_ANCHOR=0; D_SCALED="65 80"; D_AA=1; D_BLENDS=""; D_STEPS=2000; D_EVERY=500; D_RANK=64; D_RUNTIME="";;
+  *) D_LR=2.5e-5; D_SCALE=100; D_ANCHOR=1; D_SCALED=""; D_AA=0; D_BLENDS="75 50"; D_STEPS=2000; D_EVERY=500; D_RANK=64; D_RUNTIME="";;
+esac
+STEPS="${AZ_MAX_STEPS:-$D_STEPS}"
+EVERY="${AZ_SAVE_EVERY:-$D_EVERY}"
+RUNTIME="${AZ_RUNTIME-$D_RUNTIME}"         # favourite #2 with the run-time steadiness filter at these percentages
 LR="${AZ_LR:-$D_LR}"
 EVAL_SCALE="${AZ_EVAL_SCALE:-$D_SCALE}"   # saves are judged and kept turned down to this percentage (100 = as trained)
 case "$EVAL_SCALE" in 100|[1-9][0-9]) ;; *) echo "BAD_AZ_EVAL_SCALE: $EVAL_SCALE (10 to 100)"; exit 1;; esac
@@ -203,7 +226,7 @@ if [ ! -f "$START_DIR/pytorch_lora_weights.safetensors" ]; then
 fi
 START_SUM=$(sha256sum "$START_DIR/pytorch_lora_weights.safetensors" | cut -c1-64)
 case "$START_SUM" in "$START_SHA"*) ;; *) fail "WRONG_START_WEIGHTS: $START_DIR is ${START_SUM:0:8}..., expected $START_SHA... (the step-5800 weights)";; esac
-if [ "$TRAIN_FROM" = "fav2" ]; then
+if [ "$FAV2_MODE" = 1 ]; then
   FAV_SUM=$(sha256sum "$INIT/pytorch_lora_weights.safetensors" | cut -c1-64)
   case "$FAV_SUM" in "$FAV2_SHA"*) ;; *) fail "WRONG_FAVOURITE2: $INIT is ${FAV_SUM:0:8}..., expected $FAV2_SHA... (favourite #2's file)";; esac
   say "1. favourite #2 confirmed (${FAV_SUM:0:8}..., blend05s065); step 5800 of fxreal6 (${START_SUM:0:8}...) is used for the strength test"
@@ -308,10 +331,16 @@ register_saves() {  # every finished checkpoint of this run
     w="$SAVES/step${n}_$sum.safetensors"; name="${PFX}${n}x${sum}_$TAG"; label="$EXP step $n"
     cp "$f" "$w"
     if [ "$EVAL_SCALE" != "100" ]; then
-      # judged, and kept, turned down to EVAL_SCALE: the way favourite #2 itself was made
-      ( cd "$T" && "$PY" -m fluxrt_lora.merge_lora --inputs "$w" --weights 1.0 --scale "0.$EVAL_SCALE" \
+      # judged, and kept, turned down to EVAL_SCALE: the way favourite #2 itself was made. fxreal8's saves hold
+      # the add-on only: favourite #2 un-scaled + the add-on are merged into one file first.
+      local min=("$w") mw=(1.0) note="$EXP step $n turned down to 0.$EVAL_SCALE"
+      if [ "$TRAIN_FROM" = "fav2_addon" ]; then
+        min=("$UNSCALED_DIR/pytorch_lora_weights.safetensors" "$w"); mw=(1.0 1.0)
+        note="favourite #2 + the $EXP add-on at step $n, turned down to 0.$EVAL_SCALE"
+      fi
+      ( cd "$T" && "$PY" -m fluxrt_lora.merge_lora --inputs "${min[@]}" --weights "${mw[@]}" --scale "0.$EVAL_SCALE" \
           --out "$SAVES/step${n}_${sum}_s$EVAL_SCALE" --selection-from "$DATA_SRC" \
-          --note "$EXP step $n turned down to 0.$EVAL_SCALE" ) > "$EV/merge_$id.log" 2>&1 \
+          --note "$note" ) > "$EV/merge_$id.log" 2>&1 \
         || { say "SCALE_FAILED for step $n (see $EV/merge_$id.log): left out"; touch "$EV/$id.scale_failed"; continue; }
       w="$SAVES/step${n}_${sum}_s$EVAL_SCALE/pytorch_lora_weights.safetensors"
       name="${PFX}${n}x${sum}s${EVAL_SCALE}_$TAG"; label="$EXP step $n at 0.$EVAL_SCALE"
@@ -423,8 +452,8 @@ fi
 register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors" start "fxreal6 step 5800"
 rm -f "$EV/.training_done" "$EV/.waiting_note" "$EV/.renders_done"
 
-# ---- 2a. fxreal7: favourite #2 un-scaled (the training start), the strength check, the checks without training
-if [ "$TRAIN_FROM" = "fav2" ]; then
+# ---- 2a. fxreal7/8: favourite #2 un-scaled (the training start), the strength check, the checks without training
+if [ "$FAV2_MODE" = 1 ]; then
   if [ ! -f "$UNSCALED_DIR/pytorch_lora_weights.safetensors" ]; then
     UP=$(awk -v s="$FAV2_STRENGTH" 'BEGIN { printf "%.6f", 1 / s }')
     ( cd "$T" && "$PY" -m fluxrt_lora.merge_lora --inputs "$INIT/pytorch_lora_weights.safetensors" --weights 1.0 --scale "$UP" \
@@ -474,6 +503,12 @@ sys.exit(0 if abs(g['strength'] / want - 1) < 0.01 and g['new_part'] < 0.02 else
     fi
     register "s5800s$sc" "-$(( 300 - sc ))" "fx6s5800s${sc}_$TAG" "$sdir/pytorch_lora_weights.safetensors" scaled "fxreal6 step 5800 at 0.$sc"
   done
+  # favourite #2 with the run-time steadiness filter (fxreal8): favourite #2's own file, another renderer setting
+  for rt in $RUNTIME; do
+    case "$rt" in [1-9][0-9]) ;; *) say "BAD_AZ_RUNTIME: $rt (two-digit percentages, 10 to 99): skipped"; continue;; esac
+    register "rt$rt" "-$(( 500 - rt ))" "fav2rt${rt}_$TAG" "$INIT/pytorch_lora_weights.safetensors" runtime \
+      "favourite #2 + run-time steadiness 0.$rt" "--steady-blend 0.$rt"
+  done
   # a blend an earlier run rendered but never scored (its marker was set by hand) is scored now: CPU only
   for d in "$EV"/b[0-9][0-9]x*; do
     [ -f "$d/.rendered" ] && [ -f "$d/.failed" ] && [ ! -f "$d/.scored" ] && [ ! -f "$d/.score_tries" ] || continue
@@ -498,13 +533,19 @@ for b in $BLENDS; do
 done
 if [ -n "$(pending .rendered)" ]; then
   say "2. before the training: rendering $(pending .rendered | tr '\n' ' ')"
-  [ "$TRAIN_FROM" = "fav2" ] && start_scorer    # scored as each one is ready (best_blend scores them itself, below)
+  [ "$FAV2_MODE" = 1 ] && start_scorer    # scored as each one is ready (best_blend scores them itself, below)
   touch "$EV/.training_done"; render_loop; rm -f "$EV/.training_done"
   say "2. renders before the training done"
 fi
-TRAIN_RANK=64
+TRAIN_RANK="${AZ_LORA_RANK:-$D_RANK}"
 TRAIN_INIT="$START_DIR"
 [ "$TRAIN_FROM" = "fav2" ] && TRAIN_INIT="$UNSCALED_DIR"
+FX8_ENV=""
+if [ "$TRAIN_FROM" = "fav2_addon" ]; then
+  # favourite #2 un-scaled is merged into the frozen model; the add-on starts at zero (no starting LoRA)
+  TRAIN_INIT=""
+  FX8_ENV="AZ_FROZEN_LORA=$UNSCALED_DIR AZ_STEADY_RATIO=${AZ_STEADY_RATIO:-0.25} AZ_REF_WEIGHT=${AZ_REF_WEIGHT:-1.0} AZ_SAFETY_STEPS=${AZ_SAFETY_STEPS:-20}"
+fi
 if [ "$TRAIN_FROM" = "best_blend" ]; then
   # the blends are scored now: the training starts from the best one
   if [ -n "$(pending .scored)" ]; then
@@ -568,7 +609,9 @@ elif [ "${LAST:-0}" -ge "$STEPS" ]; then
 elif [ "$TRAIN_MIN" -lt 20 ]; then
   say "4. NOT TRAINING: only $TRAIN_MIN minutes of money left after the checks; top up to carry on"
 else
-  say "4. training $EXP from step ${LAST:-0} to $STEPS at learning rate $LR, rank $TRAIN_RANK, from $TRAIN_INIT, earlier-frame input $( [ "$USE_ANCHOR" = "1" ] && echo on || echo off ), a save every $EVERY, time limit $TRAIN_MIN min"
+  FROM_TXT="from $TRAIN_INIT"
+  [ "$TRAIN_FROM" = "fav2_addon" ] && FROM_TXT="as an add-on over favourite #2 (frozen, un-scaled), steadiness ${AZ_STEADY_RATIO:-0.25} of the loss, reference to favourite #2 x${AZ_REF_WEIGHT:-1.0}, a ${AZ_SAFETY_STEPS:-20}-step safety check"
+  say "4. training $EXP from step ${LAST:-0} to $STEPS at learning rate $LR, rank $TRAIN_RANK, $FROM_TXT, earlier-frame input $( [ "$USE_ANCHOR" = "1" ] && echo on || echo off ), a save every $EVERY, time limit $TRAIN_MIN min"
   timeout -s INT "${TRAIN_MIN}m" bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/fluxrt_lora/run_train.sh | \
     AZ_REF=$AZ_REF AZ_MANIFEST_DIR=$AZ_ROOT/manifests/research-train AZ_EXP=$EXP \
     KLEIN_REPO=black-forest-labs/FLUX.2-klein-base-4B AZ_TIME_SHIFT_MU=2.01 AZ_REF_SIZE=$REF_SIZE AZ_REF_SIZES=$REF_SIZES \
@@ -577,13 +620,15 @@ else
     AZ_PAIR_COLUMN=pair AZ_PAIR_WEIGHT=${AZ_PAIR_WEIGHT:-1.0} AZ_DETAIL_WEIGHT=${AZ_DETAIL_WEIGHT:-0.05} \
     AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5} AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3} \
     AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor} AZ_ANCHOR_PROB=$ANCHOR_PROB \
-    AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
+    AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT $FX8_ENV bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
   TRAIN_EXIT=$?
   TLOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
-  grep -hE "LoRA initialised from|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
-    "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -8 | sed 's/^/FX6B trainer: /'
+  grep -hE "LoRA initialised from|^FROZEN_LORA|^FX8_|^STEADY_WEIGHT|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
+    "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -12 | sed 's/^/FX6B trainer: /'
+  grep -qh "^FX8_SAFETY_FAILED" "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null \
+    && say "4. the safety check stopped the training before it could spend more (FX8_SAFETY_FAILED above): only the checks"
   rm -f "$TEXT_DIR/text_cache.bin"   # the trainer's own scratch file (made again at every start)
-  grep -oE "(loss|detail|pair|colour|texture)=[0-9.e+-]+" "$TLOG" 2>/dev/null | tail -5 | tr '\n' ' '; echo
+  grep -oE "(loss|detail|pair|colour|texture|steady|ref)=[0-9.e+-]+" "$TLOG" 2>/dev/null | tail -7 | tr '\n' ' '; echo
   LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
   [ "$TRAIN_EXIT" = 124 ] && say "training stopped by the money limit at step ${LAST:-none} (exit 124); the saves are kept" \
     || say "training ended (exit $TRAIN_EXIT), newest save: step ${LAST:-none} of $STEPS"
@@ -622,7 +667,7 @@ LOOP_PIDS=""
 
 # ---- 6. the best save
 B=$(best_step)
-grep -E "^(SAVE|AREAS|CHANCE|BEST)" "$EV/pick.log" | sed 's/^/FX6B /'
+grep -E "^(SAVE|AREAS|CHANCE|RUNTIME|BEST)" "$EV/pick.log" | sed 's/^/FX6B /'
 UNCHECKED=$(pending .scored | tr '\n' ' ')
 [ -n "$UNCHECKED" ] && say "NOT CHECKED: $UNCHECKED- run the same line again (after a top-up if the money ran out)"
 if [ -z "$B" ]; then
@@ -648,8 +693,11 @@ rows = [s for s in d['saves'] if s.get('score') is not None and s.get('kind') !=
 def top(pred):
     xs = sorted((s for s in rows if pred(s)), key=lambda s: (s['gate_sets'], s['score']), reverse=True)
     return xs[0] if xs else None
-picks = [top(lambda s: s.get('kind') == 'scaled') or next((s for s in rows if s['name'] == s5800), None)]
-if mode != 'fav2':
+if mode == 'fav2_addon':
+    picks = [top(lambda s: s.get('kind') == 'runtime')]
+else:
+    picks = [top(lambda s: s.get('kind') == 'scaled') or next((s for s in rows if s['name'] == s5800), None)]
+if mode not in ('fav2', 'fav2_addon'):
     picks.append(top(lambda s: s.get('kind') == 'blend'))
 picks += [top(lambda s: s.get('kind') == 'save' and s['name'].startswith(pfx)), d.get('best')]
 seen = set()

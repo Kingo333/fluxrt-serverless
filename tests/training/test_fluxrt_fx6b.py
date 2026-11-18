@@ -124,7 +124,8 @@ def test_gain_is_relative_capped_and_direction_aware():
 # ---------------------------------------------------------------- the Pod script
 def test_fx6b_script_continues_from_step_5800_at_half_rate_into_a_new_run_without_hijab():
     sh = SCRIPT.read_text()
-    for s in ('else D_LR=2.5e-5;', 'LR="${AZ_LR:-$D_LR}"', 'CAP="${AZ_CAP:-55}"', 'STEPS="${AZ_MAX_STEPS:-2000}"', 'EVERY="${AZ_SAVE_EVERY:-500}"',
+    for s in ('*) D_LR=2.5e-5;', 'LR="${AZ_LR:-$D_LR}"', 'CAP="${AZ_CAP:-55}"', 'STEPS="${AZ_MAX_STEPS:-$D_STEPS}"',
+              'EVERY="${AZ_SAVE_EVERY:-$D_EVERY}"', 'D_STEPS=2000; D_EVERY=500; D_RANK=64',
               'START_SHA="${AZ_START_SHA:-0ab25649}"', "EXP=\"${AZ_EXP:-fxreal6b}\"", "AZ_INIT_LORA=$TRAIN_INIT", 'ln -s "$DATA_SRC" "$DATA"',
               'SETS="${AZ_EVAL_SETS:-fx6test cases5 dress10}"', "fluxrt_lora.pick_best_save", "AZ_CKPT_INTERVAL=$EVERY",
               "AZ_COLOUR_WEIGHT=${AZ_COLOUR_WEIGHT:-0.5}", "AZ_TEXTURE_WEIGHT=${AZ_TEXTURE_WEIGHT:-0.3}",
@@ -283,7 +284,7 @@ def test_best_blend_mode_scores_blends_first_trains_from_the_best_at_its_rank_an
     # the blends are scored, and the start chosen, before the training block
     assert sh.index("best_of blend)") < sh.index("# ---- 3. a restart") < sh.index("# ---- 4. training")
     # the default mode is unchanged: s5800 start, rank 64, the fxreal6b names
-    assert "TRAIN_RANK=64\nTRAIN_INIT=\"$START_DIR\"" in sh
+    assert 'TRAIN_RANK="${AZ_LORA_RANK:-$D_RANK}"\nTRAIN_INIT="$START_DIR"' in sh
 
 
 def test_the_score_loop_waits_only_for_its_own_scorers_not_the_spend_recorder():

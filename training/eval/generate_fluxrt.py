@@ -167,6 +167,11 @@ def main(argv=None) -> None:
                     help="fxreal6: like the live FLUXRT_ANCHOR, after this many output frames of a clip the model also "
                          "gets its own last picture as a third image (0 = off; --clip-list only)")
     ap.add_argument("--anchor-every", type=int, default=0, help="and that picture is renewed every this many frames (0 = once)")
+    ap.add_argument("--steady-blend", type=float, default=0.0,
+                    help="fxreal8 run-time steadiness (eval.steady_filter): keep this share of the previous output where "
+                         "the camera picture did not move (0 = off; --clip-list only). Not part of the model.")
+    ap.add_argument("--steady-motion", type=float, default=0.04,
+                    help="camera change (0..1 of full brightness) at which a place counts as moving (no blending)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
                     "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
                     "--staging is then ignored")
@@ -269,6 +274,7 @@ def main(argv=None) -> None:
 def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies: list) -> None:
     """--clip-list: real clips with chosen garment photos (the owner's five test cases)."""
     import shutil
+    import numpy as np
     import torch
     from PIL import Image
     items = json.loads(Path(a.clip_list).read_text())[: a.max_items]
@@ -288,6 +294,10 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
         prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"), **plain)
         outs = []
         anchor, anchor_at = None, None
+        steady = None
+        if a.steady_blend > 0:
+            from eval.steady_filter import SteadyFilter
+            steady = SteadyFilter(a.steady_blend, a.steady_motion)
         for i, frame in enumerate(frames):
             if a.anchor_after > 0 and outs and (
                     (anchor is None and i >= a.anchor_after)
@@ -302,7 +312,10 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
             torch.cuda.synchronize()
             if i >= 3:
                 latencies.append(time.perf_counter() - t0)
-            outs.append(img.convert("RGB").resize((w, h)))
+            o = img.convert("RGB").resize((w, h))
+            if steady is not None:
+                o = Image.fromarray(steady(np.asarray(frame.convert("RGB")), np.asarray(o)))
+            outs.append(o)
         _write_mp4(result, outs)
         if not (dest / "input.mp4").exists():
             _write_mp4(dest / "input.mp4", frames)

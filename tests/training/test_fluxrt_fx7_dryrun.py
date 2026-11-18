@@ -89,6 +89,10 @@ def colour(name):
     if name.startswith("fx6s5800s80"): return 11.6
     if name.startswith("fx6blend"): return 12.5
     if name.startswith("fx6s5800"): return 13.0
+    if name.startswith("fav2rt"): return 11.8 if "rt50" in name else 11.9
+    if name.startswith("fx8"):
+        for step, c in (("750x", 10.9), ("1000x", 11.1), ("500x", 11.4), ("250x", 11.7)):
+            if name[3:].startswith(step): return c
     for step, c in (("2000x", 10.6), ("1500x", 10.2), ("1000x", 10.8), ("500x", 11.5)):
         if step in name: return c
     return 12.0
@@ -131,7 +135,8 @@ elif mod == "eval.generate_fluxrt":
         d = out / clip; d.mkdir(parents=True, exist_ok=True)
         if not (d / f"out_{name}.mp4").exists():
             (d / f"out_{name}.mp4").write_text("video"); new += 1; print(json.dumps({"model": name, "clip": clip}))
-    log("render.log", {"name": name, "set": out.name, "seed": opt("--seed"), "new": new, "t": time.time()})
+    log("render.log", {"name": name, "set": out.name, "seed": opt("--seed"), "steady": opt("--steady-blend"), "new": new,
+                       "t": time.time()})
     time.sleep(0.05)
 elif mod == "eval.garment_report":
     if args[0] == "score":
@@ -161,6 +166,18 @@ elif mod == "eval.step_a":
     root, s = Path(args[1]), opt("--set")
     (root / "eval/fxa" / f"{s}_labelled.mp4").write_text("video")
     log("video.log", {"set": s, "panels": opt("--panels", many=True), "cols": opt("--cols")})
+elif mod == "fake.addon":
+    import numpy as np
+    from safetensors.numpy import load_file, save_file
+    frozen = load_file(args[1])
+    rng = np.random.default_rng(int(args[2]))
+    sd = {}
+    for k, v in frozen.items():
+        if ".lora_A." in k:
+            sd[k] = rng.normal(0, 0.1, (2, v.shape[1])).astype(np.float32)
+        else:
+            sd[k] = rng.normal(0, 0.1, (v.shape[0], 2)).astype(np.float32)
+    save_file(sd, args[0])
 else:
     sys.exit(f"unexpected tool {mod}")
 '''
@@ -168,20 +185,38 @@ else:
 FAKE_TRAIN = r'''#!/bin/bash
 # stand-in for run_train.sh: records what it was asked to do and makes a save at every interval
 [ "${STUB_TRAIN_FAIL:-0}" = "1" ] && { echo "Traceback (most recent call last): made-up trainer crash" >&2; exit 9; }
-echo "AZ_EXP=$AZ_EXP AZ_MAX_STEPS=$AZ_MAX_STEPS AZ_LR=$AZ_LR AZ_LORA_RANK=$AZ_LORA_RANK AZ_INIT_LORA=$AZ_INIT_LORA AZ_ANCHOR_COLUMN=$AZ_ANCHOR_COLUMN AZ_ANCHOR_PROB=$AZ_ANCHOR_PROB AZ_CKPT_INTERVAL=$AZ_CKPT_INTERVAL KLEIN_REPO=$KLEIN_REPO AZ_TEXT_CACHE_DIR=$AZ_TEXT_CACHE_DIR" >> "$STUB_LOG/train_env.log"
-[ -f "$AZ_INIT_LORA/pytorch_lora_weights.safetensors" ] || { echo "no start weights in $AZ_INIT_LORA" >&2; exit 9; }
+echo "AZ_EXP=$AZ_EXP AZ_MAX_STEPS=$AZ_MAX_STEPS AZ_LR=$AZ_LR AZ_LORA_RANK=$AZ_LORA_RANK AZ_INIT_LORA=$AZ_INIT_LORA AZ_ANCHOR_COLUMN=$AZ_ANCHOR_COLUMN AZ_ANCHOR_PROB=$AZ_ANCHOR_PROB AZ_CKPT_INTERVAL=$AZ_CKPT_INTERVAL KLEIN_REPO=$KLEIN_REPO AZ_TEXT_CACHE_DIR=$AZ_TEXT_CACHE_DIR AZ_FROZEN_LORA=$AZ_FROZEN_LORA AZ_STEADY_RATIO=$AZ_STEADY_RATIO AZ_REF_WEIGHT=$AZ_REF_WEIGHT AZ_SAFETY_STEPS=$AZ_SAFETY_STEPS end" >> "$STUB_LOG/train_env.log"
 OUT="$AZ_ROOT/outputs/fluxrt_lora/$AZ_EXP"; mkdir -p "$OUT" "$AZ_ROOT/reports"
 LOG="$AZ_ROOT/reports/fluxlora_${AZ_EXP}_test.log"
-echo "LoRA initialised from $AZ_INIT_LORA (336 tensors)" >> "$LOG"
+if [ -n "${AZ_FROZEN_LORA:-}" ]; then
+  # fxreal8: no starting LoRA; favourite #2 un-scaled merged into the frozen model, a small add-on on top
+  [ -z "${AZ_INIT_LORA:-}" ] || { echo "both a starting LoRA and a frozen LoRA" >&2; exit 9; }
+  [ -f "$AZ_FROZEN_LORA/pytorch_lora_weights.safetensors" ] || { echo "no frozen LoRA in $AZ_FROZEN_LORA" >&2; exit 9; }
+  echo "FROZEN_LORA merged 3 layers of $AZ_FROZEN_LORA at x1 into the frozen weights (rounding to torch.bfloat16: 6.1% of the change)" >> "$LOG"
+  echo "FX8_ADDON rank $AZ_LORA_RANK on the same 3 layers as the frozen LoRA" >> "$LOG"
+  if [ "${STUB_FX8_FAIL:-0}" = "1" ]; then
+    echo "FX8_SAFETY_FAILED: the add-on does not start at the frozen model: reference term 0.4 at the first step (data term 0.9)" >> "$LOG"
+    exit 3
+  fi
+  echo "STEADY_WEIGHT 2.5" >> "$LOG"
+  echo "FX8_SAFETY_OK: start = the frozen model (reference term 0.0e+00 at the first step); steadiness term on in 20/20 batches; steadiness weight 2.5; every term finite over the first 20 steps" >> "$LOG"
+else
+  [ -f "$AZ_INIT_LORA/pytorch_lora_weights.safetensors" ] || { echo "no start weights in $AZ_INIT_LORA" >&2; exit 9; }
+  echo "LoRA initialised from $AZ_INIT_LORA (336 tensors)" >> "$LOG"
+fi
 [ "$AZ_ANCHOR_PROB" = "0" ] && echo "ANCHOR_BATCHES 0 with the earlier frame, 2000 without" >> "$LOG" || echo "ANCHOR_BATCHES 1100 with the earlier frame, 900 without" >> "$LOG"
 last=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1); last=${last:-0}
 n=$(( last + AZ_CKPT_INTERVAL ))
 while [ "$n" -le "$AZ_MAX_STEPS" ]; do
   sleep 1
   mkdir -p "$OUT/checkpoint-$n"
-  echo "weights of $AZ_EXP at step $n" > "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
+  if [ -n "${AZ_FROZEN_LORA:-}" ]; then
+    "$STUB_PY" "$STUB_DIR/tools.py" fake.addon "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors" "$AZ_FROZEN_LORA/pytorch_lora_weights.safetensors" "$n"
+  else
+    echo "weights of $AZ_EXP at step $n" > "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
+  fi
   touch -d '3 minutes ago' "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
-  echo "Steps: loss=0.1 colour=0.01" >> "$LOG"
+  echo "Steps: loss=0.1 colour=0.01${AZ_FROZEN_LORA:+ steady=0.02 ref=0.003}" >> "$LOG"
   n=$(( n + AZ_CKPT_INTERVAL ))
 done
 echo "final weights" > "$OUT/pytorch_lora_weights.safetensors"
@@ -267,6 +302,7 @@ class Volume:
         (tmp / "textcache").mkdir()
         self.env = {
             "PATH": f"{bins}:{os.environ['PATH']}", "HOME": str(tmp), "STUB_LOG": str(self.log), "STUB_DIR": str(stubs),
+            "STUB_PY": sys.executable,
             "AZ_ROOT": str(r), "AZ_REF": "testref", "AZ_SPENT": "53.17", "AZ_CAP": "65", "AZ_PRICE": "2.80",
             "AZ_BALANCE": "13.00", "AZ_TEXT_CACHE_DIR": str(tmp / "textcache"), "RUNPOD_POD_ID": "testpod",
             "AZ_FAV2_SHA": _sha8(lora / "blend05s065/pytorch_lora_weights.safetensors"),
@@ -500,3 +536,92 @@ def test_a_wrong_training_start_is_caught_before_any_gpu_time(vol):
     assert out.index("UNSCALE_WRONG") < out.index("2. before the training: rendering")
     assert "4. no training (see above): only the checks and the final pick" in out and not vol.lines("train_env.log")
     assert f"fx6s5800s65_{TAG}" in vol.scored() and vol.lines("runpodctl.log") == ["stop pod testpod"]
+
+
+# ---------------------------------------------------------------- fxreal8 (owner, 2026-11-18)
+def _fx8_env(vol):
+    return {"AZ_TRAIN_FROM": "fav2_addon", "AZ_SPENT": "61.42", "AZ_CAP": "75", "AZ_BALANCE": "18.70"}
+
+
+def test_fxreal8_practice_run(vol):
+    out, secs = vol.run(**_fx8_env(vol))
+    root = vol.root
+    assert "FX6B_DONE" in out and secs < 200, out[-2000:]
+    assert vol.lines("runpodctl.log") == ["stop pod testpod"]
+    # order: favourite #2 checked, its strength measured, the run-time test rendered, then the training
+    order = ["1. favourite #2 confirmed", "2. the training start is favourite #2 at full strength (x 1.54)",
+             "2. before the training: rendering rt30 rt50 aa53", f"render dress10/fav2rt50_{TAG}",
+             "4. training fxreal8 from step 0 to 1000 at learning rate 1e-4, rank 16, as an add-on over favourite #2",
+             "FX6B trainer: FX8_SAFETY_OK", "5. finishing the checks", "RUNTIME favourite #2 + run-time steadiness 0.30",
+             "BEST_SAVE", "VERDICT", "FX6B_DONE"]
+    at = [out.find(x) for x in order]
+    assert all(i >= 0 for i in at) and at == sorted(at), list(zip(order, at))
+    # the trainer: no starting LoRA, favourite #2 un-scaled frozen underneath, the new terms on, the fxreal8 settings
+    env = vol.lines("train_env.log")
+    assert len(env) == 1
+    unscaled = f"{root}/outputs/fluxrt_lora/blend05_unscaled"
+    for x in ("AZ_EXP=fxreal8 ", "AZ_MAX_STEPS=1000 ", "AZ_LR=1e-4 ", "AZ_LORA_RANK=16 ", "AZ_INIT_LORA= ", "AZ_ANCHOR_PROB=0 ",
+              "AZ_CKPT_INTERVAL=250 ", f"AZ_FROZEN_LORA={unscaled} ", "AZ_STEADY_RATIO=0.25 ", "AZ_REF_WEIGHT=1.0 ",
+              "AZ_SAFETY_STEPS=20 ", "KLEIN_REPO=black-forest-labs/FLUX.2-klein-base-4B "):
+        assert x in env[0], (x, env[0])
+    assert "FX6B trainer: FROZEN_LORA merged" in out and "FX6B trainer: STEADY_WEIGHT 2.5" in out and "steady=0.02" in out
+    # the run-time test: favourite #2's own file, with the filter setting, never the pick
+    renders = vol.lines("render.log")
+    rt = [r for r in renders if r["name"].startswith("fav2rt")]
+    assert {(r["name"], r["steady"]) for r in rt} == {(f"fav2rt30_{TAG}", "0.30"), (f"fav2rt50_{TAG}", "0.50")}
+    assert {r["steady"] for r in renders if not r["name"].startswith("fav2rt")} == {None}
+    first_save = min(r["t"] for r in renders if r["name"].startswith("fx8"))
+    assert max(r["t"] for r in rt) < first_save
+    assert "RUNTIME favourite #2 + run-time steadiness 0.50: score +" in out and "worth a live test" in out
+    # every save is ONE file: favourite #2 un-scaled + the add-on, turned down to 0.65
+    from safetensors.numpy import load_file
+    merges = [m for m in vol.lines("merge.log") if "/fxreal8/saves/" in m["inputs"][-1]]
+    assert len(merges) == 4 and all(m["inputs"][0] == f"{unscaled}/pytorch_lora_weights.safetensors" and
+                                    m["weights"] == ["1.0", "1.0"] and m["scale"] == "0.65" for m in merges)
+    fav = load_file(str(root / "outputs/fluxrt_lora/blend05s065/pytorch_lora_weights.safetensors"))
+    best = json.loads((vol.ev / "best.json").read_text())
+    assert best["best"]["label"] == "fxreal8 step 750 at 0.65"
+    kept = load_file(str(root / "outputs/fluxrt_lora/fxreal8/best/pytorch_lora_weights.safetensors"))
+    addon = load_file(next(str(p) for p in (root / "outputs/fluxrt_lora/fxreal8/saves").glob("step750_*.safetensors")))
+    for k in fav:
+        # rank = favourite #2's 4 + the add-on's 2; favourite #2's part is favourite #2 exactly (1/0.65 x 0.65)
+        r = fav[k].shape[0] if ".lora_A." in k else fav[k].shape[1]
+        if ".lora_A." in k:
+            assert kept[k].shape[0] == r + 2 and np.allclose(kept[k][:r], fav[k]) and np.allclose(kept[k][r:], addon[k])
+        else:
+            assert kept[k].shape[1] == r + 2 and np.allclose(kept[k][:, :r], fav[k], rtol=1e-5, atol=1e-7)
+            assert np.allclose(kept[k][:, r:], addon[k] * 0.65, rtol=1e-5, atol=1e-7)
+    assert json.loads((root / "outputs/fluxrt_lora/fxreal8/best/selection.json").read_text())["strength_baked_in"] == 0.65
+    # the videos: favourite #2, the best run-time test, this run's best save
+    videos = {v["set"]: v["panels"] for v in vol.lines("video.log")}
+    assert videos["dress10"][0] == f"fav2_{TAG}=favourite #2 (today)"
+    assert f"fav2rt50_{TAG}=favourite #2 + run-time steadiness 0.50" in videos["dress10"]
+    assert any(p.endswith("=fxreal8 step 750 at 0.65") for p in videos["dress10"]) and len(videos["dress10"]) == 3
+    for x in SETS:
+        assert (vol.ev / f"fx8_{x}_best.mp4").exists()
+    _no_two_scorers_at_once(vol.lines("score.log"))
+
+
+def test_fxreal8_safety_check_failure_stops_the_training_but_not_the_checks(vol):
+    out, secs = vol.run(**_fx8_env(vol), STUB_FX8_FAIL="1")
+    assert "FX6B_DONE" in out and secs < 150
+    assert "FX6B trainer: FX8_SAFETY_FAILED: the add-on does not start at the frozen model" in out
+    assert "4. the safety check stopped the training before it could spend more" in out
+    assert not list((vol.root / "outputs/fluxrt_lora/fxreal8").glob("checkpoint-*"))
+    # the run-time test and the chance run were still checked, and the Pod stopped once
+    assert {f"fav2rt30_{TAG}", f"fav2rt50_{TAG}", f"fav2seed53_{TAG}"} <= set(vol.scored())
+    assert vol.lines("runpodctl.log") == ["stop pod testpod"]
+
+
+def test_fxreal8_restart_carries_on_from_its_best_save(vol):
+    out1, _ = vol.run(**_fx8_env(vol), AZ_MAX_STEPS="500")
+    assert "4. training fxreal8 from step 0 to 500" in out1 and "FX6B_DONE" in out1
+    out2, _ = vol.run(**_fx8_env(vol))
+    assert "3. carrying on from the best save, step 500 (the newest)" in out2
+    assert "4. training fxreal8 from step 500 to 1000" in out2 and "2. before the training: rendering" not in out2
+    # nothing made twice
+    assert len({r["name"] for r in vol.lines("render.log") if r["name"].startswith("fav2rt") and r["new"]}) == 2
+    merges = [m for m in vol.lines("merge.log") if "/fxreal8/saves/" in m["inputs"][-1]]
+    assert len(merges) == 4 and len({m["out"] for m in merges}) == 4
+    assert json.loads((vol.ev / "best.json").read_text())["best"]["label"] == "fxreal8 step 750 at 0.65"
+    _no_two_scorers_at_once(vol.lines("score.log"))
