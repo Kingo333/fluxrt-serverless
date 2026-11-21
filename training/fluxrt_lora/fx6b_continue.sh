@@ -36,6 +36,16 @@
 #           outputs/fluxrt_lora/fxreal7/best/ is a file the live worker loads at scale 1.0, like favourite #2.
 #      All modes: the pick is weighted for the kiosk (AZ_SET_WEIGHTS, default fx6test=1,dress10=1,cases5=0.5)
 #      and prints AREAS lines (colour, detail, fabric, movement, flicker, face and skin, length).
+#      By garment type (owner, 2026-11-21: dresses first, shirts and trousers too): every checked save also gets a
+#      GARMENT line (dresses | tops | bottoms: the same score for the test clips of that type), the best one a
+#      GARMENT_VERDICT against chance per type and its GARMENT_AREAS lines; at the start the saves already on the
+#      volume are listed that way (step 1b, no GPU). At the end one more video per type is cut from the same
+#      clips: <run>_dresses_best.mp4, <run>_tops_best.mp4, <run>_bottoms_best.mp4 (AZ_GARMENT_CLIPS per type,
+#      default 8; AZ_GARMENT_VIDEOS=0 leaves them out).
+#      AZ_AA_SEEDS (default "53"): the random seeds of the chance runs. More than one ("53 54 55") gives a
+#      steadier measure of chance: the largest of theirs, overall, per area and per garment type.
+#      Longer runs: AZ_MAX_STEPS and AZ_SAVE_EVERY with AZ_RESUME_FROM=newest carry a finished run on from its
+#      newest save (fxreal8 from step 1000 to 3000, a save every 500).
 #   AZ_TRAIN_FROM=best_blend (owner, 2026-11-17): the blends are scored BEFORE the training, and the training
 #      starts from the best blend (exactly: at the blend file's own rank, 128, with alpha = rank) into a new run,
 #      AZ_EXP (default fxreal6c; saves named fx6c...). It is skipped when no blend could be made, or when the best
@@ -112,6 +122,7 @@ USE_ANCHOR="${AZ_USE_ANCHOR:-$D_ANCHOR}"  # 0: no earlier-frame input in trainin
 ANCHOR_PROB=0; [ "$USE_ANCHOR" = "1" ] && ANCHOR_PROB="${AZ_ANCHOR_PROB:-1.0}"
 SCALED="${AZ_SCALED-$D_SCALED}"           # step 5800 turned down to these percentages, checked before the training
 AA="${AZ_AA:-$D_AA}"                      # 1: favourite #2 with another random seed (the size of chance)
+AA_SEEDS="${AZ_AA_SEEDS:-53}"             # those seeds; more than one = a steadier measure of chance (53 54 55)
 WEIGHTS="${AZ_SET_WEIGHTS:-fx6test=1,dress10=1,cases5=0.5}"   # the kiosk: studio-like sets first
 FAV2_SHA="${AZ_FAV2_SHA:-8a2f5635}"       # favourite #2's file (docs/fluxrt-favourite-2.md)
 FAV2_STRENGTH="${AZ_FAV2_STRENGTH:-0.65}"
@@ -404,7 +415,8 @@ score_loop() {
         touch "$EV/$id/.scored"
         ( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" --weights "$WEIGHTS" ) > "$EV/pick.log" 2>&1
         grep -F "($(meta "$id" name))" "$EV/pick.log" | grep "^SAVE" | sed 's/^/FX6B check: /'
-        grep -F "AREAS $(meta "$id" label):" "$EV/pick.log" | sed 's/^/FX6B check: /'
+        grep -F "AREAS $(meta "$id" label):" "$EV/pick.log" | grep "^AREAS" | sed 's/^/FX6B check: /'
+        grep -F "GARMENT $(meta "$id" label):" "$EV/pick.log" | grep "^GARMENT " | sed 's/^/FX6B check: /'
       else
         echo x >> "$EV/$id/.score_tries"
         if [ "$(wc -l < "$EV/$id/.score_tries")" -ge 2 ]; then
@@ -452,6 +464,17 @@ fi
 register "s0" 0 "$S5800" "$START_DIR/pytorch_lora_weights.safetensors" start "fxreal6 step 5800"
 rm -f "$EV/.training_done" "$EV/.waiting_note" "$EV/.renders_done"
 
+# ---- 1b. by garment type (owner, 2026-11-21): the checks already on the volume, split into dresses, tops and
+# bottoms. No GPU and nothing new is rendered: the same per-clip numbers, grouped by what each test clip is.
+( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" --weights "$WEIGHTS" ) > "$EV/pick.log" 2>&1 || true
+if grep -q "^GARMENT " "$EV/pick.log" 2>/dev/null; then
+  say "1b. by garment type, from the checks already on the volume (score vs favourite #2; + = better):"
+  grep -E "^GARMENT ($EXP |favourite #2)" "$EV/pick.log" | sed 's/^/FX6B /'
+  grep -E "^GARMENT_CHANCE" "$EV/pick.log" | sed 's/^/FX6B /'
+else
+  say "1b. NOTE: no split by garment type (the clip lists in $E do not say what their clips are)"
+fi
+
 # ---- 2a. fxreal7/8: favourite #2 un-scaled (the training start), the strength check, the checks without training
 if [ "$FAV2_MODE" = 1 ]; then
   if [ ! -f "$UNSCALED_DIR/pytorch_lora_weights.safetensors" ]; then
@@ -490,8 +513,15 @@ sys.exit(0 if abs(g['strength'] / want - 1) < 0.01 and g['new_part'] < 0.02 else
     esac
   fi
   # chance: favourite #2 with another random seed. Never a candidate; it sets the bar for the others.
-  [ "$AA" = "1" ] && register "aa53" -300 "fav2seed53_$TAG" "$INIT/pytorch_lora_weights.safetensors" aa \
-    "favourite #2, another random seed" "--seed 53"
+  if [ "$AA" = "1" ]; then
+    AAN=0
+    for sd in $AA_SEEDS; do
+      case "$sd" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) say "BAD_AZ_AA_SEEDS: $sd (whole numbers 1 to 999): skipped"; continue;; esac
+      albl="favourite #2, another random seed"; [ "$sd" = "53" ] || albl="favourite #2, random seed $sd"
+      register "aa$sd" "-$(( 300 + AAN ))" "fav2seed${sd}_$TAG" "$INIT/pytorch_lora_weights.safetensors" aa "$albl" "--seed $sd"
+      AAN=$(( AAN + 1 ))
+    done
+  fi
   # step 5800 turned down, as favourite #2 was
   for sc in $SCALED; do
     case "$sc" in [1-9][0-9]) ;; *) say "BAD_AZ_SCALED: $sc (two-digit percentages, 10 to 99): skipped"; continue;; esac
@@ -668,6 +698,7 @@ LOOP_PIDS=""
 # ---- 6. the best save
 B=$(best_step)
 grep -E "^(SAVE|AREAS|CHANCE|RUNTIME|BEST)" "$EV/pick.log" | sed 's/^/FX6B /'
+grep -E "^GARMENT( |_CHANCE)" "$EV/pick.log" | sed 's/^/FX6B /'      # per garment type: dresses | tops | bottoms
 UNCHECKED=$(pending .scored | tr '\n' ' ')
 [ -n "$UNCHECKED" ] && say "NOT CHECKED: $UNCHECKED- run the same line again (after a top-up if the money ran out)"
 if [ -z "$B" ]; then
@@ -683,6 +714,8 @@ else
   BL=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['best'].get('label') or 'step ' + str(json.load(open(sys.argv[1]))['best']['step']))" "$EV/best.json")
   say "BEST_SAVE $BL -> $OUT/best/pytorch_lora_weights.safetensors $(sha256sum "$OUT/best/pytorch_lora_weights.safetensors" | cut -c1-16)..."
   grep -E "^VERDICT" "$EV/pick.log" | sed 's/^/FX6B /'
+  grep -E "^GARMENT_VERDICT" "$EV/pick.log" | sed 's/^/FX6B /'
+  grep -F "GARMENT_AREAS $BL," "$EV/pick.log" | grep "^GARMENT_AREAS" | sed 's/^/FX6B /'
   # the video panels: favourite #2, then the best of each kind (step 5800 turned down, or as it is; the best
   # blend; this run's best save) and the overall pick
   PANELS=("$FAV=favourite #2 (today)")
@@ -712,6 +745,20 @@ for s in picks:
       ( cd "$T" && timeout 10m "$PY" -m eval.step_a video "$AZ_ROOT" --set "$s" --cols $(( ${#PANELS[@]} + 2 )) --no-legend \
           --panels "${PANELS[@]}" ) > "$EV/video_$s.log" 2>&1 || true
       [ -f "$E/${s}_labelled.mp4" ] && mv -f "$E/${s}_labelled.mp4" "$EV/${PFX}_${s}_best.mp4" && say "video: $EV/${PFX}_${s}_best.mp4"
+    done
+  fi
+  # one video per garment type (owner, 2026-11-21): dresses, tops, bottoms, cut from the same clips (nothing is
+  # rendered again). Each has the item's type and number on screen.
+  if [ "${AZ_GARMENT_VIDEOS:-1}" = "1" ] && [ "$(left_min)" -gt 4 ]; then
+    GSETS=""; for s in dress10 fx6test cases5; do case " $SETS " in *" $s "*) GSETS="$GSETS $s";; esac; done
+    ( cd "$T" && "$PY" -m eval.garment_mix "$AZ_ROOT" --sets $GSETS --per-type "${AZ_GARMENT_CLIPS:-8}" ) > "$EV/garment_mix.log" 2>&1 || true
+    grep "^GARMENT_SETS" "$EV/garment_mix.log" | sed 's/^/FX6B /'
+    for t in dresses tops bottoms; do
+      [ -f "$E/g_$t.json" ] || continue
+      [ "$(left_min)" -gt 4 ] || break
+      ( cd "$T" && timeout 10m "$PY" -m eval.step_a video "$AZ_ROOT" --set "g_$t" --cols $(( ${#PANELS[@]} + 3 )) \
+          --panels "${PANELS[@]}" ) > "$EV/video_g_$t.log" 2>&1 || true
+      [ -f "$E/g_${t}_labelled.mp4" ] && mv -f "$E/g_${t}_labelled.mp4" "$EV/${PFX}_${t}_best.mp4" && say "video: $EV/${PFX}_${t}_best.mp4"
     done
   fi
 fi

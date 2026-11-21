@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "training/fluxrt_lora/fx6b_continue.sh"
 SETS = ("fx6test", "cases5", "dress10")
 TAG = "r528"
+# what the two stand-in clips of each test set are (the real lists: 8 tops, 8 dresses, 8 bottoms; 10 dresses; the owner's 5)
+CLIP_TYPES = {"fx6test": ("tops", "bottoms"), "dress10": ("dresses", "dresses"), "cases5": ("dresses", "tops")}
 
 FAKE_PY = r'''#!/bin/bash
 # stand-in for the training venv's python
@@ -47,7 +49,7 @@ fi
 if [ "$1" = "-m" ]; then
   mod="$2"; shift 2
   case "$mod" in
-    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry) exec "$REAL" -m "$mod" "$@";;   # the real tools
+    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix) exec "$REAL" -m "$mod" "$@";;   # the real tools
     fluxrt_lora.merge_lora|eval.generate_fluxrt|eval.garment_report|eval.step_a) exec "$REAL" "$STUB_DIR/tools.py" "$mod" "$@";;
   esac
   echo "unexpected module $mod" >&2; exit 3
@@ -144,7 +146,9 @@ elif mod == "eval.garment_report":
         if os.environ.get("STUB_FAIL_SCORE") and name.startswith(os.environ["STUB_FAIL_SCORE"]):
             sys.exit("made-up scoring failure")
         rows = [{"priority": "COLOUR", "metric": "colour_de", "model": name, "baseline": base, "mean": colour(name), "baseline_mean": 12.0}]
-        Path(opt("--json")).write_text(json.dumps({"scorecard": rows}))
+        # per clip: the first clip of every set a little better than the set's mean, the second a little worse
+        items = {c: {name: {"colour_de": colour(name) + d}, base: {"colour_de": 12.0}} for c, d in (("c1", -0.4), ("c2", 0.4))}
+        Path(opt("--json")).write_text(json.dumps({"scorecard": rows, "items": items}))
         Path(opt("--out")).write_text("| garment |\n")
 elif mod == "eval.face_skin_report":
     root = Path(args[0]); models = opt("--models", many=True); base = opt("--baseline"); name = [m for m in models if m != base][0]
@@ -165,7 +169,7 @@ elif mod == "eval.stability_report":
 elif mod == "eval.step_a":
     root, s = Path(args[1]), opt("--set")
     (root / "eval/fxa" / f"{s}_labelled.mp4").write_text("video")
-    log("video.log", {"set": s, "panels": opt("--panels", many=True), "cols": opt("--cols")})
+    log("video.log", {"set": s, "panels": opt("--panels", many=True), "cols": opt("--cols"), "legend": "--no-legend" not in args})
 elif mod == "fake.addon":
     import numpy as np
     from safetensors.numpy import load_file, save_file
@@ -292,7 +296,8 @@ class Volume:
         fxa = r / "eval/fxa"
         for s in SETS:
             (fxa / f"{s}.json").parent.mkdir(parents=True, exist_ok=True)
-            (fxa / f"{s}.json").write_text("[]")
+            (fxa / f"{s}.json").write_text(json.dumps([{"key": c, "category": t, "case": s}
+                                                       for c, t in zip(("c1", "c2"), CLIP_TYPES[s])]))
             for clip in ("c1", "c2"):
                 d = fxa / "results" / s / clip
                 d.mkdir(parents=True)
@@ -432,7 +437,7 @@ def test_fxreal7_practice_run_from_favourite_2(vol):
 
     # the videos: favourite #2, step 5800 at its best strength, this run's best save; the old ones kept
     videos = {v["set"]: v["panels"] for v in vol.lines("video.log")}
-    assert set(videos) == {"dress10", "cases5", "fx6test"}
+    assert set(videos) == {"dress10", "cases5", "fx6test", "g_dresses", "g_tops", "g_bottoms"}   # per set, per garment type
     assert videos["dress10"][0] == f"fav2_{TAG}=favourite #2 (today)"
     assert f"fx6s5800s65_{TAG}=fxreal6 step 5800 at 0.65" in videos["dress10"]
     assert any(p.startswith("fx7") and p.endswith("=fxreal7 step 1500 at 0.65") for p in videos["dress10"])
@@ -624,4 +629,54 @@ def test_fxreal8_restart_carries_on_from_its_best_save(vol):
     merges = [m for m in vol.lines("merge.log") if "/fxreal8/saves/" in m["inputs"][-1]]
     assert len(merges) == 4 and len({m["out"] for m in merges}) == 4
     assert json.loads((vol.ev / "best.json").read_text())["best"]["label"] == "fxreal8 step 750 at 0.65"
+    _no_two_scorers_at_once(vol.lines("score.log"))
+
+
+# ---------------------------------------------------------------- by garment type, more steps (owner, 2026-11-21)
+def test_fxreal8_carries_on_from_its_newest_save_and_reports_each_garment_type(vol):
+    out1, _ = vol.run(**_fx8_env(vol), AZ_MAX_STEPS="500")
+    assert "4. training fxreal8 from step 0 to 500" in out1 and "FX6B_DONE" in out1
+    # the second start: more money, more steps, from the NEWEST save, two more chance seeds
+    out2, secs = vol.run(**{**_fx8_env(vol), "AZ_SPENT": "68.34", "AZ_CAP": "100", "AZ_BALANCE": "24.29"},
+                         AZ_MAX_STEPS="1500", AZ_SAVE_EVERY="500", AZ_RESUME_FROM="newest", AZ_AA_SEEDS="53 54 55")
+    assert "FX6B_DONE" in out2 and secs < 200, out2[-2000:]
+    assert vol.lines("runpodctl.log") == ["stop pod testpod", "stop pod testpod"]
+    order = ["1b. by garment type, from the checks already on the volume", "GARMENT fxreal8 step 500 at 0.65: dresses",
+             "2. before the training: rendering aa55 aa54", "3. carrying on from the newest save",
+             "4. training fxreal8 from step 500 to 1500", "5. finishing the checks", "BEST_SAVE",
+             "GARMENT_VERDICT", "video: ", "FX6B_DONE"]
+    at = [out2.find(x) for x in order]
+    assert all(i >= 0 for i in at) and at == sorted(at), list(zip(order, at))
+    assert out2.count("FX6B GARMENT_CHANCE differences up to these sizes mean nothing: dresses") == 2   # at the start and the end
+    env = vol.lines("train_env.log")
+    assert len(env) == 2 and "AZ_MAX_STEPS=1500 " in env[1] and "AZ_CKPT_INTERVAL=500 " in env[1]
+    # nothing set aside: the newest save is where the training carried on
+    assert not (vol.root / "outputs/fluxrt_lora/fxreal8/set_aside").exists()
+    assert {p.name for p in (vol.root / "outputs/fluxrt_lora/fxreal8").glob("checkpoint-*")} == \
+        {"checkpoint-250", "checkpoint-500", "checkpoint-1000", "checkpoint-1500"}
+    # three chance runs: the first is reused, the two new ones are rendered with their seeds and scored
+    seeds = {r["name"]: r["seed"] for r in vol.lines("render.log") if r["name"].startswith("fav2seed") and r["new"]}
+    assert seeds == {f"fav2seed53_{TAG}": "53", f"fav2seed54_{TAG}": "54", f"fav2seed55_{TAG}": "55"}
+    assert {f"fav2seed{n}_{TAG}" for n in (53, 54, 55)} <= set(vol.scored())
+    assert "CHANCE favourite #2 with 3 other random seeds: scores" in out2 and "CHANCE_AREAS" in out2
+    best = json.loads((vol.ev / "best.json").read_text())
+    assert best["chance"]["seeds"] == 3 and set(best["chance"]["garments"]) == {"dresses", "tops", "bottoms"}
+    # per garment type: tops are the first clip of fx6test and the second of cases5; bottoms the second of fx6test
+    g = {s["label"]: s["garments"] for s in best["saves"]}["fxreal8 step 500 at 0.65"]
+    assert g["dresses"]["clips"] == 3 and g["tops"]["clips"] == 2 and g["bottoms"]["clips"] == 1
+    # colour is the stand-in's only measure: (12 - x) / 12 per set, sets weighted 1, 1 and 0.5 (the owner's cases)
+    assert g["dresses"]["score"] == pytest.approx((0.6 / 12 + 0.5 * 1.0 / 12) / 1.5, abs=1e-4)
+    assert g["tops"]["score"] == pytest.approx((1.0 / 12 + 0.5 * 0.2 / 12) / 1.5, abs=1e-4)
+    assert g["bottoms"]["score"] == pytest.approx(0.2 / 12, abs=1e-4)
+    assert "GARMENT_AREAS " + best["best"]["label"] + ", dresses: colour" in out2
+    # one video per garment type, cut from the videos that are there, with the type on screen
+    videos = {v["set"]: v for v in vol.lines("video.log")[-6:]}
+    for t, n in (("dresses", 3), ("tops", 2), ("bottoms", 1)):
+        assert videos[f"g_{t}"]["legend"] is True and videos[f"g_{t}"]["panels"] == videos["dress10"]["panels"]
+        assert int(videos[f"g_{t}"]["cols"]) == int(videos["dress10"]["cols"]) + 1
+        assert (vol.ev / f"fx8_{t}_best.mp4").exists()
+        items = json.loads((vol.root / f"eval/fxa/g_{t}.json").read_text())
+        assert len(items) == n and all((vol.root / "eval/fxa/results" / f"g_{t}" / it["key"] / "input.mp4").exists() for it in items)
+    assert videos["dress10"]["legend"] is False
+    assert "GARMENT_SETS dresses: 3 clips from cases5, dress10 | tops: 2 clips from cases5, fx6test | bottoms: 1 clips from fx6test" in out2
     _no_two_scorers_at_once(vol.lines("score.log"))
