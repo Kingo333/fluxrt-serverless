@@ -123,6 +123,8 @@ ANCHOR_PROB=0; [ "$USE_ANCHOR" = "1" ] && ANCHOR_PROB="${AZ_ANCHOR_PROB:-1.0}"
 SCALED="${AZ_SCALED-$D_SCALED}"           # step 5800 turned down to these percentages, checked before the training
 AA="${AZ_AA:-$D_AA}"                      # 1: favourite #2 with another random seed (the size of chance)
 AA_SEEDS="${AZ_AA_SEEDS:-53}"             # those seeds; more than one = a steadier measure of chance (53 54 55)
+BRANCH_FROM="${AZ_BRANCH_FROM:-}"         # <run>:<step> (fxreal8:1000): this run starts from that run's save
+BRANCH_STEP=0
 WEIGHTS="${AZ_SET_WEIGHTS:-fx6test=1,dress10=1,cases5=0.5}"   # the kiosk: studio-like sets first
 FAV2_SHA="${AZ_FAV2_SHA:-8a2f5635}"       # favourite #2's file (docs/fluxrt-favourite-2.md)
 FAV2_STRENGTH="${AZ_FAV2_STRENGTH:-0.65}"
@@ -175,7 +177,7 @@ stop_pod() {
   for p in ${LOOP_PIDS:-} ${SCORE_PID:-}; do kill "$p" 2>/dev/null; done
   kill "$SPEND_PID" 2>/dev/null; record_spend
   say "end: \$$(spent_run) this run (cap \$$CAP${BALANCE:+, balance at start \$$BALANCE})"
-  if [ "${AZ_NO_STOP:-0}" = "1" ]; then echo "== AZ_NO_STOP=1: Pod left RUNNING (billing) - stop it by hand"; return; fi
+  if [ "${AZ_NO_STOP:-0}" = "1" ]; then echo "== AZ_NO_STOP=1: ${AZ_NO_STOP_NOTE:-Pod left RUNNING (billing) - stop it by hand}"; return; fi
   echo "== stopping the Pod"; runpodctl stop pod "$RUNPOD_POD_ID" 2>/dev/null || true
 }
 trap stop_pod EXIT
@@ -231,6 +233,32 @@ mp_ok || fail "NO_MEDIAPIPE_VENV: $MP"
 # ---- 1. the start weights, the data, the test sets
 [ -f "$INIT/pytorch_lora_weights.safetensors" ] || fail "NO_FAVOURITE2: $INIT"
 mkdir -p "$START_DIR" "$OUT" "$SAVES" "$EV"
+# fxreal9 (owner, 2026-11-21): a run that starts from another run's save, with that save's optimiser state, so two
+# recipes can be compared from the same point at equal steps. The other run's folder is only read.
+if [ -n "$BRANCH_FROM" ]; then
+  BRUN="${BRANCH_FROM%%:*}"; BRANCH_STEP="${BRANCH_FROM##*:}"
+  case "$BRANCH_STEP" in ''|*[!0-9]*) fail "BAD_AZ_BRANCH_FROM: $BRANCH_FROM (run:step, e.g. fxreal8:1000)";; esac
+  [ "$TRAIN_FROM" = "fav2_addon" ] || fail "BAD_AZ_BRANCH_FROM: only with AZ_TRAIN_FROM=fav2_addon"
+  [ -n "$BRUN" ] && [ "$BRUN" != "$EXP" ] || fail "BAD_AZ_BRANCH_FROM: $BRANCH_FROM (set AZ_EXP to a new run name)"
+  BSRC="$AZ_ROOT/outputs/fluxrt_lora/$BRUN"
+  if ls -d "$OUT"/checkpoint-* >/dev/null 2>&1; then
+    [ "$(cat "$OUT/branch_from.txt" 2>/dev/null)" = "$BRANCH_FROM" ] \
+      || fail "BRANCH_MISMATCH: $OUT was started from '$(cat "$OUT/branch_from.txt" 2>/dev/null)', not from $BRANCH_FROM"
+    say "1. $EXP carries on (it started from $BRUN step $BRANCH_STEP)"
+  else
+    [ -f "$BSRC/checkpoint-$BRANCH_STEP/pytorch_lora_weights.safetensors" ] || fail "NO_BRANCH_POINT: $BSRC/checkpoint-$BRANCH_STEP"
+    # copied under another name first, so a copy that was cut off is never taken for a save (nothing is deleted:
+    # a cut-off copy stays as a small hidden folder)
+    BTMP="$OUT/.branch_tmp_$START"
+    cp -r "$BSRC/checkpoint-$BRANCH_STEP" "$BTMP" && mv "$BTMP" "$OUT/checkpoint-$BRANCH_STEP" \
+      || fail "BRANCH_COPY_FAILED: $BSRC/checkpoint-$BRANCH_STEP"
+    # the steadiness weight measured at that run's first start stays the same
+    [ -f "$BSRC/fx8_steady_weight.json" ] && cp "$BSRC/fx8_steady_weight.json" "$OUT/fx8_steady_weight.json"
+    echo "$BRANCH_FROM" > "$OUT/branch_from.txt"
+    say "1. $EXP starts from $BRUN step $BRANCH_STEP (its save and optimiser state copied; $BRUN itself is not changed)"
+  fi
+  RESUME_FROM=newest          # nothing of this run is set aside
+fi
 if [ ! -f "$START_DIR/pytorch_lora_weights.safetensors" ]; then
   [ -f "$SRC_OUT/pytorch_lora_weights.safetensors" ] || fail "NO_FXREAL6_WEIGHTS: $SRC_OUT"
   cp "$SRC_OUT/pytorch_lora_weights.safetensors" "$START_DIR/pytorch_lora_weights.safetensors"
@@ -331,6 +359,7 @@ register_saves() {  # every finished checkpoint of this run
   for n in $(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n); do
     f="$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
     [ -f "$f" ] || continue
+    [ "$n" -le "$BRANCH_STEP" ] && continue    # the save this run started from: the other run's, checked there
     # while the trainer runs, a file must be unchanged for a minute (it may still be written). Once the training
     # has ended nothing writes any more: without this the LAST save, less than a minute old when the loops look,
     # was never registered and the run ended without it (found by the practice run, 2026-11-17).
@@ -469,7 +498,7 @@ rm -f "$EV/.training_done" "$EV/.waiting_note" "$EV/.renders_done"
 ( cd "$T" && "$PY" -m fluxrt_lora.pick_best_save "$EV" --baseline "$FAV" --weights "$WEIGHTS" ) > "$EV/pick.log" 2>&1 || true
 if grep -q "^GARMENT " "$EV/pick.log" 2>/dev/null; then
   say "1b. by garment type, from the checks already on the volume (score vs favourite #2; + = better):"
-  grep -E "^GARMENT ($EXP |favourite #2)" "$EV/pick.log" | sed 's/^/FX6B /'
+  grep -E "^GARMENT ($EXP |${BRANCH_FROM:+${BRANCH_FROM%%:*} |}favourite #2)" "$EV/pick.log" | sed 's/^/FX6B /'
   grep -E "^GARMENT_CHANCE" "$EV/pick.log" | sed 's/^/FX6B /'
 else
   say "1b. NOTE: no split by garment type (the clip lists in $E do not say what their clips are)"
@@ -575,6 +604,17 @@ if [ "$TRAIN_FROM" = "fav2_addon" ]; then
   # favourite #2 un-scaled is merged into the frozen model; the add-on starts at zero (no starting LoRA)
   TRAIN_INIT=""
   FX8_ENV="AZ_FROZEN_LORA=$UNSCALED_DIR AZ_STEADY_RATIO=${AZ_STEADY_RATIO:-0.25} AZ_REF_WEIGHT=${AZ_REF_WEIGHT:-1.0} AZ_SAFETY_STEPS=${AZ_SAFETY_STEPS:-20}"
+  # fxreal9: garment terms counted at the live model's noise levels, favourite #2's fabric contrast kept
+  FX9_TXT=""
+  for v in AZ_PAIR_FLOOR AZ_DETAIL_FLOOR AZ_TEXTURE_FLOOR AZ_KEEP_SPREAD; do
+    x="${!v:-}"; [ -n "$x" ] || continue
+    case "$x" in *[!0-9.]*|'') fail "BAD_$v: $x (a number)";; esac
+    FX8_ENV="$FX8_ENV $v=$x"
+  done
+  [ -n "${AZ_PAIR_FLOOR:-}" ] && FX9_TXT="$FX9_TXT, frame-to-frame garment colour counted from ${AZ_PAIR_FLOOR} at every noise level"
+  [ -n "${AZ_KEEP_SPREAD:-}" ] && FX9_TXT="$FX9_TXT, favourite #2's fabric contrast kept (x${AZ_KEEP_SPREAD})"
+  [ -n "${AZ_TEXTURE_FLOOR:-}" ] && FX9_TXT="$FX9_TXT, fabric contrast towards the real frame counted from ${AZ_TEXTURE_FLOOR}"
+  [ -n "${AZ_DETAIL_FLOOR:-}" ] && FX9_TXT="$FX9_TXT, detail counted from ${AZ_DETAIL_FLOOR}"
 fi
 if [ "$TRAIN_FROM" = "best_blend" ]; then
   # the blends are scored now: the training starts from the best one
@@ -640,7 +680,7 @@ elif [ "$TRAIN_MIN" -lt 20 ]; then
   say "4. NOT TRAINING: only $TRAIN_MIN minutes of money left after the checks; top up to carry on"
 else
   FROM_TXT="from $TRAIN_INIT"
-  [ "$TRAIN_FROM" = "fav2_addon" ] && FROM_TXT="as an add-on over favourite #2 (frozen, un-scaled), steadiness ${AZ_STEADY_RATIO:-0.25} of the loss, reference to favourite #2 x${AZ_REF_WEIGHT:-1.0}, a ${AZ_SAFETY_STEPS:-20}-step safety check"
+  [ "$TRAIN_FROM" = "fav2_addon" ] && FROM_TXT="as an add-on over favourite #2 (frozen, un-scaled), steadiness ${AZ_STEADY_RATIO:-0.25} of the loss, reference to favourite #2 x${AZ_REF_WEIGHT:-1.0}, a ${AZ_SAFETY_STEPS:-20}-step safety check${FX9_TXT:-}"
   say "4. training $EXP from step ${LAST:-0} to $STEPS at learning rate $LR, rank $TRAIN_RANK, $FROM_TXT, earlier-frame input $( [ "$USE_ANCHOR" = "1" ] && echo on || echo off ), a save every $EVERY, time limit $TRAIN_MIN min"
   timeout -s INT "${TRAIN_MIN}m" bash -c "curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/$AZ_REF/training/fluxrt_lora/run_train.sh | \
     AZ_REF=$AZ_REF AZ_MANIFEST_DIR=$AZ_ROOT/manifests/research-train AZ_EXP=$EXP \
@@ -653,12 +693,12 @@ else
     AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT $FX8_ENV bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
   TRAIN_EXIT=$?
   TLOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
-  grep -hE "LoRA initialised from|^FROZEN_LORA|^FX8_|^STEADY_WEIGHT|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
+  grep -hE "LoRA initialised from|^FROZEN_LORA|^FX8_|^FX9_|^STEADY_WEIGHT|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
     "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -12 | sed 's/^/FX6B trainer: /'
   grep -qh "^FX8_SAFETY_FAILED" "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null \
     && say "4. the safety check stopped the training before it could spend more (FX8_SAFETY_FAILED above): only the checks"
   rm -f "$TEXT_DIR/text_cache.bin"   # the trainer's own scratch file (made again at every start)
-  grep -oE "(loss|detail|pair|colour|texture|steady|ref)=[0-9.e+-]+" "$TLOG" 2>/dev/null | tail -7 | tr '\n' ' '; echo
+  grep -oE "(loss|detail|pair|colour|texture|steady|ref|keep)=[0-9.e+-]+" "$TLOG" 2>/dev/null | tail -8 | tr '\n' ' '; echo
   LAST=$(ls -d "$OUT"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
   [ "$TRAIN_EXIT" = 124 ] && say "training stopped by the money limit at step ${LAST:-none} (exit 124); the saves are kept" \
     || say "training ended (exit $TRAIN_EXIT), newest save: step ${LAST:-none} of $STEPS"
@@ -699,6 +739,7 @@ LOOP_PIDS=""
 B=$(best_step)
 grep -E "^(SAVE|AREAS|CHANCE|RUNTIME|BEST)" "$EV/pick.log" | sed 's/^/FX6B /'
 grep -E "^GARMENT( |_CHANCE)" "$EV/pick.log" | sed 's/^/FX6B /'      # per garment type: dresses | tops | bottoms
+grep -E "^(FABRIC|COMPARE)" "$EV/pick.log" | sed 's/^/FX6B /'        # fabric direction; runs at equal steps
 UNCHECKED=$(pending .scored | tr '\n' ' ')
 [ -n "$UNCHECKED" ] && say "NOT CHECKED: $UNCHECKED- run the same line again (after a top-up if the money ran out)"
 if [ -z "$B" ]; then

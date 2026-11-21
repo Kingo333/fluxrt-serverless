@@ -92,6 +92,8 @@ def colour(name):
     if name.startswith("fx6blend"): return 12.5
     if name.startswith("fx6s5800"): return 13.0
     if name.startswith("fav2rt"): return 11.8 if "rt50" in name else 11.9
+    if name.startswith("fx9a"): return 10.6 if "2000x" in name else 10.9
+    if name.startswith("fx9b"): return 9.9 if "2000x" in name else 11.2
     if name.startswith("fx8"):
         for step, c in (("750x", 10.9), ("1000x", 11.1), ("500x", 11.4), ("250x", 11.7)):
             if name[3:].startswith(step): return c
@@ -147,7 +149,8 @@ elif mod == "eval.garment_report":
             sys.exit("made-up scoring failure")
         rows = [{"priority": "COLOUR", "metric": "colour_de", "model": name, "baseline": base, "mean": colour(name), "baseline_mean": 12.0}]
         # per clip: the first clip of every set a little better than the set's mean, the second a little worse
-        items = {c: {name: {"colour_de": colour(name) + d}, base: {"colour_de": 12.0}} for c, d in (("c1", -0.4), ("c2", 0.4))}
+        items = {c: {name: {"colour_de": colour(name) + d, "fabric_ratio": round(colour(name) / 12.0, 3)},
+                     base: {"colour_de": 12.0, "fabric_ratio": 0.9}} for c, d in (("c1", -0.4), ("c2", 0.4))}
         Path(opt("--json")).write_text(json.dumps({"scorecard": rows, "items": items}))
         Path(opt("--out")).write_text("| garment |\n")
 elif mod == "eval.face_skin_report":
@@ -189,7 +192,7 @@ else:
 FAKE_TRAIN = r'''#!/bin/bash
 # stand-in for run_train.sh: records what it was asked to do and makes a save at every interval
 [ "${STUB_TRAIN_FAIL:-0}" = "1" ] && { echo "Traceback (most recent call last): made-up trainer crash" >&2; exit 9; }
-echo "AZ_EXP=$AZ_EXP AZ_MAX_STEPS=$AZ_MAX_STEPS AZ_LR=$AZ_LR AZ_LORA_RANK=$AZ_LORA_RANK AZ_INIT_LORA=$AZ_INIT_LORA AZ_ANCHOR_COLUMN=$AZ_ANCHOR_COLUMN AZ_ANCHOR_PROB=$AZ_ANCHOR_PROB AZ_CKPT_INTERVAL=$AZ_CKPT_INTERVAL KLEIN_REPO=$KLEIN_REPO AZ_TEXT_CACHE_DIR=$AZ_TEXT_CACHE_DIR AZ_FROZEN_LORA=$AZ_FROZEN_LORA AZ_STEADY_RATIO=$AZ_STEADY_RATIO AZ_REF_WEIGHT=$AZ_REF_WEIGHT AZ_SAFETY_STEPS=$AZ_SAFETY_STEPS end" >> "$STUB_LOG/train_env.log"
+echo "AZ_EXP=$AZ_EXP AZ_MAX_STEPS=$AZ_MAX_STEPS AZ_LR=$AZ_LR AZ_LORA_RANK=$AZ_LORA_RANK AZ_INIT_LORA=$AZ_INIT_LORA AZ_ANCHOR_COLUMN=$AZ_ANCHOR_COLUMN AZ_ANCHOR_PROB=$AZ_ANCHOR_PROB AZ_CKPT_INTERVAL=$AZ_CKPT_INTERVAL KLEIN_REPO=$KLEIN_REPO AZ_TEXT_CACHE_DIR=$AZ_TEXT_CACHE_DIR AZ_FROZEN_LORA=$AZ_FROZEN_LORA AZ_STEADY_RATIO=$AZ_STEADY_RATIO AZ_REF_WEIGHT=$AZ_REF_WEIGHT AZ_SAFETY_STEPS=$AZ_SAFETY_STEPS AZ_PAIR_FLOOR=${AZ_PAIR_FLOOR:-} AZ_DETAIL_FLOOR=${AZ_DETAIL_FLOOR:-} AZ_TEXTURE_FLOOR=${AZ_TEXTURE_FLOOR:-} AZ_KEEP_SPREAD=${AZ_KEEP_SPREAD:-} end" >> "$STUB_LOG/train_env.log"
 OUT="$AZ_ROOT/outputs/fluxrt_lora/$AZ_EXP"; mkdir -p "$OUT" "$AZ_ROOT/reports"
 LOG="$AZ_ROOT/reports/fluxlora_${AZ_EXP}_test.log"
 if [ -n "${AZ_FROZEN_LORA:-}" ]; then
@@ -202,7 +205,9 @@ if [ -n "${AZ_FROZEN_LORA:-}" ]; then
     echo "FX8_SAFETY_FAILED: the add-on does not start at the frozen model: reference term 0.4 at the first step (data term 0.9)" >> "$LOG"
     exit 3
   fi
-  echo "STEADY_WEIGHT 2.5" >> "$LOG"
+  if [ -f "$OUT/fx8_steady_weight.json" ]; then echo "STEADY_WEIGHT 2.5 (from the first start of this run)" >> "$LOG"
+  else echo "STEADY_WEIGHT 2.5" >> "$LOG"; echo '{"steady_weight": 2.5}' > "$OUT/fx8_steady_weight.json"; fi
+  [ -n "${AZ_PAIR_FLOOR:-}${AZ_KEEP_SPREAD:-}" ] && echo "FX9_TERMS same-clip colour floor ${AZ_PAIR_FLOOR:-0}, detail floor ${AZ_DETAIL_FLOOR:-0}, fabric-contrast floor ${AZ_TEXTURE_FLOOR:-0} (1 = counted fully at every noise level), keep-spread weight ${AZ_KEEP_SPREAD:-0}" >> "$LOG"
   echo "FX8_SAFETY_OK: start = the frozen model (reference term 0.0e+00 at the first step); steadiness term on in 20/20 batches; steadiness weight 2.5; every term finite over the first 20 steps" >> "$LOG"
 else
   [ -f "$AZ_INIT_LORA/pytorch_lora_weights.safetensors" ] || { echo "no start weights in $AZ_INIT_LORA" >&2; exit 9; }
@@ -219,8 +224,9 @@ while [ "$n" -le "$AZ_MAX_STEPS" ]; do
   else
     echo "weights of $AZ_EXP at step $n" > "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
   fi
+  echo "optimiser state at step $n of $AZ_EXP" > "$OUT/checkpoint-$n/optimizer.bin"
   touch -d '3 minutes ago' "$OUT/checkpoint-$n/pytorch_lora_weights.safetensors"
-  echo "Steps: loss=0.1 colour=0.01${AZ_FROZEN_LORA:+ steady=0.02 ref=0.003}" >> "$LOG"
+  echo "Steps: loss=0.1 colour=0.01${AZ_FROZEN_LORA:+ steady=0.02 ref=0.003}${AZ_KEEP_SPREAD:+ keep=0.004}" >> "$LOG"
   n=$(( n + AZ_CKPT_INTERVAL ))
 done
 echo "final weights" > "$OUT/pytorch_lora_weights.safetensors"
@@ -680,3 +686,115 @@ def test_fxreal8_carries_on_from_its_newest_save_and_reports_each_garment_type(v
     assert videos["dress10"]["legend"] is False
     assert "GARMENT_SETS dresses: 3 clips from cases5, dress10 | tops: 2 clips from cases5, fx6test | bottoms: 1 clips from fx6test" in out2
     _no_two_scorers_at_once(vol.lines("score.log"))
+
+
+# ---------------------------------------------------------------- fxreal9: two arms from fxreal8's step 1000
+ARMS = ROOT / "training/fluxrt_lora/fx9_arms.sh"
+
+
+def _arms(vol, timeout=400, **extra):
+    env = {**vol.env, "AZ_SPENT": "79.50", "AZ_CAP": "100", "AZ_BALANCE": "43.00", "AZ_CONTINUE_SCRIPT": str(SCRIPT), **extra}
+    t0 = time.time()
+    p = subprocess.run(["bash", str(ARMS)], capture_output=True, text=True, env=env, timeout=timeout)
+    assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+    return p.stdout + p.stderr, time.time() - t0
+
+
+def test_fxreal9_two_arms_start_from_fxreal8_step_1000_and_are_compared_at_equal_steps(vol):
+    root = vol.root
+    # stage 1 as it will be on the volume: fxreal8 to step 2000, saves at 250..1000, 1500, 2000
+    vol.run(**_fx8_env(vol))
+    vol.run(**{**_fx8_env(vol), "AZ_SPENT": "68.34", "AZ_CAP": "100", "AZ_BALANCE": "24.29"}, AZ_MAX_STEPS="2000",
+            AZ_SAVE_EVERY="500", AZ_RESUME_FROM="newest", AZ_AA_SEEDS="53 54 55")
+    fx8 = root / "outputs/fluxrt_lora/fxreal8"
+    before = {p.name: p.read_bytes() for p in (fx8 / "checkpoint-1000").iterdir()}
+    n_env = len(vol.lines("train_env.log"))
+    out, secs = _arms(vol)
+    assert "FX9_DONE" in out and secs < 300, out[-2500:]
+    # one Pod: the first arm leaves it running, the second stops it (and stage 1 stopped its own twice)
+    assert vol.lines("runpodctl.log") == ["stop pod testpod"] * 3
+    assert out.count("== AZ_NO_STOP=1: the Pod keeps running: the next arm starts now") == 1 and "stop it by hand" not in out
+    order = ["FX9 ", "arm 1 of 2: fxreal9a (protect) from fxreal8:1000 to step 2000",
+             "1. fxreal9a starts from fxreal8 step 1000 (its save and optimiser state copied; fxreal8 itself is not changed)",
+             "1b. by garment type", "GARMENT fxreal8 step 1000 at 0.65",
+             "4. training fxreal9a from step 1000 to 2000",
+             "favourite #2's fabric contrast kept (x1.0)", "FX6B_DONE", "arm fxreal9a ended (exit 0)",
+             "arm 2 of 2: fxreal9b (reach) from fxreal8:1000 to step 2000", "1. fxreal9b starts from fxreal8 step 1000",
+             "4. training fxreal9b from step 1000 to 2000", "arm fxreal9b ended (exit 0)", "FX9_DONE"]
+    at = []
+    pos = 0
+    for x in order:
+        pos = out.find(x, pos)
+        at.append(pos)
+        assert pos >= 0, (x, out[-3000:])
+    # the trainer: each arm resumes fxreal8's step 1000 in its own folder, with its own terms and the same recipe
+    env = vol.lines("train_env.log")[n_env:]
+    assert len(env) == 2
+    for e, exp, extra in ((env[0], "fxreal9a", "AZ_PAIR_FLOOR=1.0 AZ_DETAIL_FLOOR= AZ_TEXTURE_FLOOR= AZ_KEEP_SPREAD=1.0 "),
+                          (env[1], "fxreal9b", "AZ_PAIR_FLOOR=1.0 AZ_DETAIL_FLOOR=0.5 AZ_TEXTURE_FLOOR=0.5 AZ_KEEP_SPREAD=1.0 ")):
+        for x in (f"AZ_EXP={exp} ", "AZ_MAX_STEPS=2000 ", "AZ_CKPT_INTERVAL=500 ", "AZ_LR=1e-4 ", "AZ_LORA_RANK=16 ", "AZ_INIT_LORA= ",
+                  "AZ_STEADY_RATIO=0.25 ", "AZ_REF_WEIGHT=1.0 ", extra):
+            assert x in e, (x, e)
+    assert "FX6B trainer: FX9_TERMS same-clip colour floor 1.0, detail floor 0.5, fabric-contrast floor 0.5" in out
+    assert "FX6B trainer: STEADY_WEIGHT 2.5 (from the first start of this run)" in out and "keep=0.004" in out
+    # fxreal8 is untouched; each arm holds a copy of its step 1000 and its own later saves
+    assert {p.name: p.read_bytes() for p in (fx8 / "checkpoint-1000").iterdir()} == before
+    assert {p.name for p in fx8.glob("checkpoint-*")} == {f"checkpoint-{n}" for n in (250, 500, 750, 1000, 1500, 2000)}
+    for exp in ("fxreal9a", "fxreal9b"):
+        d = root / "outputs/fluxrt_lora" / exp
+        assert {p.name for p in d.glob("checkpoint-*")} == {"checkpoint-1000", "checkpoint-1500", "checkpoint-2000"}
+        assert (d / "checkpoint-1000/optimizer.bin").read_text() == "optimiser state at step 1000 of fxreal8\n"
+        assert (d / "branch_from.txt").read_text().strip() == "fxreal8:1000" and (d / "fx8_steady_weight.json").exists()
+        assert not list(d.glob(".branch_tmp*")) and not (d / "set_aside").exists()
+    # the branch point is not checked again: two new saves per arm, nothing else rendered
+    scored = set(vol.scored())
+    for pfx in ("fx9a", "fx9b"):
+        mine = sorted(n for n in scored if n.startswith(pfx))
+        assert len(mine) == 2 and mine[0].startswith(f"{pfx}1500x") and mine[1].startswith(f"{pfx}2000x"), mine
+    new = [r["name"] for r in vol.lines("render.log") if r["new"] and r["name"].startswith("fx9")]
+    assert len(new) == 4 * len(SETS) and not any(n.startswith(("fx9a1000", "fx9b1000")) for n in new)
+    # each save is favourite #2 un-scaled + that arm's add-on, turned down to 0.65
+    merges = [m for m in vol.lines("merge.log") if "/fxreal9" in m["inputs"][-1]]
+    assert len(merges) == 4 and all(m["weights"] == ["1.0", "1.0"] and m["scale"] == "0.65" and
+                                    m["inputs"][0].endswith("blend05_unscaled/pytorch_lora_weights.safetensors") for m in merges)
+    # side by side at equal steps, and the fabric direction of every newly scored save
+    for step in (1500, 2000):
+        for run in ("fxreal8", "fxreal9a", "fxreal9b"):
+            assert f"FX6B COMPARE step {step}, {run}: score " in out, (step, run)
+    assert "FX6B FABRIC fxreal9b step 2000 at 0.65: the garment's light-dark spread is x0.82 of the photo's (favourite #2 x0.90" in out
+    best = json.loads((vol.ev / "best.json").read_text())
+    assert best["best"]["label"] == "fxreal9b step 2000 at 0.65"          # the made-up best colour
+    assert (root / "outputs/fluxrt_lora/fxreal9b/best/pytorch_lora_weights.safetensors").exists()
+    for pfx in ("fx9a", "fx9b"):
+        for v in ("dress10", "dresses", "tops", "bottoms"):
+            assert (vol.ev / f"{pfx}_{v}_best.mp4").exists(), (pfx, v)
+    # the money: both arms are recorded under the same AZ_SPENT and AZ_BALANCE, so the second one starts with what
+    # the first one spent already counted (the adding-up itself: the restart test of fxreal7)
+    runs = [x.read_text().split() for x in (vol.ev / "spend").glob("*.run")]
+    assert len([r for r in runs if r[:2] == ["79.50", "43.00"]]) == 2
+    _no_two_scorers_at_once(vol.lines("score.log"))
+
+
+def test_fxreal9_started_again_makes_nothing_twice(vol):
+    vol.run(**_fx8_env(vol))
+    out1, _ = _arms(vol, AZ_ARMS="a", AZ_MAX_STEPS="1500")
+    assert "4. training fxreal9a from step 1000 to 1500" in out1 and "FX9_DONE" in out1
+    out2, _ = _arms(vol, AZ_ARMS="a", AZ_MAX_STEPS="2000")
+    assert "1. fxreal9a carries on (it started from fxreal8 step 1000)" in out2
+    assert "4. training fxreal9a from step 1500 to 2000" in out2 and "its save and optimiser state copied" not in out2
+    names = [r["name"] for r in vol.lines("render.log") if r["new"] and r["name"].startswith("fx9a")]
+    assert len(names) == 2 * len(SETS) and len(set(names)) == 2
+    d = vol.root / "outputs/fluxrt_lora/fxreal9a"
+    assert {p.name for p in d.glob("checkpoint-*")} == {"checkpoint-1000", "checkpoint-1500", "checkpoint-2000"}
+
+
+def test_a_branch_from_a_save_that_is_not_there_stops_before_anything_is_spent(vol):
+    p = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120,
+                       env={**vol.env, **_fx8_env(vol), "AZ_EXP": "fxreal9a", "AZ_BRANCH_FROM": "fxreal8:1000"})
+    out = p.stdout + p.stderr
+    assert p.returncode != 0 and "STOPPED: NO_BRANCH_POINT" in out and not vol.lines("train_env.log")
+    assert vol.lines("runpodctl.log") == ["stop pod testpod"]
+    for bad in ("fxreal8", "fxreal8:x", "fxreal9a:1000"):
+        p = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120,
+                           env={**vol.env, **_fx8_env(vol), "AZ_EXP": "fxreal9a", "AZ_BRANCH_FROM": bad})
+        assert p.returncode != 0 and "BAD_AZ_BRANCH_FROM" in p.stdout + p.stderr, bad

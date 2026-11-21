@@ -247,6 +247,7 @@ def clip_metrics(cam_frames, out_frames, cam_cats, out_cats, ref_rgb, ref_mask, 
         s_ref, s_out = spread(ref_rgb, ref_mask), spread(pooled.reshape(-1, 1, 3), np.ones((len(pooled), 1), bool))
         if s_ref and s_out:
             res["fabric"] = round(abs(float(np.log(s_out / s_ref))), 4)
+            res["fabric_ratio"] = round(float(s_out / s_ref), 4)   # the direction: under 1 = flatter than the photo
     on = [np.logical_and(garm[t], _dilate(person[t], 6)).sum() / max(1, garm[t].sum()) for t in valid if garm[t].any()]
     if on:
         res["on_body"] = round(float(np.mean(on)), 4)

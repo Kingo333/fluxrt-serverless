@@ -33,6 +33,11 @@ the per-clip numbers for the clips of one type only: a GARMENT line per save (dr
 number of clips) and a GARMENT_AREAS line per type. The pick itself is unchanged: with the kiosk weights the
 dresses already carry about two thirds of it.
 
+Fabric direction and equal steps (fxreal9, 2026-11-21): where the per-clip records hold fabric_ratio (the
+garment's light-dark spread over the photo's; newer scorings), a FABRIC line says whether a model is flatter or
+more contrasty than the photo, next to favourite #2 (the fabric score itself has no direction). Runs that have
+saves at the same step are put side by side in COMPARE lines (score, garment types, areas).
+
 Several chance entries (2026-11-21): with more than one "aa" entry (other random seeds) the size of chance is
 the largest of theirs, per area and per garment type too (CHANCE_AREAS, GARMENT_CHANCE), and the GATE bar is the
 smallest number of sets any of them passes.
@@ -43,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 CAP = 0.5
@@ -175,6 +181,23 @@ def area_gains(per_set_gains: dict, weights: dict) -> dict:
     return out
 
 
+def fabric_direction(d: Path, name: str, base: str, weights: dict):
+    """(model, favourite #2): the garment's light-dark spread as a multiple of the photo's (geometric mean over the
+    clips of a set, sets weighted), or None when the records do not hold it. Under 1 = flatter than the photo."""
+    tot = {name: 0.0, base: 0.0}
+    wsum = 0.0
+    for s, w in weights.items():
+        items = (_load(d / s / "garment.json") or {}).get("items") or {}
+        both = [(v[name]["fabric_ratio"], v[base]["fabric_ratio"]) for v in items.values() if isinstance(v, dict)
+                and all(isinstance(v.get(m), dict) and (_num(v[m].get("fabric_ratio")) or 0) > 0 for m in (name, base))]
+        if not both or w <= 0:
+            continue
+        tot[name] += w * sum(math.log(a) for a, _ in both) / len(both)
+        tot[base] += w * sum(math.log(b) for _, b in both) / len(both)
+        wsum += w
+    return (round(math.exp(tot[name] / wsum), 3), round(math.exp(tot[base] / wsum), 3)) if wsum else None
+
+
 def subset_numbers(d: Path, name: str, base: str, clips: set) -> tuple[dict, int]:
     """set_numbers for some of the set's clips only, from the per-clip records: ({metric: (cand, base)}, the number
     of those clips with garment numbers for both models)."""
@@ -252,7 +275,8 @@ def judge(root: Path, base: str, weights: dict, clips_dir: Path | None = None) -
                      "sha256": meta.get("sha256"), "score": round(total / wsum, 4) if wsum else None,
                      "gate_sets": gates, "face_gate_sets": face_gates, "sets": len(per_set), "per_set": per_set,
                      "areas": area_gains(gains, weights),
-                     "garments": garment_split(d, name, base, weights, types)})
+                     "garments": garment_split(d, name, base, weights, types),
+                     "fabric_ratio": fabric_direction(d, name, base, weights)})
     return rows
 
 
@@ -292,6 +316,9 @@ def main(argv=None) -> dict:
         areas = ", ".join(f"{k} {fmt(v)}" for k, v in r["areas"].items() if v is not None)
         if areas:
             print(f"AREAS {r['label']}: {areas}")
+        if r["fabric_ratio"]:
+            print(f"FABRIC {r['label']}: the garment's light-dark spread is x{r['fabric_ratio'][0]:.2f} of the photo's "
+                  f"(favourite #2 x{r['fabric_ratio'][1]:.2f}; 1.00 = the same, under 1 = flatter)")
         if r["garments"]:
             print(f"GARMENT {r['label']}: "
                   + " | ".join(f"{t} {fmt(g['score'])} ({g['clips']} clips)" for t, g in r["garments"].items()))
@@ -335,6 +362,21 @@ def main(argv=None) -> dict:
     if garment_noise:
         print("GARMENT_CHANCE differences up to these sizes mean nothing: "
               + " | ".join(f"{t} {size(v)}" for t, v in garment_noise.items()))
+    # runs with saves at the same step, side by side (fxreal8's own continuation next to the fxreal9 arms)
+    by_step: dict = {}
+    for r in rows:
+        mt = re.match(r"^(\S+) step (\d+)\b", r["label"]) if r["kind"] == "save" else None
+        if mt and r["score"] is not None:
+            by_step.setdefault(int(mt.group(2)), {})[mt.group(1)] = r
+    for step in sorted(by_step):
+        if len(by_step[step]) < 2:
+            continue
+        for run in sorted(by_step[step]):
+            r = by_step[step][run]
+            parts = [f"score {fmt(r['score'])}"] + [f"{t} {fmt(v['score'])}" for t, v in r["garments"].items()]
+            parts += [f"{k} {fmt(r['areas'][k])}" for k in ("colour", "detail", "fabric", "movement", "flicker", "face and skin")
+                      if r["areas"].get(k) is not None]
+            print(f"COMPARE step {step}, {run}: " + ", ".join(parts))
     for r in runtime:
         ar = r["areas"]
         beyond = (r["score"] or 0) > noise

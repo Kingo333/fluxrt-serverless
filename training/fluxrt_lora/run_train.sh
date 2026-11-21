@@ -103,6 +103,11 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-diskcache.patch"
 # prediction (--ref_weight) and a check of the first steps (--safety_steps). All off unless set.
 curl -fsSL "$RAW/patches/flux2-klein-fx8.patch" -o "$AZ_ROOT/flux2-klein-fx8.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx8.patch"
+# fxreal9 (2026-11-21): the garment terms also count at the noise levels the live model runs at (--pair_floor,
+# --detail_floor, --texture_floor), and the frozen model's fabric contrast is kept (--keep_spread_weight). All off
+# unless set: without them every step gets the same numbers as before.
+curl -fsSL "$RAW/patches/flux2-klein-fx9.patch" -o "$AZ_ROOT/flux2-klein-fx9.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx9.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -163,6 +168,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   ${AZ_FROZEN_LORA:+--frozen_init_lora="$AZ_FROZEN_LORA"} \
   ${AZ_STEADY_RATIO:+--steady_ratio="$AZ_STEADY_RATIO"} ${AZ_STEADY_WEIGHT:+--steady_weight="$AZ_STEADY_WEIGHT"} \
   ${AZ_REF_WEIGHT:+--ref_weight="$AZ_REF_WEIGHT"} ${AZ_SAFETY_STEPS:+--safety_steps="$AZ_SAFETY_STEPS"} \
+  ${AZ_PAIR_FLOOR:+--pair_floor="$AZ_PAIR_FLOOR"} ${AZ_DETAIL_FLOOR:+--detail_floor="$AZ_DETAIL_FLOOR"} \
+  ${AZ_TEXTURE_FLOOR:+--texture_floor="$AZ_TEXTURE_FLOOR"} ${AZ_KEEP_SPREAD:+--keep_spread_weight="$AZ_KEEP_SPREAD"} \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"
