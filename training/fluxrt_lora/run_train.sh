@@ -91,6 +91,28 @@ git -C "$SRC" apply "$AZ_ROOT/flux2-klein-refsizes.patch"
 # encoder is freed after caching. Memory only: every step gets the same numbers.
 curl -fsSL "$RAW/patches/flux2-klein-cpucache.patch" -o "$AZ_ROOT/flux2-klein-cpucache.patch"
 git -C "$SRC" apply "$AZ_ROOT/flux2-klein-cpucache.patch"
+# fxreal6: a third input, an earlier frame of the same video (--cond_image_column_3; off unless AZ_ANCHOR_COLUMN is set).
+curl -fsSL "$RAW/patches/flux2-klein-anchor.patch" -o "$AZ_ROOT/flux2-klein-anchor.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-anchor.patch"
+# 2026-11-16 (94 GB Pods): the text rows of the cache can live on disk (AZ_TEXT_CACHE_DIR; off unless set: same
+# bytes, same numbers), and the CPU RAM check reads the container's memory limit, not only the host's.
+curl -fsSL "$RAW/patches/flux2-klein-diskcache.patch" -o "$AZ_ROOT/flux2-klein-diskcache.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-diskcache.patch"
+# fxreal8 (2026-11-18): a LoRA merged into the frozen weights with a small add-on on top (--frozen_init_lora), a
+# steadiness term between the two frames of a pair (--steady_ratio), a reference term to the frozen model's own
+# prediction (--ref_weight) and a check of the first steps (--safety_steps). All off unless set.
+curl -fsSL "$RAW/patches/flux2-klein-fx8.patch" -o "$AZ_ROOT/flux2-klein-fx8.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx8.patch"
+# fxreal9 (2026-11-21): the garment terms also count at the noise levels the live model runs at (--pair_floor,
+# --detail_floor, --texture_floor), and the frozen model's fabric contrast is kept (--keep_spread_weight). All off
+# unless set: without them every step gets the same numbers as before.
+curl -fsSL "$RAW/patches/flux2-klein-fx9.patch" -o "$AZ_ROOT/flux2-klein-fx9.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-fx9.patch"
+# 2026-11-21: after a restart the trainer went through the first batches of the pass again (the batch order is
+# fixed), so a continued run trained on examples it had already seen before any new one. --resume_skip_seen carries
+# on where the save left off. Off unless AZ_RESUME_SKIP=1: runs started without it stay exactly as they were.
+curl -fsSL "$RAW/patches/flux2-klein-resume.patch" -o "$AZ_ROOT/flux2-klein-resume.patch"
+git -C "$SRC" apply "$AZ_ROOT/flux2-klein-resume.patch"
 "$VENV/bin/pip" install -q -e "$SRC" accelerate transformers peft datasets bitsandbytes tensorboard sentencepiece pyarrow pillow huggingface_hub
 "$VENV/bin/python" -c "import torch, diffusers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'diffusers', diffusers.__version__)"
 
@@ -147,6 +169,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   ${AZ_COLOUR_WEIGHT:+--colour_weight="$AZ_COLOUR_WEIGHT"} \
   ${AZ_TEXTURE_WEIGHT:+--texture_weight="$AZ_TEXTURE_WEIGHT"} \
   ${AZ_REF_SIZES:+--cond_2_sizes="$AZ_REF_SIZES"} \
+  ${AZ_ANCHOR_COLUMN:+--cond_image_column_3="$AZ_ANCHOR_COLUMN" --cond_3_prob="${AZ_ANCHOR_PROB:-1.0}"} \
+  ${AZ_FROZEN_LORA:+--frozen_init_lora="$AZ_FROZEN_LORA"} \
+  ${AZ_STEADY_RATIO:+--steady_ratio="$AZ_STEADY_RATIO"} ${AZ_STEADY_WEIGHT:+--steady_weight="$AZ_STEADY_WEIGHT"} \
+  ${AZ_REF_WEIGHT:+--ref_weight="$AZ_REF_WEIGHT"} ${AZ_SAFETY_STEPS:+--safety_steps="$AZ_SAFETY_STEPS"} \
+  ${AZ_PAIR_FLOOR:+--pair_floor="$AZ_PAIR_FLOOR"} ${AZ_DETAIL_FLOOR:+--detail_floor="$AZ_DETAIL_FLOOR"} \
+  ${AZ_TEXTURE_FLOOR:+--texture_floor="$AZ_TEXTURE_FLOOR"} ${AZ_KEEP_SPREAD:+--keep_spread_weight="$AZ_KEEP_SPREAD"} \
+  $( [ "${AZ_RESUME_SKIP:-0}" = "1" ] && echo --resume_skip_seen ) \
   --resume_from_checkpoint=latest \
   --skip_final_inference --report_to=tensorboard \
   --seed=0 2>&1 | tee "$LOG"

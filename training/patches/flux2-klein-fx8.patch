@@ -1,0 +1,302 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index c001370..38eb110 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -456,6 +456,48 @@ def parse_args(input_args=None):
+             "A newer checkpoint of the same run (--resume_from_checkpoint) still takes over."
+         ),
+     )
++    parser.add_argument(
++        "--frozen_init_lora",
++        type=str,
++        default=None,
++        help=(
++            "Azyah fxreal8: a LoRA (folder or file) merged into the frozen model weights before the new LoRA is "
++            "added, so the new LoRA is a small add-on on top of it that starts as an exact zero. Its saves hold the "
++            "add-on only. Not together with --init_lora_weights."
++        ),
++    )
++    parser.add_argument(
++        "--steady_ratio",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal8: the steadiness term (the change between the two predicted pictures of a frame pair vs "
++            "the change between the two real frames, counted where the real frames barely change, at every noise "
++            "level) gets this share of the loss at the start, measured over the first --safety_steps steps. 0 = off."
++        ),
++    )
++    parser.add_argument(
++        "--steady_weight", type=float, default=0.0,
++        help="Azyah fxreal8: a fixed weight for the steadiness term instead of --steady_ratio (0 = use the ratio).",
++    )
++    parser.add_argument(
++        "--ref_weight",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal8: weight of the squared distance between the prediction and the frozen model's own "
++            "prediction for the same input (the add-on switched off). Needs --frozen_init_lora."
++        ),
++    )
++    parser.add_argument(
++        "--safety_steps",
++        type=int,
++        default=0,
++        help=(
++            "Azyah fxreal8: check the first N steps (a new add-on starts exactly at the frozen model, every term is "
++            "finite, frame pairs are present) and stop with FX8_SAFETY_FAILED otherwise. 0 = no check."
++        ),
++    )
+ 
+     parser.add_argument(
+         "--output_dir",
+@@ -1324,6 +1366,126 @@ def _azyah_use_anchor(examples):
+     return _AZ_COND3_RNG.random() < _AZ_COND3_PROB
+ 
+ 
++# Azyah fxreal8: favourite #2 merged into the frozen weights with a small add-on trained on top, a steadiness term
++# between the two frames of a pair, a reference term to favourite #2's own prediction, and a safety check.
++_AZ_FX8 = {"seen": 0, "steady_on": 0, "data": 0.0, "steady": 0.0, "first_ref": None, "first_data": None,
++           "weight": 0.0, "done": False}
++
++
++def _azyah_lora_layers(state_dict):
++    """{module name: (lora_A, lora_B)} from a peft-style LoRA state dict (keys <module>.lora_A.weight)."""
++    out = {}
++    for k, a in state_dict.items():
++        if not k.endswith(".lora_A.weight"):
++            continue
++        name = k[: -len(".lora_A.weight")]
++        b = state_dict.get(name + ".lora_B.weight")
++        if b is None:
++            raise ValueError(f"the LoRA has no lora_B for {name}")
++        out[name] = (a, b)
++    return out
++
++
++def _azyah_lora_file_scale(path):
++    """alpha / rank from the file's settings record; 1.0 when there is none (our files store alpha = rank)."""
++    import glob
++
++    from safetensors import safe_open
++    files = [path] if os.path.isfile(path) else sorted(glob.glob(os.path.join(path, "*.safetensors")))
++    if not files:
++        return 1.0
++    try:
++        with safe_open(files[0], framework="pt") as f:
++            raw = (f.metadata() or {}).get("lora_adapter_metadata")
++        meta = json.loads(raw) if raw else {}
++    except Exception:  # noqa: BLE001 - a file without a readable record counts as alpha = rank
++        return 1.0
++    r = next((v for k, v in meta.items() if k.rsplit(".", 1)[-1] == "r" and isinstance(v, (int, float))), None)
++    al = next((v for k, v in meta.items() if k.rsplit(".", 1)[-1] == "lora_alpha" and isinstance(v, (int, float))), None)
++    return float(al) / float(r) if r and al else 1.0
++
++
++@torch.no_grad()
++def _azyah_merge_into(model, layers, scale=1.0):
++    """Adds scale * B @ A into each layer's weight (summed in float32, stored in the weight's own dtype).
++    Returns (layers merged, rounding error of the stored change relative to the change itself)."""
++    n, err2, ref2 = 0, 0.0, 0.0
++    for name, (a, b) in layers.items():
++        w = model.get_submodule(name).weight
++        delta = (b.to(w.device, torch.float32) @ a.to(w.device, torch.float32)) * scale
++        if tuple(delta.shape) != tuple(w.shape):
++            raise ValueError(f"{name}: the LoRA change {tuple(delta.shape)} does not fit the layer {tuple(w.shape)}")
++        old = w.detach().float().clone()
++        w.copy_((old + delta).to(w.dtype))
++        err2 += float(((w.float() - old) - delta).pow(2).sum())
++        ref2 += float(delta.pow(2).sum())
++        n += 1
++        del old, delta
++    return n, (err2 / ref2) ** 0.5 if ref2 > 0 else 0.0
++
++
++def _azyah_steady_term(x0_hat, x0, pairs):
++    """Per frame pair (two nearby frames of one clip, the same noise): the mean distance between the change from
++    one predicted picture to the other and the change from one real frame to the other, weighted towards the
++    places where the real frames barely change (exp(-|change| / its median)). Not turned down at high noise."""
++    terms = []
++    for i, j in pairs:
++        d_true = x0[i] - x0[j]
++        d_hat = x0_hat[i] - x0_hat[j]
++        mag = d_true.abs().mean(0, keepdim=True)
++        tau = mag.median().clamp(min=1e-4)
++        w = torch.exp(-mag / tau)
++        terms.append(((d_hat - d_true).abs().mean(0, keepdim=True) * w).sum() / w.sum().clamp(min=1e-6))
++    return torch.stack(terms).mean()
++
++
++def _azyah_ref_term(pred, ref_pred):
++    """Mean squared distance from the frozen model's own prediction. Uniform: the data term already counts the
++    garment and the face 3x (--mask_weight), so the add-on stays freest there and closest elsewhere."""
++    return ((pred.float() - ref_pred.float()) ** 2).mean()
++
++
++def _azyah_fx8_fail(reason):
++    print(f"FX8_SAFETY_FAILED: {reason}", flush=True)
++    raise SystemExit(3)
++
++
++def _azyah_fx8_check(args, logs, loss, fresh_start, weight_file):
++    """Called once per step while the first --safety_steps steps (or the steadiness calibration) last."""
++    st = _AZ_FX8
++    vals = {"loss": float(loss), **logs}
++    bad = [k for k, v in vals.items() if not math.isfinite(v)]
++    if bad:
++        _azyah_fx8_fail(f"not finite at step {st['seen']}: {', '.join(bad)}")
++    if st["seen"] < max(args.safety_steps, 1):
++        return
++    notes = []
++    if args.ref_weight > 0 and fresh_start:
++        r, d = st["first_ref"], st["first_data"]
++        if r is None or not r <= 1e-4 * max(d or 0.0, 1e-8):
++            _azyah_fx8_fail(f"the add-on does not start at the frozen model: reference term {r} at the first step "
++                            f"(data term {d})")
++        notes.append(f"start = the frozen model (reference term {r:.1e} at the first step)")
++    steady_on = args.steady_ratio > 0 or args.steady_weight > 0
++    if steady_on:
++        if st["steady_on"] == 0:
++            _azyah_fx8_fail(f"no frame pairs in the first {st['seen']} batches: the steadiness term never ran")
++        notes.append(f"steadiness term on in {st['steady_on']}/{st['seen']} batches")
++        if st["weight"] <= 0:
++            mean_s, mean_d = st["steady"] / st["steady_on"], st["data"] / st["steady_on"]
++            if not (mean_s > 0 and mean_d > 0):
++                _azyah_fx8_fail(f"the steadiness term ({mean_s}) or the data term ({mean_d}) is not positive at the start")
++            st["weight"] = args.steady_ratio * mean_d / mean_s
++            with open(weight_file, "w") as f:
++                json.dump({"steady_weight": st["weight"], "ratio": args.steady_ratio, "steady_at_start": mean_s,
++                           "data_at_start": mean_d, "batches": st["steady_on"]}, f)
++        notes.append(f"steadiness weight {st['weight']:.4g}")
++        print(f"STEADY_WEIGHT {st['weight']:.6g}", flush=True)
++    st["done"] = True
++    print(f"FX8_SAFETY_OK: {'; '.join(notes) or 'every term finite'}; every term finite over the first {st['seen']} steps",
++          flush=True)
++
++
+ def collate_fn(examples):
+     pixel_values = [example["instance_images"] for example in examples]
+     prompts = [example["instance_prompt"] for example in examples]
+@@ -1656,7 +1818,31 @@ def main(args):
+         init_lora_weights="gaussian",
+         target_modules=target_modules,
+     )
++    _az_frozen_layers = None
++    if args.frozen_init_lora:
++        # Azyah fxreal8: favourite #2 (un-scaled) becomes part of the frozen weights; the new LoRA is an add-on.
++        if args.init_lora_weights:
++            raise ValueError("--frozen_init_lora and --init_lora_weights cannot be used together")
++        _fsd = Flux2KleinPipeline.lora_state_dict(args.frozen_init_lora)
++        _fsd = {k[len("transformer."):]: v for k, v in _fsd.items() if k.startswith("transformer.")}
++        _fsd = convert_unet_state_dict_to_peft(_fsd)
++        _az_frozen_layers = _azyah_lora_layers(_fsd)
++        if not _az_frozen_layers:
++            _azyah_fx8_fail(f"no LoRA layers in {args.frozen_init_lora}")
++        _az_scale = _azyah_lora_file_scale(args.frozen_init_lora)
++        _az_n, _az_rel = _azyah_merge_into(transformer, _az_frozen_layers, _az_scale)
++        print(f"FROZEN_LORA merged {_az_n} layers of {args.frozen_init_lora} at x{_az_scale:g} into the frozen "
++              f"weights (rounding to {transformer.dtype}: {100 * _az_rel:.1f}% of the change)", flush=True)
++        del _fsd
++    elif args.ref_weight > 0:
++        raise ValueError("--ref_weight needs --frozen_init_lora (the reference is the model with the add-on off)")
+     transformer.add_adapter(transformer_lora_config)
++    if _az_frozen_layers is not None:
++        _az_new = {k[: -len(".lora_A.weight")] for k in get_peft_model_state_dict(transformer) if k.endswith(".lora_A.weight")}
++        if _az_new != set(_az_frozen_layers):
++            _azyah_fx8_fail(f"the add-on's layers differ from the frozen LoRA's ({len(_az_new - set(_az_frozen_layers))} "
++                            f"extra, {len(set(_az_frozen_layers) - _az_new)} missing): its saves could not be merged")
++        print(f"FX8_ADDON rank {args.rank} on the same {len(_az_new)} layers as the frozen LoRA", flush=True)
+     if args.init_lora_weights:
+         # Azyah fxreal5: continue from an existing LoRA (e.g. favourite #2's exact merge, its strength baked in).
+         _init_sd = Flux2KleinPipeline.lora_state_dict(args.init_lora_weights)
+@@ -2145,6 +2331,17 @@ def main(args):
+         disable=not accelerator.is_local_main_process,
+     )
+ 
++    # Azyah fxreal8: a restart keeps the steadiness weight measured at the first start.
++    _az_fx8_weight_file = os.path.join(args.output_dir, "fx8_steady_weight.json")
++    _az_fx8_fresh = initial_global_step == 0
++    if args.steady_weight > 0:
++        _AZ_FX8["weight"] = args.steady_weight
++    elif args.steady_ratio > 0 and os.path.exists(_az_fx8_weight_file):
++        with open(_az_fx8_weight_file) as f:
++            _AZ_FX8["weight"] = float(json.load(f)["steady_weight"])
++        print(f"STEADY_WEIGHT {_AZ_FX8['weight']:.6g} (from the first start of this run)", flush=True)
++    _az_fx8_on = args.steady_ratio > 0 or args.steady_weight > 0 or args.ref_weight > 0 or args.safety_steps > 0
++
+     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+         sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+         schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+@@ -2301,6 +2498,24 @@ def main(args):
+                 else:
+                     guidance = None
+ 
++                # Azyah fxreal8: the frozen model's own prediction for the same input (the add-on switched off).
++                _az_ref_pred = None
++                if args.ref_weight > 0:
++                    with torch.no_grad():
++                        unwrap_model(transformer).disable_adapters()
++                        try:
++                            _az_ref_pred = transformer(
++                                hidden_states=packed_noisy_model_input,
++                                timestep=timesteps / 1000,
++                                guidance=guidance,
++                                encoder_hidden_states=prompt_embeds,
++                                txt_ids=text_ids,
++                                img_ids=model_input_ids,
++                                return_dict=False,
++                            )[0][:, : orig_input_shape[1], :]
++                        finally:
++                            unwrap_model(transformer).enable_adapters()
++
+                 # Predict the noise residual
+                 model_pred = transformer(
+                     hidden_states=packed_noisy_model_input,  # (B, image_seq_len, C)
+@@ -2316,6 +2531,8 @@ def main(args):
+                 model_input_ids = model_input_ids[:, : orig_input_ids_shape[1], :]
+ 
+                 model_pred = Flux2KleinPipeline._unpack_latents_with_ids(model_pred, model_input_ids)
++                if _az_ref_pred is not None:
++                    _az_ref_pred = Flux2KleinPipeline._unpack_latents_with_ids(_az_ref_pred, model_input_ids)
+ 
+                 # these weighting schemes use a uniform timestep sampling
+                 # and instead post-weight the loss
+@@ -2338,6 +2555,7 @@ def main(args):
+                     loss = ((wts * err).reshape(err.shape[0], -1).sum(1) / wts.reshape(err.shape[0], -1).sum(1)).mean()
+                 else:
+                     loss = torch.mean(err.reshape(target.shape[0], -1), 1).mean()
++                _az_data_loss = float(loss.detach())
+ 
+                 # Azyah fxreal3: detail (edge) term and same-clip colour term on the predicted clean latents.
+                 _az_logs = {}
+@@ -2391,6 +2609,29 @@ def main(args):
+                         _texture = (_c5 * _per5).sum() / _c5.sum().clamp(min=1e-6)
+                         loss = loss + args.texture_weight * _texture
+                         _az_logs["texture"] = _texture.detach().item()
++                # Azyah fxreal8: steadiness between the two frames of a pair, distance to favourite #2's own
++                # prediction, and the check of the first steps.
++                if _az_fx8_on:
++                    _AZ_FX8["seen"] += 1
++                    _az_first = not _AZ_FX8["done"]
++                    if (args.steady_ratio > 0 or args.steady_weight > 0) and _az_pairs:
++                        _az_x0h = noisy_model_input.float() - sigmas.float() * model_pred.float()
++                        _steady = _azyah_steady_term(_az_x0h, model_input.float(), _az_pairs)
++                        _az_logs["steady"] = _steady.detach().item()
++                        if _az_first:
++                            _AZ_FX8["steady_on"] += 1
++                            _AZ_FX8["data"] += _az_data_loss
++                            _AZ_FX8["steady"] += _az_logs["steady"]
++                        if _AZ_FX8["weight"] > 0:
++                            loss = loss + _AZ_FX8["weight"] * _steady
++                    if _az_ref_pred is not None:
++                        _ref = _azyah_ref_term(model_pred, _az_ref_pred)
++                        loss = loss + args.ref_weight * _ref
++                        _az_logs["ref"] = _ref.detach().item()
++                        if _AZ_FX8["first_ref"] is None:
++                            _AZ_FX8["first_ref"], _AZ_FX8["first_data"] = _az_logs["ref"], _az_data_loss
++                    if _az_first:
++                        _azyah_fx8_check(args, _az_logs, loss.detach(), _az_fx8_fresh, _az_fx8_weight_file)
+ 
+                 accelerator.backward(loss)
+                 if accelerator.sync_gradients:

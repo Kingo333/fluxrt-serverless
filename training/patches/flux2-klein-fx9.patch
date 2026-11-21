@@ -1,0 +1,160 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index 38eb110..4e0982b 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -498,6 +498,39 @@ def parse_args(input_args=None):
+             "finite, frame pairs are present) and stop with FX8_SAFETY_FAILED otherwise. 0 = no check."
+         ),
+     )
++    parser.add_argument(
++        "--pair_floor",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal9: the same-clip colour term (--pair_weight) counts at least this much at every noise "
++            "level instead of fading out as (1 - noise): 1.0 = fully at every level, like the colour term. The live "
++            "model runs at noise 1.0 and ~0.88, where the term was off. 0 = as before."
++        ),
++    )
++    parser.add_argument(
++        "--detail_floor",
++        type=float,
++        default=0.0,
++        help="Azyah fxreal9: the same floor for the detail (edge) term's weighting inside a batch. 0 = as before.",
++    )
++    parser.add_argument(
++        "--texture_floor",
++        type=float,
++        default=0.0,
++        help="Azyah fxreal9: the same floor for the fabric-contrast term's weighting inside a batch. 0 = as before.",
++    )
++    parser.add_argument(
++        "--keep_spread_weight",
++        type=float,
++        default=0.0,
++        help=(
++            "Azyah fxreal9: weight of a one-sided term that keeps the frozen model's fabric contrast: how far the "
++            "spread of the predicted clean latents inside --mask_column falls BELOW the frozen model's own for the "
++            "same input (the add-on switched off), at every noise level. Zero when the add-on is as contrasty or "
++            "more. Needs --frozen_init_lora and --mask_column."
++        ),
++    )
+ 
+     parser.add_argument(
+         "--output_dir",
+@@ -1445,6 +1478,20 @@ def _azyah_ref_term(pred, ref_pred):
+     return ((pred.float() - ref_pred.float()) ** 2).mean()
+ 
+ 
++def _azyah_spread(x, m):
++    """Per picture and channel: the spread (standard deviation) of x inside the weight map m (B, 1, H, W)."""
++    n = m.sum((-2, -1)).clamp(min=1e-6)
++    mean = (x * m).sum((-2, -1)) / n
++    return (((x - mean[..., None, None]) ** 2 * m).sum((-2, -1)) / n).clamp(min=1e-8).sqrt()
++
++
++def _azyah_keep_spread_term(x0_hat, x0_ref, m):
++    """Azyah fxreal9, one-sided: how far the spread of the predicted picture inside m falls below the frozen
++    model's own (favourite #2's) for the same input. Zero where the add-on is as contrasty as favourite #2 or
++    more: it stops the fabric going flat without pulling it anywhere else."""
++    return torch.relu(_azyah_spread(x0_ref.float(), m) - _azyah_spread(x0_hat.float(), m)).mean()
++
++
+ def _azyah_fx8_fail(reason):
+     print(f"FX8_SAFETY_FAILED: {reason}", flush=True)
+     raise SystemExit(3)
+@@ -1834,8 +1881,15 @@ def main(args):
+         print(f"FROZEN_LORA merged {_az_n} layers of {args.frozen_init_lora} at x{_az_scale:g} into the frozen "
+               f"weights (rounding to {transformer.dtype}: {100 * _az_rel:.1f}% of the change)", flush=True)
+         del _fsd
+-    elif args.ref_weight > 0:
+-        raise ValueError("--ref_weight needs --frozen_init_lora (the reference is the model with the add-on off)")
++    elif args.ref_weight > 0 or args.keep_spread_weight > 0:
++        raise ValueError("--ref_weight and --keep_spread_weight need --frozen_init_lora (the reference is the model "
++                         "with the add-on off)")
++    if args.keep_spread_weight > 0 and args.mask_column is None:
++        raise ValueError("--keep_spread_weight needs --mask_column (the area whose spread is kept)")
++    if args.pair_floor > 0 or args.detail_floor > 0 or args.texture_floor > 0 or args.keep_spread_weight > 0:
++        print(f"FX9_TERMS same-clip colour floor {args.pair_floor:g}, detail floor {args.detail_floor:g}, fabric-contrast "
++              f"floor {args.texture_floor:g} (1 = counted fully at every noise level), keep-spread weight "
++              f"{args.keep_spread_weight:g}", flush=True)
+     transformer.add_adapter(transformer_lora_config)
+     if _az_frozen_layers is not None:
+         _az_new = {k[: -len(".lora_A.weight")] for k in get_peft_model_state_dict(transformer) if k.endswith(".lora_A.weight")}
+@@ -2340,7 +2394,8 @@ def main(args):
+         with open(_az_fx8_weight_file) as f:
+             _AZ_FX8["weight"] = float(json.load(f)["steady_weight"])
+         print(f"STEADY_WEIGHT {_AZ_FX8['weight']:.6g} (from the first start of this run)", flush=True)
+-    _az_fx8_on = args.steady_ratio > 0 or args.steady_weight > 0 or args.ref_weight > 0 or args.safety_steps > 0
++    _az_fx8_on = (args.steady_ratio > 0 or args.steady_weight > 0 or args.ref_weight > 0 or args.safety_steps > 0
++                  or args.keep_spread_weight > 0)
+ 
+     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+         sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+@@ -2500,7 +2555,7 @@ def main(args):
+ 
+                 # Azyah fxreal8: the frozen model's own prediction for the same input (the add-on switched off).
+                 _az_ref_pred = None
+-                if args.ref_weight > 0:
++                if args.ref_weight > 0 or args.keep_spread_weight > 0:
+                     with torch.no_grad():
+                         unwrap_model(transformer).disable_adapters()
+                         try:
+@@ -2562,6 +2617,9 @@ def main(args):
+                 if args.detail_weight > 0 or (args.pair_weight > 0 and _az_pairs):
+                     _sig = sigmas.float().reshape(-1)
+                     _conf = (1.0 - _sig).clamp(min=0.0)  # x0 is only well defined at lower noise
++                    # Azyah fxreal9: a floor, so the terms also count at the noise levels the live model runs at
++                    _conf_d = _conf.clamp(min=args.detail_floor) if args.detail_floor > 0 else _conf
++                    _conf_p = _conf.clamp(min=args.pair_floor) if args.pair_floor > 0 else _conf
+                     _x0_hat = noisy_model_input.float() - sigmas.float() * model_pred.float()
+                     _x0 = model_input.float()
+                     _mk = m if loss_mask is not None else torch.ones_like(_x0[:, :1])
+@@ -2575,7 +2633,7 @@ def main(args):
+                         _gy = ((_uh[..., 1:, :] - _uh[..., :-1, :]) - (_ut[..., 1:, :] - _ut[..., :-1, :])).abs() * _wy
+                         _den = (_wx.sum((1, 2, 3)) + _wy.sum((1, 2, 3))) * _uh.shape[1] + 1e-6
+                         _per = (_gx.sum((1, 2, 3)) + _gy.sum((1, 2, 3))) / _den
+-                        _detail = (_conf * _per).sum() / _conf.sum().clamp(min=1e-6)
++                        _detail = (_conf_d * _per).sum() / _conf_d.sum().clamp(min=1e-6)
+                         loss = loss + args.detail_weight * _detail
+                         _az_logs["detail"] = _detail.detach().item()
+                     if args.pair_weight > 0 and _az_pairs:
+@@ -2585,7 +2643,7 @@ def main(args):
+                         for _i, _j in _az_pairs:
+                             _d_hat = _cmean(_x0_hat[_i], _mk[_i]) - _cmean(_x0_hat[_j], _mk[_j])
+                             _d_true = _cmean(_x0[_i], _mk[_i]) - _cmean(_x0[_j], _mk[_j])
+-                            _terms.append(_conf[_i] * (_d_hat - _d_true).abs().mean())
++                            _terms.append(_conf_p[_i] * (_d_hat - _d_true).abs().mean())
+                         _pair = torch.stack(_terms).mean()
+                         loss = loss + args.pair_weight * _pair
+                         _az_logs["pair"] = _pair.detach().item()
+@@ -2593,6 +2651,8 @@ def main(args):
+                 # latents vs the answer, inside --mask_column (the garment area, plus the face).
+                 if (args.colour_weight > 0 or args.texture_weight > 0) and loss_mask is not None:
+                     _c5 = (1.0 - sigmas.float().reshape(-1)).clamp(min=0.0)
++                    if args.texture_floor > 0:  # Azyah fxreal9: also at the live model's noise levels
++                        _c5 = _c5.clamp(min=args.texture_floor)
+                     _xh5 = noisy_model_input.float() - sigmas.float() * model_pred.float()
+                     _xt5 = model_input.float()
+                     _n5 = m.sum((-2, -1)).clamp(min=1e-6)
+@@ -2624,12 +2684,19 @@ def main(args):
+                             _AZ_FX8["steady"] += _az_logs["steady"]
+                         if _AZ_FX8["weight"] > 0:
+                             loss = loss + _AZ_FX8["weight"] * _steady
+-                    if _az_ref_pred is not None:
++                    if _az_ref_pred is not None and args.ref_weight > 0:
+                         _ref = _azyah_ref_term(model_pred, _az_ref_pred)
+                         loss = loss + args.ref_weight * _ref
+                         _az_logs["ref"] = _ref.detach().item()
+                         if _AZ_FX8["first_ref"] is None:
+                             _AZ_FX8["first_ref"], _AZ_FX8["first_data"] = _az_logs["ref"], _az_data_loss
++                    if _az_ref_pred is not None and args.keep_spread_weight > 0 and loss_mask is not None:
++                        # Azyah fxreal9: the fabric contrast must not fall below favourite #2's own
++                        _keep = _azyah_keep_spread_term(
++                            noisy_model_input.float() - sigmas.float() * model_pred.float(),
++                            noisy_model_input.float() - sigmas.float() * _az_ref_pred.float(), m)
++                        loss = loss + args.keep_spread_weight * _keep
++                        _az_logs["keep"] = _keep.detach().item()
+                     if _az_first:
+                         _azyah_fx8_check(args, _az_logs, loss.detach(), _az_fx8_fresh, _az_fx8_weight_file)
+ 
