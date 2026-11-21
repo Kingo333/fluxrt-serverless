@@ -156,3 +156,37 @@ def test_clips_without_a_number_and_entries_without_a_seed_are_left_out(tmp_path
     assert set(table) == {("fav2", 54), ("fav2", 52)}
     res, out = _run(yard, capsys)
     assert res["seeds"][0]["fresh"]["score"] == pytest.approx(0.1 / 10, abs=1e-6)            # the other 46 clips
+
+
+def test_the_direction_of_the_fabric_gap_is_reported_next_to_favourite_2(tmp_path, capsys):
+    fxa = tmp_path / "fxa"
+    yard = fxa / "yard"
+    _lists(fxa)
+    _entry(yard, "fav2seed54_r528", "fav2", 54, FRESH, lambda s, i, t: 1.0)
+    _entry(yard, "m52", "fxreal8 step 750", 52, FRESH, lambda s, i, t: 1.0)
+    _entry(yard, "m54", "fxreal8 step 750", 54, FRESH, lambda s, i, t: 1.0)
+    # the scorers' newer records: favourite #2 x0.92 of the photo's spread at seed 52 and x0.96 at seed 54; the
+    # model x0.80 at both seeds
+    for name, mine in (("fav2seed54_r528", 0.96), ("m52", 0.80), ("m54", 0.80)):
+        g = yard / name / "fx12test/garment.json"
+        d = json.loads(g.read_text())
+        for clip, v in d["items"].items():
+            v[name]["fabric_ratio"] = mine
+            v[BASE]["fabric_ratio"] = 0.92
+        g.write_text(json.dumps(d))
+    res, out = _run(yard, capsys)
+    assert "YARD_FABRIC favourite #2: the garment's light-dark spread is x0.92 at seed 52, x0.96 at seed 54 of the photo's" in out
+    # against favourite #2 at the SAME seeds: (0.92 x 0.96) ** 0.5 = 0.94
+    assert ("YARD_FABRIC fxreal8 step 750: x0.80 of the photo's, favourite #2 at the same seeds and clips x0.94 (96 renders): "
+            "flatter than favourite #2") in out
+    assert res["fabric"]["models"]["fxreal8 step 750"]["pairs"] == 96
+    # records without the direction (older scorings) give no line and nothing breaks
+    for name in ("fav2seed54_r528", "m52", "m54"):
+        g = yard / name / "fx12test/garment.json"
+        d = json.loads(g.read_text())
+        for v in d["items"].values():
+            v[name].pop("fabric_ratio")
+            v[BASE].pop("fabric_ratio")
+        g.write_text(json.dumps(d))
+    res, out = _run(yard, capsys)
+    assert "YARD_FABRIC" not in out and "fabric" not in res

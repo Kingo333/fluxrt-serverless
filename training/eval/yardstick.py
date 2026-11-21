@@ -20,6 +20,9 @@ The score is the picker's (fluxrt_lora.pick_best_save): per set, every measure's
   YARD_SEED_ORDER   the seeds best first, on the old and on the fresh clips: the same order = seeds really differ
   YARD_MODEL        a model against favourite #2 AT THE SAME SEEDS, all clips: the seeds pooled, and each seed alone
   YARD_MODEL_GARMENT / YARD_MODEL_AREAS   the same per garment type and per area
+  YARD_FABRIC       the direction of the fabric score (it has none itself): the garment's light-dark spread as a
+                    multiple of the photo's, for favourite #2 per seed and for each model next to favourite #2 at
+                    the same seeds and on the same clips (under 1 = flatter than the photo)
   YARD_RESOLUTION   how small a difference this yardstick shows
 A range that does not include 0 is a real difference ("better" or "worse"); otherwise "no difference shown".
 """
@@ -76,6 +79,41 @@ def clip_rows(d: Path, name: str) -> dict:
             for k in STEADY:
                 row(clip)[KEYS.index(k)] = _num(m.get(k))
     return out
+
+
+def fabric_ratios(d: Path, name: str) -> dict:
+    """{clip: the garment's light-dark spread over the photo's} for model `name` (newer scorings only)."""
+    out = {}
+    for clip, v in ((_load(d / "garment.json") or {}).get("items") or {}).items():
+        m = v.get(name) if isinstance(v, dict) else None
+        x = _num(m.get("fabric_ratio")) if isinstance(m, dict) else np.nan
+        if x > 0:
+            out[clip] = x
+    return out
+
+
+def load_fabric(yard: Path, baseline: str, sets: list[str], live: int = 52) -> dict:
+    """{(model, seed): {(set, clip): ratio}}, favourite #2 at the live seed included (as in load)."""
+    table: dict = {}
+    for d in sorted(p for p in yard.iterdir() if p.is_dir() and (p / "meta.json").exists()):
+        meta = _load(d / "meta.json") or {}
+        if not meta.get("name") or meta.get("seed") is None or not meta.get("model"):
+            continue
+        key = (str(meta["model"]), int(meta["seed"]))
+        for s in sets:
+            if not (d / s).is_dir():
+                continue
+            if key != ("fav2", live):
+                for c, x in fabric_ratios(d / s, meta["name"]).items():
+                    table.setdefault(key, {})[(s, c)] = x
+            for c, x in fabric_ratios(d / s, baseline).items():
+                table.setdefault(("fav2", live), {}).setdefault((s, c), x)
+    return table
+
+
+def geo(xs) -> float | None:
+    xs = [x for x in xs if x and x > 0]
+    return float(np.exp(np.mean(np.log(xs)))) if xs else None
 
 
 def load(yard: Path, baseline: str, sets: list[str], live: int = 52) -> dict:
@@ -279,6 +317,30 @@ def main(argv=None) -> dict:
             print(f"YARD_MODEL_GARMENT {model}: " + " | ".join(f"{t} {rng_txt(v)} {word(v)}, {v['clips']} clips" for t, v in g.items()))
         print(f"YARD_MODEL_AREAS {model}: " + ", ".join(f"{k} {rng_txt(v)}" for k, v in r["areas"].items()))
         out["models"].append({"model": model, "seeds": seeds, "all": r, "garments": g})
+    # ---- which way the fabric differs: flatter or more contrasty than the garment photo
+    fab = load_fabric(yard, a.baseline, sets, live)
+    fav = {sd: geo(v.values()) for (m, sd), v in sorted(fab.items()) if m == "fav2"}
+    fav = {sd: x for sd, x in fav.items() if x}
+    if fav:
+        print("YARD_FABRIC favourite #2: the garment's light-dark spread is "
+              + ", ".join(f"x{x:.2f} at seed {sd}" for sd, x in fav.items()) + " of the photo's (1.00 = the same, under 1 = flatter)")
+        out["fabric"] = {"fav2": fav, "models": {}}
+    for model in sorted({m for (m, _) in fab if m != "fav2"}):
+        mine, theirs = [], []
+        for (m, sd), rows in fab.items():
+            if m != model:
+                continue
+            for key, x in rows.items():
+                y = fab.get(("fav2", sd), {}).get(key)
+                if y:
+                    mine.append(x)
+                    theirs.append(y)
+        if mine:
+            gm, gt = geo(mine), geo(theirs)
+            out.setdefault("fabric", {"fav2": fav, "models": {}})["models"][model] = {"model": gm, "fav2": gt, "pairs": len(mine)}
+            print(f"YARD_FABRIC {model}: x{gm:.2f} of the photo's, favourite #2 at the same seeds and clips x{gt:.2f} "
+                  f"({len(mine)} renders): " + ("flatter than favourite #2" if gm < gt * 0.985 else
+                                               "more contrast than favourite #2" if gm > gt * 1.015 else "the same as favourite #2"))
     if half:
         res = float(np.median(half))
         out["resolution"] = res
