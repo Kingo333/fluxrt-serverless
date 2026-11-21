@@ -19,7 +19,8 @@ KIOSK = "fx6test=1,dress10=1,cases5=0.5"
 def test_the_trainer_wrapper_applies_the_fx9_patch_last_and_passes_its_options():
     s = (ROOT / "training/fluxrt_lora/run_train.sh").read_text()
     applies = [l.split("flux2-klein-")[1].split(".patch")[0] for l in s.splitlines() if l.startswith('git -C "$SRC" apply')]
-    assert applies[-2:] == ["fx8", "fx9"]
+    assert applies[-3:] == ["fx8", "fx9", "resume"]
+    assert '$( [ "${AZ_RESUME_SKIP:-0}" = "1" ] && echo --resume_skip_seen )' in s
     for opt in ('${AZ_PAIR_FLOOR:+--pair_floor="$AZ_PAIR_FLOOR"}', '${AZ_DETAIL_FLOOR:+--detail_floor="$AZ_DETAIL_FLOOR"}',
                 '${AZ_TEXTURE_FLOOR:+--texture_floor="$AZ_TEXTURE_FLOOR"}',
                 '${AZ_KEEP_SPREAD:+--keep_spread_weight="$AZ_KEEP_SPREAD"}'):
@@ -111,3 +112,21 @@ def test_the_garment_scorer_keeps_the_direction_of_the_fabric_score():
     s = (ROOT / "training/eval/garment_report.py").read_text()
     assert 'res["fabric_ratio"] = round(float(s_out / s_ref), 4)' in s
     assert 'res["fabric"] = round(abs(float(np.log(s_out / s_ref))), 4)' in s        # the score itself is unchanged
+
+
+def test_a_restarted_run_can_carry_on_in_the_data_instead_of_replaying_it():
+    p = (ROOT / "training/patches/flux2-klein-resume.patch").read_text()
+    assert '"--resume_skip_seen"' in p and 'action="store_true"' in p                      # off unless asked
+    assert "+        _az_resume_skip = (initial_global_step % num_update_steps_per_epoch) * args.gradient_accumulation_steps" in p
+    assert "+            if epoch == first_epoch and step < _az_resume_skip:" in p and "+                continue" in p
+    assert 'print(f"RESUME_SKIP carrying on after the' in p
+    s = SCRIPT.read_text()
+    assert 'if [ "${AZ_RESUME_SKIP:-0}" = "1" ]; then FX8_ENV="$FX8_ENV AZ_RESUME_SKIP=1"' in s and "^RESUME_SKIP" in s
+
+
+def test_the_yardstick_script_never_trains_or_deletes_and_keeps_to_the_money():
+    s = (ROOT / "training/fluxrt_lora/fxb_yard.sh").read_text()
+    assert "run_train.sh" not in s and "rm -rf" not in s and "endpoint" in s.split("set -uo pipefail")[0]
+    assert 'out_of_money() { [ "$(left_min)" -le "$END_MIN" ]; }' in s and s.count("out_of_money &&") >= 4
+    assert 'case "$FAV_SUM" in "$FAV2_SHA"*) ;; *) fail "WRONG_FAVOURITE2' in s
+    assert "trap stop_pod EXIT" in s and 'runpodctl stop pod "${RUNPOD_POD_ID:-}"' in s

@@ -611,6 +611,8 @@ if [ "$TRAIN_FROM" = "fav2_addon" ]; then
     case "$x" in *[!0-9.]*|'') fail "BAD_$v: $x (a number)";; esac
     FX8_ENV="$FX8_ENV $v=$x"
   done
+  # after a restart: carry on in the data where the save left off (not the first batches again)
+  if [ "${AZ_RESUME_SKIP:-0}" = "1" ]; then FX8_ENV="$FX8_ENV AZ_RESUME_SKIP=1"; FX9_TXT="$FX9_TXT, new examples after the restart (no replay)"; fi
   [ -n "${AZ_PAIR_FLOOR:-}" ] && FX9_TXT="$FX9_TXT, frame-to-frame garment colour counted from ${AZ_PAIR_FLOOR} at every noise level"
   [ -n "${AZ_KEEP_SPREAD:-}" ] && FX9_TXT="$FX9_TXT, favourite #2's fabric contrast kept (x${AZ_KEEP_SPREAD})"
   [ -n "${AZ_TEXTURE_FLOOR:-}" ] && FX9_TXT="$FX9_TXT, fabric contrast towards the real frame counted from ${AZ_TEXTURE_FLOOR}"
@@ -693,7 +695,7 @@ else
     AZ_TEXT_CACHE_DIR=$TEXT_DIR AZ_INIT_LORA=$TRAIN_INIT $FX8_ENV bash" > "$AZ_ROOT/reports/fx6b_train_run.log" 2>&1
   TRAIN_EXIT=$?
   TLOG=$(ls -t "$AZ_ROOT"/reports/fluxlora_${EXP}_*.log 2>/dev/null | head -1)
-  grep -hE "LoRA initialised from|^FROZEN_LORA|^FX8_|^FX9_|^STEADY_WEIGHT|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
+  grep -hE "LoRA initialised from|^FROZEN_LORA|^FX8_|^FX9_|^RESUME_SKIP|^STEADY_WEIGHT|^ANCHOR_BATCHES|^TEXT_CACHE_DISK|^CACHE_RAM|^CACHE_CPU|NOT_ENOUGH_CPU_RAM|OutOfMemoryError|CUDA out of memory|Traceback" \
     "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null | tail -12 | sed 's/^/FX6B trainer: /'
   grep -qh "^FX8_SAFETY_FAILED" "$TLOG" "$AZ_ROOT/reports/fx6b_train_run.log" 2>/dev/null \
     && say "4. the safety check stopped the training before it could spend more (FX8_SAFETY_FAILED above): only the checks"

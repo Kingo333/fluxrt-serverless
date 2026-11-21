@@ -49,7 +49,7 @@ fi
 if [ "$1" = "-m" ]; then
   mod="$2"; shift 2
   case "$mod" in
-    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix) exec "$REAL" -m "$mod" "$@";;   # the real tools
+    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix|eval.yardstick) exec "$REAL" -m "$mod" "$@";;   # the real tools
     fluxrt_lora.merge_lora|eval.generate_fluxrt|eval.garment_report|eval.step_a) exec "$REAL" "$STUB_DIR/tools.py" "$mod" "$@";;
   esac
   echo "unexpected module $mod" >&2; exit 3
@@ -86,7 +86,8 @@ def log(name, rec):
         f.write(json.dumps(rec) + "\n")
 def colour(name):
     """The made-up garment colour score of each model (favourite #2 = 12.0, lower is better)."""
-    if name.startswith("fav2seed"): return 12.1
+    if name.startswith("fav2seed"):          # seed 53 as it always was; the seeds of the sweep differ a little
+        return {"54": 11.6, "55": 12.3, "56": 11.9, "57": 12.0}.get(name[8:10], 12.1)
     if name.startswith("fx6s5800s65"): return 11.0
     if name.startswith("fx6s5800s80"): return 11.6
     if name.startswith("fx6blend"): return 12.5
@@ -169,6 +170,11 @@ elif mod == "eval.preserve_check":
     Path(opt("--out")).write_text("| gate |\n")
 elif mod == "eval.stability_report":
     out = Path(opt("--out")); out.write_text("| steady |\n"); out.with_suffix(".json").write_text("{}")
+elif mod == "eval.step_a" and args[0] == "pick":
+    root, s = Path(args[1]), opt("--set")
+    items = [{"key": f"c{i + 1}", "category": ("tops", "dresses")[i], "case": s} for i in range(min(int(opt("--n")), 2))]
+    (root / "eval/fxa" / f"{s}.json").write_text(json.dumps(items))
+    log("pick.log", {"set": s, "n": opt("--n"), "auto": "--auto-describe" in args})
 elif mod == "eval.step_a":
     root, s = Path(args[1]), opt("--set")
     (root / "eval/fxa" / f"{s}_labelled.mp4").write_text("video")
@@ -798,3 +804,82 @@ def test_a_branch_from_a_save_that_is_not_there_stops_before_anything_is_spent(v
         p = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=120,
                            env={**vol.env, **_fx8_env(vol), "AZ_EXP": "fxreal9a", "AZ_BRANCH_FROM": bad})
         assert p.returncode != 0 and "BAD_AZ_BRANCH_FROM" in p.stdout + p.stderr, bad
+
+
+# ---------------------------------------------------------------- the better yardstick (step B, 2026-11-21)
+YARD = ROOT / "training/fluxrt_lora/fxb_yard.sh"
+
+
+def _yard(vol, timeout=300, **extra):
+    env = {**vol.env, "AZ_SPENT": "86.00", "AZ_CAP": "100", "AZ_BALANCE": "40.00", "AZ_FRESH_N": "2", "AZ_FRESH_MIN": "2", **extra}
+    t0 = time.time()
+    p = subprocess.run(["bash", str(YARD)], capture_output=True, text=True, env=env, timeout=timeout)
+    return p, p.stdout + p.stderr, time.time() - t0
+
+
+def test_the_yardstick_run_judges_the_best_seeds_on_fresh_clips_and_two_saves_at_the_same_seeds(vol):
+    vol.run(**_fx8_env(vol), AZ_AA_SEEDS="53 54 55 56 57")           # fxreal8 to step 1000, and a sweep of five seeds
+    n_env, n_render = len(vol.lines("train_env.log")), len(vol.lines("render.log"))
+    p, out, secs = _yard(vol)
+    assert p.returncode == 0 and "YARD_DONE" in out and secs < 200, out[-3000:]
+    assert vol.lines("runpodctl.log") == ["stop pod testpod"] * 2 and len(vol.lines("train_env.log")) == n_env   # nothing trained
+    order = ["0. favourite #2 confirmed", "1. fresh test set fx12test: 2 clips no run has used (1 dresses, 1 tops)",
+             "2. seeds from the sweep: best on the old clips 54 56 57; for comparison (middle, worst) 53 55",
+             "favourite #2 at seed 54: the scores of 3 old set(s) reused",
+             "fxreal8 step 750 at seed 52: the scores of 3 old set(s) reused",
+             "3. 11 renders to check on: fx6test dress10 cases5 fx12test (models at seeds 52 54 56 )",
+             f"render fx12test/fav2_{TAG}: 2 new clips, 2 of 2", "4. renders done", "YARD YARD_SETS old clips: 6 in fx6test, dress10, cases5",
+             "YARD YARD_SETS fresh clips: 2 in fx12test", "YARD YARD_SEED favourite #2 at seed 54 against seed 52: old clips +",
+             "YARD YARD_MODEL fxreal8 step 1000 against favourite #2 at the same seeds (52, 54, 56), 8 clips:",
+             "YARD YARD_MODEL fxreal8 step 750 against favourite #2 at the same seeds (52, 54, 56), 8 clips:",
+             "YARD YARD_RESOLUTION", "video: ", "YARD_DONE"]
+    assert "YARD YARD_SEED_ORDER best first, on the old clips: 54 > 56 > 57 > 53 > 55; on the fresh clips: 54 > 56 > 57 > 53 > 55" in out
+    pos, at = 0, []
+    for x in order:
+        pos = out.find(x, pos)
+        assert pos >= 0, (x, out[-3500:])
+        at.append(pos)
+    renders = vol.lines("render.log")[n_render:]
+    fresh = [r for r in renders if r["set"] == "fx12test"]
+    # favourite #2 at the live seed first on the fresh clips; then the five seeds there, each with its own seed
+    assert fresh[0]["name"] == f"fav2_{TAG}" and fresh[0]["seed"] is None
+    assert [(r["name"], r["seed"]) for r in fresh[1:6]] == [(f"fav2seed{s}_{TAG}", str(s)) for s in (54, 56, 57, 53, 55)]
+    # the seeds have their videos on the old clips already: nothing is rendered there again
+    assert not [r for r in renders if r["name"].startswith("fav2seed") and r["set"] != "fx12test"]
+    # the two saves: the live seed only on the fresh clips (the old videos are there), the two best seeds on every set
+    m750 = [r for r in renders if r["name"].startswith("fx8750x")]
+    assert {(r["set"], r["seed"]) for r in m750} == {("fx12test", None)} | {(s, sd) for s in (*SETS, "fx12test") for sd in ("54", "56")}
+    assert all(r["new"] == 2 for r in m750) and len(m750) == 9
+    assert len({r["name"] for r in renders if r["name"].startswith("fx81000x")}) == 3
+    res = json.loads((vol.root / "eval/fxa/yard/yardstick.json").read_text())
+    seeds = {s["seed"]: s for s in res["seeds"]}
+    assert set(seeds) == {53, 54, 55, 56, 57} and seeds[54]["old"]["score"] > seeds[57]["old"]["score"] > seeds[55]["old"]["score"]
+    assert seeds[54]["fresh"] is not None and [m["model"] for m in res["models"]] == ["fxreal8 step 1000", "fxreal8 step 750"]
+    assert res["models"][1]["seeds"] == [52, 54, 56]
+    # the videos: the best seeds side by side, the models side by side, on the fresh clips, once each
+    videos = vol.lines("video.log")[-2:]
+    assert [v["set"] for v in videos] == ["fx12test", "fx12test"] and all(v["legend"] for v in videos)
+    assert videos[0]["panels"] == [f"fav2_{TAG}=favourite #2, seed 52 (live)"] + [f"fav2seed{s}_{TAG}=favourite #2, seed {s}" for s in (54, 56, 57)]
+    assert videos[1]["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(videos[1]["panels"]) == 3
+    assert videos[1]["panels"][1].endswith("=fxreal8 step 750") and videos[1]["panels"][2].endswith("=fxreal8 step 1000")
+    yard = vol.root / "eval/fxa/yard"
+    assert (yard / "yard_seeds.mp4").exists() and (yard / "yard_models.mp4").exists() and (vol.root / "eval/yard_review.tar").exists()
+    _no_two_scorers_at_once(vol.lines("score.log"))
+    # started again: nothing is rendered or scored twice, the report is made again
+    n_render, n_score = len(vol.lines("render.log")), len(vol.lines("score.log"))
+    p, out2, _ = _yard(vol)
+    assert p.returncode == 0 and "YARD_DONE" in out2 and "YARD YARD_SEED favourite #2 at seed 54" in out2
+    assert len(vol.lines("render.log")) == n_render and len(vol.lines("score.log")) == n_score
+
+
+def test_the_yardstick_run_without_a_sweep_or_without_money_stops_before_the_gpu_is_used(vol):
+    vol.run(**_fx8_env(vol), AZ_AA="0")                                # no chance runs at all
+    n = len(vol.lines("render.log"))
+    p, out, _ = _yard(vol)
+    assert p.returncode != 0 and "STOPPED: NO_SWEEP" in out and len(vol.lines("render.log")) == n
+    p, out, _ = _yard(vol, AZ_BALANCE="2.00")
+    assert p.returncode != 0 and "minutes of money left" in out
+    # seeds named by hand need no sweep
+    p, out, _ = _yard(vol, AZ_YARD_SEEDS="61 62", AZ_YARD_MODELS="")
+    assert p.returncode == 0 and "2. seeds as named: 61 62" in out and "YARD_DONE" in out
+    assert "YARD YARD_SEED favourite #2 at seed 61 against seed 52: old clips" in out
