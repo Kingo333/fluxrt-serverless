@@ -181,15 +181,19 @@ json_ok() {  # files: each is there AND can be read (a Pod that stops in the mid
 }
 scores_ok() { json_ok "$1/garment.json" "$1/face_skin.json"; }   # dest: what a set must have to count as scored
 score_set() {  # set, name, dest: the scorers of the training runs, without the GATE (the yardstick does not use it)
-  local s="$1" n="$2" d="$3"
+  local s="$1" n="$2" d="$3" p1 p2 p3
   json_ok "$d/garment.json" "$d/face_skin.json" "$d/stability.json" && return 0
   mkdir -p "$d"
-  ( cd "$T" && "$MP" -m eval.face_skin_report "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --model "$SEG" --out "$d/face_skin.md" ) \
-    > "$d/face_skin.log" 2>&1 && cp "$R/$s/face_skin.json" "$d/face_skin.json"
-  ( cd "$T" && "$MP" -m eval.stability_report "$R/$s" --models "$FAV" "$n" --model "$SEG" --out "$d/stability.md" ) > "$d/stability.log" 2>&1
-  ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "$FAV" "$n" --model "$SEG" ) > "$d/garment_seg.log" 2>&1
-  ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --out "$d/garment.md" \
-      --json "$d/garment.json" ) > "$d/garment.log" 2>&1
+  # The three scorers do not need each other, so they run side by side: a 48-clip set is then scored in the time of
+  # the slowest one, not of all three (the renders come every 13 minutes, the scores must keep up). The set's
+  # shared face_skin.json is still written by one model only, because the models are scored one after the other.
+  ( ( cd "$T" && "$MP" -m eval.face_skin_report "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --model "$SEG" --out "$d/face_skin.md" ) \
+      > "$d/face_skin.log" 2>&1 && cp "$R/$s/face_skin.json" "$d/face_skin.json" ) & p1=$!
+  ( cd "$T" && "$MP" -m eval.stability_report "$R/$s" --models "$FAV" "$n" --model "$SEG" --out "$d/stability.md" ) > "$d/stability.log" 2>&1 & p2=$!
+  ( ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "$FAV" "$n" --model "$SEG" ) > "$d/garment_seg.log" 2>&1
+    ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --out "$d/garment.md" \
+        --json "$d/garment.json" ) > "$d/garment.log" 2>&1 ) & p3=$!
+  wait "$p1" "$p2" "$p3"
   scores_ok "$d"
 }
 reuse_scores() {  # name: the scores an earlier run made for this very render on the old clips are copied, not made again

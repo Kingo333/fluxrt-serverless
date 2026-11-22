@@ -177,7 +177,9 @@ elif mod == "eval.preserve_check":
     (root / "preserve_check.json").write_text(json.dumps({"verdict": {name: {"pass": ok, "fails": [], "clips": 2}}, "per_clip": {}}))
     Path(opt("--out")).write_text("| gate |\n")
 elif mod == "eval.stability_report":
+    t0 = time.time(); time.sleep(0.1)
     out = Path(opt("--out")); out.write_text("| steady |\n"); out.with_suffix(".json").write_text("{}")
+    log("steady.log", {"set": Path(args[0]).name, "models": opt("--models", many=True), "t0": t0, "t1": time.time()})
 elif mod == "eval.worn_reference":
     if os.environ.get("STUB_FAIL_WORN"):
         sys.exit("made-up failure: the real videos cannot be read")
@@ -926,6 +928,14 @@ def test_the_yardstick_run_judges_every_seed_on_fresh_clips_with_a_control_and_a
     # the training runs' own review sets are not touched: the yardstick's are y_...
     assert (vol.root / "eval/fxa/y_dresses.json").exists() and (vol.root / "eval/fxa/g_dresses.json").exists()
     _no_two_scorers_at_once(vol.lines("score.log"))
+    # the three scorers of one model on one set run side by side (the scores must keep up with the renders)
+    face = {}
+    for e in vol.lines("score.log"):
+        face.setdefault((e["name"], e["set"]), {})[e["ev"]] = e["t"]
+    side = [x for x in vol.lines("steady.log") if len(x["models"]) == 2
+            and face.get((x["models"][1], x["set"]), {}).get("start", 9e18) < x["t1"]
+            and face.get((x["models"][1], x["set"]), {}).get("end", 0) > x["t0"]]
+    assert len(side) >= 10, len(side)
     # started again: nothing is rendered or scored twice, the report is made again
     n_render, n_score, n_worn = len(vol.lines("render.log")), len(vol.lines("score.log")), len(vol.lines("worn_score.log"))
     p, out2, _ = _yard(vol)
