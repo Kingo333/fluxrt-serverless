@@ -142,6 +142,9 @@ elif mod == "eval.generate_fluxrt":
             (d / f"out_{name}.mp4").write_text("video"); new += 1; print(json.dumps({"model": name, "clip": clip}))
     log("render.log", {"name": name, "set": out.name, "seed": opt("--seed"), "steady": opt("--steady-blend"), "new": new,
                        "t": time.time()})
+    if os.environ.get("STUB_RENDER_MIN"):                  # the made-up clock (Volume.fake_clock): a render takes this long
+        clock = LOG / "clock"
+        clock.write_text(str((int(clock.read_text()) if clock.exists() else 0) + 60 * int(os.environ["STUB_RENDER_MIN"])))
     time.sleep(0.05)
 elif mod == "eval.garment_report":
     if args[0] == "score":
@@ -343,6 +346,13 @@ class Volume:
             "AZ_START_SHA": _sha8(lora / "fxreal6/pytorch_lora_weights.safetensors"),
         }
         self.ev = fxa / "fx6b"
+
+    def fake_clock(self):
+        """A clock that only the stand-in renderer moves (STUB_RENDER_MIN minutes per render): `date +%s` adds the
+        seconds in log/clock, so a run can reach its money limit in a test."""
+        real = shutil.which("date")
+        _exe(self.tmp / "bin" / "date", '#!/bin/bash\noff=0; [ -f "$STUB_LOG/clock" ] && off=$(cat "$STUB_LOG/clock")\n'
+             f'if [ "$1" = "+%s" ]; then echo $(( $({real} +%s) + off )); else exec {real} "$@"; fi\n')
 
     def add_unscored_blend(self):
         """What the 2026-11-17 Pod left: a 50% blend, rendered, never scored, marked failed by hand."""
@@ -853,8 +863,8 @@ def test_the_yardstick_run_judges_every_seed_on_fresh_clips_with_a_control_and_a
              "YARD YARD_SEED_AGREEMENT the order of the 5 seeds on the old clips against their order on the fresh clips: rank correlation +1.00",
              "YARD YARD_SEED_PICK better than seed 52 on the fresh clips at the level that allows for 5 seeds being tried, and no area "
              "clearly worse on both the old and the fresh clips: none",
-             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its videos of this run, fresh clips: +0.0%",
-             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its stored videos, old clips: +0.0%",
+             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its videos of this run, 2 fresh clips: +0.0%",
+             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its stored videos, 6 old clips: +0.0%",
              "YARD YARD_CONTROL_SEEDS the 5 other seeds together against favourite #2 rendered again today at seed 52, old clips:",
              "YARD YARD_MODEL fxreal8 step 750 against favourite #2 at the same seeds (52, 54, 56), 8 clips:",
              "YARD YARD_REAL the same garments as really worn (6 real videos) next to favourite #2 at seed 52 on the same garments: "
@@ -934,6 +944,56 @@ def test_the_yardstick_run_carries_on_when_the_real_videos_cannot_be_scored_and_
     # AZ_WORN=0 leaves the real videos out without a note
     p, out, _ = _yard(vol, AZ_WORN="0", AZ_YARD_CONTROL="0")
     assert p.returncode == 0 and "YARD_DONE" in out and "the real videos" not in out and "YARD_REAL" not in out
+
+
+def test_the_yardstick_run_stops_at_its_money_limit_and_a_second_start_after_a_top_up_finishes_it(vol):
+    vol.run(**_fx8_env(vol), AZ_AA_SEEDS="53 54 55 56 57")
+    vol.fake_clock()
+    n_render = len(vol.lines("render.log"))
+    yard = vol.root / "eval/fxa/yard"
+    # $8.40 on the account: (8.40 - 1.50) / 2.80 an hour = 147 minutes; every render here takes 40 of them
+    p, out, _ = _yard(vol, AZ_SPENT="83.30", AZ_BALANCE="8.40", STUB_RENDER_MIN="40")
+    assert p.returncode == 0 and "YARD_DONE" in out, out[-3000:]
+    assert "RunPod balance $8.40 (keeping $1.50): 147 min allowed" in out
+    # the limit falls in the middle of the control (three of its four sets rendered): unfinished, not a failed try
+    assert f"money limit reached: fav2again_{TAG} is left unfinished, the remaining renders are left out" in out
+    first = vol.lines("render.log")[n_render:]
+    assert [(r["name"], r["set"]) for r in first] == [(f"fav2_{TAG}", "fx12test")] + [(f"fav2again_{TAG}", s) for s in ("fx6test", "dress10", "cases5")]
+    assert not (yard / f"fav2again_{TAG}/.rendered").exists() and not (yard / f"fav2again_{TAG}/.render_tries").exists()
+    assert not list(yard.glob("*/.failed")) and "NO_RENDERS" not in out
+    # the report is made from what is there (the sweep's scores on the old clips), and says what is left and how to go on
+    assert "YARD YARD_SEED favourite #2 at seed 54 against seed 52: old clips +" in out and "YARD_CONTROL" not in out
+    left = next(l for l in out.splitlines() if "NOT CHECKED:" in l)
+    assert f"fav2again_{TAG} " in left and f"fav2seed55_{TAG} " in left
+    spent = float(left.split("AZ_SPENT=")[1].split()[0])
+    assert 90.7 < spent < 91.0 and "AZ_BALANCE set to the balance RunPod shows then" in left     # 160 minutes at $2.80, and a little
+    # a score file cut off by the stopping Pod: all three files are there, one is half a file
+    cut = yard / f"fav2seed54_{TAG}/fx12test"
+    cut.mkdir(parents=True)
+    (cut / "garment.json").write_text('{"scorecard": [], "items": {"c1": {"fav2se')
+    (cut / "face_skin.json").write_text("{}")
+    (cut / "stability.json").write_text("{}")
+    # the owner tops up; the line is started again with the new balance but the OLD spent figure (the easy mistake):
+    # what the first start spent is still counted, so the cap holds
+    n_render = len(vol.lines("render.log"))
+    p, out2, _ = _yard(vol, AZ_SPENT="83.30", AZ_BALANCE="38.40", STUB_RENDER_MIN="1")
+    assert p.returncode == 0 and "YARD_DONE" in out2 and "NOT CHECKED" not in out2 and "money limit reached" not in out2, out2[-3000:]
+    assert "earlier starts with this same AZ_SPENT spent $7." in out2 and "already spent $90." in out2
+    assert "RunPod balance $38.40 (keeping $1.50)" in out2                   # the balance was read again: taken as given
+    second = vol.lines("render.log")[n_render:]
+    # nothing is rendered twice: the control only on the set it lacked, then the rest of the list
+    assert [(r["name"], r["set"]) for r in second if r["name"] == f"fav2again_{TAG}"] == [(f"fav2again_{TAG}", "fx12test")]
+    assert not [r for r in second if r["name"] == f"fav2_{TAG}"] and len({r["name"] for r in second}) == 9
+    assert "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its stored videos, 6 old clips: +0.0%" in out2
+    assert "YARD YARD_MODEL fxreal8 step 750 against favourite #2 at the same seeds (52, 54, 56), 8 clips:" in out2
+    # the half file was not taken for scores: that set was scored again, and the report has no unreadable file
+    assert json.loads((cut / "garment.json").read_text())["items"]["c1"][f"fav2seed54_{TAG}"]["colour_de"] > 0
+    assert "YARD_NOTE" not in out2 and len(list(yard.glob("*/.scored"))) == 9
+    # a third start with the spent figure the log gave: nothing is counted twice, nothing is made again
+    n_render = len(vol.lines("render.log"))
+    p, out3, _ = _yard(vol, AZ_SPENT="92.00", AZ_BALANCE="30.00")
+    assert p.returncode == 0 and "YARD_DONE" in out3 and "earlier starts" not in out3 and "already spent $92.00" in out3
+    assert len(vol.lines("render.log")) == n_render
 
 
 def test_the_yardstick_run_without_a_sweep_or_without_money_stops_before_the_gpu_is_used(vol):

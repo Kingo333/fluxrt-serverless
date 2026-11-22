@@ -283,9 +283,9 @@ def test_the_control_is_favourite_2_again_and_says_whether_the_stored_videos_can
     _entry(yard, "fav2again_r528", CONTROL, 52, allsets, lambda s, i, t: 1.0)
     res, out = _run(yard, capsys)
     assert res["control"]["fresh"]["ok"] and res["control"]["old"]["ok"] and res["models"] == []
-    assert ("YARD_CONTROL favourite #2 rendered again at seed 52 against its videos of this run, fresh clips: +0.0% "
+    assert ("YARD_CONTROL favourite #2 rendered again at seed 52 against its videos of this run, 48 fresh clips: +0.0% "
             "(95% +0.0% to +0.0%), largest area 0.0%: the same: a render can be repeated") in out
-    assert "against its stored videos, old clips: +0.0% (95% +0.0% to +0.0%), largest area 0.0%: the same: the stored videos are what today's renderer makes" in out
+    assert "against its stored videos, 39 old clips: +0.0% (95% +0.0% to +0.0%), largest area 0.0%: the same: the stored videos are what today's renderer makes" in out
     assert "YARD_CONTROL_SEEDS the 2 other seeds together against favourite #2 rendered again today at seed 52, old clips: +1.0%" in out
     assert "YARD_MODEL" not in out and "YARD_FABRIC favourite #2 rendered again" not in out
     # the stored seed-52 videos of the OLD clips are stale: today's renderer makes what the other seeds make there.
@@ -295,7 +295,7 @@ def test_the_control_is_favourite_2_again_and_says_whether_the_stored_videos_can
     _entry(yard, "fav2again_r528", CONTROL, 52, allsets, lambda s, i, t: 0.9 if s in OLD else 1.0)
     res, out = _run(yard, capsys)
     assert res["control"]["fresh"]["ok"] and not res["control"]["old"]["ok"]
-    assert ("old clips: +1.0% (95% +1.0% to +1.0%), largest area 10.0%: NOT the same: the stored seed 52 videos are not "
+    assert ("39 old clips: +1.0% (95% +1.0% to +1.0%), largest area 10.0%: NOT the same: the stored seed 52 videos are not "
             "what today's renderer makes; on the old clips read the seeds against today's render (YARD_CONTROL_SEEDS)") in out
     assert "at seed 52, old clips: +0.0% (95% +0.0% to +0.0%): no difference shown" in out
     assert res["control"]["seeds_old"]["score"] == pytest.approx(0.0, abs=1e-9)
@@ -303,7 +303,7 @@ def test_the_control_is_favourite_2_again_and_says_whether_the_stored_videos_can
     shutil.rmtree(yard / "fav2again_r528")
     _entry(yard, "fav2again_r528", CONTROL, 52, allsets, lambda s, i, t: 0.9)
     res, out = _run(yard, capsys)
-    assert "fresh clips: +1.0% (95% +1.0% to +1.0%), largest area 10.0%: NOT the same: two renders of the same thing differ by this much" in out
+    assert "48 fresh clips: +1.0% (95% +1.0% to +1.0%), largest area 10.0%: NOT the same: two renders of the same thing differ by this much" in out
     assert "NOT the same, as on the fresh clips: the renderer itself is not repeatable to that extent" in out
 
 
@@ -374,3 +374,23 @@ def test_the_real_videos_of_the_same_garments_are_shown_next_to_favourite_2_meas
     assert {m["model"] for m in res["models"]} == {"model near", "model far"}
     res, out = _run(yard, capsys)
     assert "YARD_REAL" not in out and "really worn" not in out and "real" not in res
+
+
+def test_a_score_file_cut_off_in_the_middle_is_named_and_never_taken_for_scores(tmp_path, capsys):
+    fxa = tmp_path / "fxa"
+    yard = fxa / "yard"
+    _lists(fxa)
+    _entry(yard, "fav2seed54_r528", "fav2", 54, {**OLD, **FRESH}, lambda s, i, t: 0.9)
+    _entry(yard, "fav2seed55_r528", "fav2", 55, {**OLD, **FRESH}, lambda s, i, t: 0.9)
+    g = yard / "fav2seed55_r528/fx12test/garment.json"
+    g.write_text(g.read_text()[:300])                                        # the Pod stopped while it was written
+    res, out = _run(yard, capsys)
+    assert res["unreadable"] == ["fav2seed55_r528/fx12test/garment.json"]
+    assert "YARD_NOTE 1 score file(s) are there but cannot be read and are left out" in out and "fav2seed55_r528/fx12test/garment.json" in out
+    by = {x["seed"]: x for x in res["seeds"]}
+    # seed 55 on the fresh clips has no garment numbers: its colour gain is not there, and nothing is made up for it
+    assert by[54]["fresh"]["score"] == pytest.approx(0.01, abs=1e-6) and "colour" not in by[55]["fresh"]["areas"]
+    # a whole run without such files says nothing
+    g.unlink()
+    res, out = _run(yard, capsys)
+    assert "unreadable" not in res and "YARD_NOTE" not in out

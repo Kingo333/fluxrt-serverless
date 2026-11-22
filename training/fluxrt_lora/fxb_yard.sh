@@ -31,7 +31,9 @@
 #      yard_models_<type>.mp4: next to the models; AZ_GARMENT_CLIPS clips each, default 8), eval/yard_review.tar.
 #      Then the Pod stops itself.
 # Money: never past AZ_CAP (counting AZ_SPENT) nor past AZ_BALANCE minus AZ_BALANCE_KEEP (1.50); what is rendered
-# and scored when the money ends is kept, and the report is made from it. Safe to start again.
+# and scored when the money ends is kept, and the report is made from it. Both limits are fixed when the script
+# starts: a top-up during the run is not seen. Safe to start again, with AZ_SPENT = the total the log shows and
+# AZ_BALANCE = the balance RunPod shows then: nothing is rendered or scored twice, the report is made again.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fxb_yard.sh -o /workspace/fxb_yard.sh
 #   AZ_REF=<SHA> AZ_SPENT=86.00 AZ_CAP=100 AZ_PRICE=2.80 AZ_BALANCE=40.00 nohup bash /workspace/fxb_yard.sh >> /workspace/yard.log 2>&1 &
@@ -71,13 +73,17 @@ mins() { echo "$(( ($(date +%s) - START) / 60 ))"; }
 spent_run() { awk -v s="$START" -v n="$(date +%s)" -v p="$PRICE" 'BEGIN { printf "%.2f", (n - s) / 3600 * p }'; }
 say() { echo "YARD $(date -u +%H:%M) [$(mins) min, \$$(awk -v a="$SPENT0" -v b="$(spent_run)" 'BEGIN { printf "%.2f", a + b }') total] $*"; }
 
-# the same spend record as the training runs: a second start of the SAME line counts what the first one spent
+# the same spend record as the training runs. A start that is given the SAME AZ_SPENT as an earlier one cannot
+# have counted what that one spent, whatever balance it is given (after a top-up the balance is read again, the
+# spent figure easily is not): that spend is added, so the cap holds. The balance is lowered by it only when the
+# balance given is the same too (the same line started again, the balance not read again).
 SPENT_GIVEN="$SPENT0"; BALANCE_GIVEN="${BALANCE:-none}"
 LEDGER="$AZ_ROOT/eval/fxa/fx6b/spend"
 mkdir -p "$LEDGER" 2>/dev/null || true
-PRIOR=$(cat "$LEDGER"/*.run 2>/dev/null | awk -v a="$SPENT_GIVEN" -v b="$BALANCE_GIVEN" '$1 == a && $2 == b { s += $3 } END { printf "%.2f", s + 0 }')
+PRIOR=$(cat "$LEDGER"/*.run 2>/dev/null | awk -v a="$SPENT_GIVEN" '$1 == a { s += $3 } END { printf "%.2f", s + 0 }')
+PRIOR_SAME=$(cat "$LEDGER"/*.run 2>/dev/null | awk -v a="$SPENT_GIVEN" -v b="$BALANCE_GIVEN" '$1 == a && $2 == b { s += $3 } END { printf "%.2f", s + 0 }')
 SPENT0=$(awk -v a="$SPENT_GIVEN" -v p="$PRIOR" 'BEGIN { printf "%.2f", a + p }')
-[ -n "$BALANCE" ] && BALANCE=$(awk -v a="$BALANCE" -v p="$PRIOR" 'BEGIN { printf "%.2f", a - p }')
+[ -n "$BALANCE" ] && BALANCE=$(awk -v a="$BALANCE" -v p="$PRIOR_SAME" 'BEGIN { printf "%.2f", a - p }')
 RUN_FILE="$LEDGER/$START.run"
 record_spend() { echo "$SPENT_GIVEN $BALANCE_GIVEN $(spent_run)" > "$RUN_FILE.tmp" 2>/dev/null && mv -f "$RUN_FILE.tmp" "$RUN_FILE"; }
 ALLOWED=$(awk -v c="$CAP" -v s="$SPENT0" -v p="$PRICE" -v b="$BALANCE" -v k="$KEEP" 'BEGIN {
@@ -100,7 +106,7 @@ stop_pod() {
 trap stop_pod EXIT
 fail() { say "STOPPED: $*"; exit 1; }
 
-[ "$PRIOR" != "0.00" ] && say "earlier starts of this same line spent \$$PRIOR (counted)"
+[ "$PRIOR" != "0.00" ] && say "earlier starts with this same AZ_SPENT spent \$$PRIOR (counted: \$$SPENT0 spent before this start)"
 say "start: cap \$$CAP, already spent \$$SPENT0, price \$$PRICE/h${BALANCE:+, RunPod balance \$$BALANCE (keeping \$$KEEP)}: $ALLOWED min allowed"
 [ "$ALLOWED" -ge $(( END_MIN + 30 )) ] || fail "only $ALLOWED minutes of money left (need at least $(( END_MIN + 30 ))): top up and/or raise AZ_CAP"
 
@@ -157,9 +163,14 @@ render() {  # set, name, weights, extra renderer arguments -> 0 when every clip 
   say "render $s/$n: $(grep -c '"model"' "$Y/render_${s}_$n.log") new clips, $have of $want"
   [ "$have" -gt 0 ] && [ "$have" -ge $(( want * 9 / 10 )) ]
 }
+json_ok() {  # files: each is there AND can be read (a Pod that stops in the middle of a write leaves half a file)
+  local f; for f in "$@"; do [ -f "$f" ] || return 1; done
+  "$PY" -c "import json, sys; [json.load(open(f)) for f in sys.argv[1:]]" "$@" 2>/dev/null
+}
+scores_ok() { json_ok "$1/garment.json" "$1/face_skin.json"; }   # dest: what a set must have to count as scored
 score_set() {  # set, name, dest: the scorers of the training runs, without the GATE (the yardstick does not use it)
   local s="$1" n="$2" d="$3"
-  [ -f "$d/garment.json" ] && [ -f "$d/face_skin.json" ] && [ -f "$d/stability.json" ] && return 0
+  json_ok "$d/garment.json" "$d/face_skin.json" "$d/stability.json" && return 0
   mkdir -p "$d"
   ( cd "$T" && "$MP" -m eval.face_skin_report "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --model "$SEG" --out "$d/face_skin.md" ) \
     > "$d/face_skin.log" 2>&1 && cp "$R/$s/face_skin.json" "$d/face_skin.json"
@@ -167,7 +178,7 @@ score_set() {  # set, name, dest: the scorers of the training runs, without the 
   ( cd "$T" && "$MP" -m eval.garment_report seg "$R/$s" --models "$FAV" "$n" --model "$SEG" ) > "$d/garment_seg.log" 2>&1
   ( cd "$T" && "$PY" -m eval.garment_report score "$R/$s" --models "$FAV" "$n" --baseline "$FAV" --out "$d/garment.md" \
       --json "$d/garment.json" ) > "$d/garment.log" 2>&1
-  [ -f "$d/garment.json" ] && [ -f "$d/face_skin.json" ]
+  scores_ok "$d"
 }
 reuse_scores() {  # name: the scores an earlier run made for this very render on the old clips are copied, not made again
   "$PY" -c "
@@ -288,7 +299,7 @@ score_loop() {
         score_set "$s" "$n" "$Y/$n/$s" & pids="$pids $!"
       done
       [ -n "$pids" ] && { wait $pids || true; }
-      for s in $todo; do [ -f "$Y/$n/$s/garment.json" ] && [ -f "$Y/$n/$s/face_skin.json" ] || ok=0; done
+      for s in $todo; do scores_ok "$Y/$n/$s" || ok=0; done
       if [ "$ok" = 1 ]; then touch "$Y/$n/.scored"; say "scored: $("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['label'])" "$Y/$n/meta.json")"
       else
         echo x >> "$Y/$n/.score_tries"
@@ -331,15 +342,16 @@ for row in "${JOBS[@]}"; do
   [ -f "$Y/$n/.rendered" ] || [ -f "$Y/$n/.failed" ] && continue
   out_of_money && { say "money limit reached: the remaining renders are left out"; break; }
   x=""; [ "$sd" != "$LIVE_SEED" ] && x="--seed $sd"
-  ok=1
+  ok=1; cut=0
   for s in $SETS; do
-    out_of_money && { ok=0; break; }
+    out_of_money && { cut=1; break; }
     render "$s" "$n" "$w" "$x" || ok=0
   done
-  if [ "$ok" = 1 ]; then touch "$Y/$n/.rendered"
-  else
+  if [ "$cut" = 1 ]; then say "money limit reached: $n is left unfinished, the remaining renders are left out"; break
+  elif [ "$ok" = 1 ]; then touch "$Y/$n/.rendered"
+  else   # a real failure. Three tries over the starts: one may be an earlier version's count of a money stop
     echo x >> "$Y/$n/.render_tries"
-    [ "$(wc -l < "$Y/$n/.render_tries")" -ge 2 ] && { say "NO_RENDERS for $n after 2 tries: left out (see $Y/render_*_$n.log)"; touch "$Y/$n/.failed"; }
+    [ "$(wc -l < "$Y/$n/.render_tries")" -ge 3 ] && { say "NO_RENDERS for $n after 3 tries: left out (see $Y/render_*_$n.log)"; touch "$Y/$n/.failed"; }
   fi
 done
 touch "$Y/.renders_done"
@@ -365,7 +377,8 @@ fi
     --clips "$E" --worn "$Y/worn" --json "$Y/yardstick.json" ) > "$Y/yardstick.log" 2>&1 || say "NOTE: the report failed (see $Y/yardstick.log)"
 grep -E "^YARD_" "$Y/yardstick.log" | sed 's/^/YARD /'
 LEFT=$(for row in "${JOBS[@]}"; do n="${row%%$'\t'*}"; [ -f "$Y/$n/.scored" ] || echo "$n"; done | tr '\n' ' ')
-[ -n "$LEFT" ] && say "NOT CHECKED: $LEFT- run the same line again (after a top-up if the money ran out)"
+TOTAL=$(awk -v a="$SPENT0" -v b="$(spent_run)" 'BEGIN { printf "%.2f", a + b + 0.10 }')   # with the minutes until the Pod is off
+[ -n "$LEFT" ] && say "NOT CHECKED: $LEFT- to finish them start the line again with AZ_SPENT=$TOTAL and AZ_BALANCE set to the balance RunPod shows then (raise it first if the money ran out): what is rendered and scored is kept"
 # videos per garment type, dresses first, on the fresh clips (the old ones when there is no fresh set): favourite #2
 # at the live seed next to the seeds the report puts first, and next to the models
 video() {  # set, file name, panels...

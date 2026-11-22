@@ -41,6 +41,7 @@ The score is the picker's (fluxrt_lora.pick_best_save): per set, every measure's
                     photos' own clips, scored like a render) next to favourite #2 on the same garments, measure by
                     measure: the level a perfect try-on would reach. YARD_REAL_GARMENT: per garment type
   YARD_RESOLUTION   how small a difference this yardstick shows
+  YARD_NOTE         score files that are there but cannot be read (left out, never taken for scores)
 A range that does not include 0 is a real difference ("better" or "worse"); otherwise "no difference shown"; with
 fewer than 5 clips nothing is called.
 """
@@ -75,10 +76,17 @@ TEX = KEYS.index("texture")
 AREA_IDX = {a: [KEYS.index("texture" if k == "texture_off" else k) for k in ks] for a, ks in AREAS}
 
 
+UNREADABLE: list = []        # score files that are there but cannot be read (a Pod stopped while one was written)
+
+
 def _load(p: Path):
     try:
         return json.loads(p.read_text())
-    except (OSError, ValueError):
+    except OSError:
+        return None
+    except ValueError:
+        if str(p) not in UNREADABLE:
+            UNREADABLE.append(str(p))
         return None
 
 
@@ -336,6 +344,7 @@ def main(argv=None) -> dict:
     ap.add_argument("--json")
     a = ap.parse_args(argv)
     yard = Path(a.yard)
+    UNREADABLE.clear()
     sets = list(a.old) + list(a.fresh)
     weights = {s: 1.0 for s in sets}
     weights.update({k: float(v) for k, v in (x.split("=") for x in a.weights.split(",") if x)})
@@ -497,7 +506,7 @@ def main(argv=None) -> dict:
             else:
                 verdict = "NOT the same, as on the fresh clips: the renderer itself is not repeatable to that extent"
             print(f"YARD_CONTROL favourite #2 rendered again at seed {live} against its {'videos of this run' if label == 'fresh' else 'stored videos'}, "
-                  f"{label} clips: {rng_txt(r)}, largest area {r['largest_area'] * 100:.1f}%: {verdict}")
+                  f"{r['clips']} {label} clips: {rng_txt(r)}, largest area {r['largest_area'] * 100:.1f}%: {verdict}")
         if ctl:
             out["control"] = ctl
         sds = seeds_on(a.old)
@@ -581,6 +590,11 @@ def main(argv=None) -> dict:
             print(f"YARD_FABRIC {model}: x{gm:.2f} of the photo's, favourite #2 at the same seeds and clips x{gt:.2f} "
                   f"({len(mine)} renders): " + ("flatter than favourite #2" if gm < gt * 0.985 else
                                                "more contrast than favourite #2" if gm > gt * 1.015 else "the same as favourite #2") + near)
+    if UNREADABLE:
+        rel = sorted(str(Path(x).relative_to(yard)) if Path(x).is_relative_to(yard) else x for x in UNREADABLE)
+        out["unreadable"] = rel
+        print(f"YARD_NOTE {len(rel)} score file(s) are there but cannot be read and are left out (start the run again: "
+              "they are made again): " + ", ".join(rel[:8]) + (" ..." if len(rel) > 8 else ""))
     if half:
         res = float(np.median(half))
         out["resolution"] = res
