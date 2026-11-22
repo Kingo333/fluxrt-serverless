@@ -394,3 +394,58 @@ def test_a_score_file_cut_off_in_the_middle_is_named_and_never_taken_for_scores(
     g.unlink()
     res, out = _run(yard, capsys)
     assert "unreadable" not in res and "YARD_NOTE" not in out
+
+
+def test_a_model_is_read_against_the_real_videos_where_favourite_2_stands_apart_from_them(tmp_path, capsys):
+    """The live settings test (2026-11-22): does favourite #2 at 4 steps come nearer to a real video in dress length,
+    flicker on tops and the fabric's light and shade?"""
+    fxa = tmp_path / "fxa"
+    yard = fxa / "yard"
+    _lists(fxa)
+    allsets = {**OLD, **FRESH}
+    # three settings, all a little better in colour; the first by most
+    for name, model, mult in (("fav2st4s100_r528", "favourite #2, 4 steps", 0.80), ("fav2st3s100_r528", "favourite #2, 3 steps", 0.90),
+                              ("fav2st4s154_r528", "favourite #2, 4 steps, strength x1.54", 0.95),
+                              ("fav2st2s100px432_r528", "favourite #2, 2 steps, worked at 432x768", 0.97)):
+        _entry(yard, name, model, 52, allsets, lambda s, i, t, m=mult: m)
+    # the scorers' own figures: favourite #2 live has dresses 15% too long, flickers on tops, and is flatter than real
+    mine = {"fav2st4s100_r528": {"length_ratio": 1.04, "flicker_de": 1.9, "fabric_ratio": 1.9},
+            "fav2st3s100_r528": {"length_ratio": 1.15, "flicker_de": 2.5, "fabric_ratio": 1.6},
+            "fav2st4s154_r528": {"length_ratio": 1.30, "flicker_de": 3.4, "fabric_ratio": 1.2},
+            "fav2st2s100px432_r528": {"length_ratio": 1.15, "flicker_de": 2.5, "fabric_ratio": 1.6}}
+    for name, vals in mine.items():
+        for st in allsets:
+            g = yard / name / st / "garment.json"
+            d = json.loads(g.read_text())
+            for v in d["items"].values():
+                v[name].update(vals)
+                v[BASE].update({"length_ratio": 1.15, "flicker_de": 2.5, "fabric_ratio": 1.6})
+            g.write_text(json.dumps(d))
+    real = {k: v for k, v in allsets.items() if k != "cases5"}
+    _worn(yard / "worn", real)
+    for st in real:                                                             # the real videos: flicker 1.8, length 0.98
+        g = yard / "worn" / st / "garment.json"
+        d = json.loads(g.read_text())
+        for v in d["items"].values():
+            v["worn"]["flicker_de"] = 1.8
+            v["worn"]["length_ratio"] = 0.98
+        g.write_text(json.dumps(d))
+    res, out = _run(yard, capsys, worn=yard / "worn")
+    assert ("YARD_GAPS favourite #2, 4 steps: dress length x1.04 (favourite #2 x1.15, real x0.98): nearer to real | "
+            "colour flicker on tops 1.90 (favourite #2 2.50, real 1.80): nearer to real | "
+            "light-dark spread on dresses x1.90 (favourite #2 x1.60, real x2.00): nearer to real | "
+            "light-dark spread on tops x1.90 (favourite #2 x1.60, real x2.00): nearer to real | "
+            "light-dark spread on bottoms x1.90 (favourite #2 x1.60, real x2.00): nearer to real") in out
+    assert "YARD_GAPS favourite #2, 3 steps: dress length x1.15 (favourite #2 x1.15, real x0.98): as near to real" in out
+    assert "YARD_GAPS favourite #2, 4 steps, strength x1.54: dress length x1.30 (favourite #2 x1.15, real x0.98): further from real" in out
+    assert res["gaps"]["favourite #2, 4 steps"]["flicker_de:tops"] == {"model": pytest.approx(1.9), "fav2": pytest.approx(2.5),
+                                                                       "real": pytest.approx(1.8), "clips": 24, "word": "nearer to real"}
+    assert res["gaps"]["favourite #2, 4 steps"]["length_ratio:dresses"]["clips"] == 34
+    # the three best overall are the ones shown beside favourite #2 in the video, best first, by their render names
+    # (full strength is last: its better colour does not make up for its flicker, which counts in the score)
+    assert res["model_show"] == ["fav2st4s100_r528", "fav2st3s100_r528", "fav2st2s100px432_r528"]
+    # 4 steps: colour +20% and flicker +24%, 2 of the 11 measures these records hold
+    assert "YARD_MODEL favourite #2, 4 steps against favourite #2 at the same seeds (52), 87 clips: +4.0%" in out
+    # without the real videos there are no such lines, and nothing breaks
+    res, out = _run(yard, capsys)
+    assert "YARD_GAPS" not in out and "gaps" not in res and len(res["model_show"]) == 3

@@ -225,13 +225,18 @@ def test_the_yardstick_pod_script_has_the_control_every_seed_and_the_real_videos
     assert at == sorted(at)
     # the real videos: laid out, scored alone by the usual scorers, read by the report; a failure there is only a note
     assert '-m eval.worn_reference "$AZ_ROOT" --sets $SETS --out "$E/worn"' in s
-    assert '-m eval.garment_report score "$d" --models worn --baseline worn' in s and '--worn "$Y/worn"' in s
+    assert '-m eval.garment_report score "$d" --models worn --baseline worn' in s and '--worn "${AZ_WORN_SCORES:-$Y/worn}"' in s
     assert 'if [ "${AZ_WORN:-1}" = "1" ]; then' in s and "NOTE: the real videos could not be scored" in s
     # the videos: per garment type, dresses first, on sets of their own
     assert "--prefix y_" in s and "for t in dresses tops bottoms; do" in s
     assert 'video "y_$t" "yard_seeds_$t" "${PS[@]}"' in s and 'video "y_$t" "yard_models_$t" "${PM[@]}"' in s
     # a set may take two hours to render before it is cut off (a clip took a minute on 2026-11-22, not 20 seconds)
     assert 'timeout -s INT "${AZ_RENDER_MIN:-120}m" $G' in s
+    # the live settings test: favourite #2's own file with other steps, strength and size, given as the last arguments
+    assert 'SETTINGS="${AZ_YARD_SETTINGS:-}"' in s and 'Y="$E/$NAME"' in s
+    assert '"--steps $st_steps --lora-scale $st_scale${st_size:+ --render-size $st_size}"' in s
+    r = (ROOT / "training/eval/generate_fluxrt.py").read_text()
+    assert '"--render-size"' in r and "height=mh, width=mw" in r and "model_frames[i]" in r
     # never an endpoint, never a training
     assert "run_train" not in s and "endpoint" not in s.replace("never touches an endpoint", "")
 

@@ -40,6 +40,9 @@ The score is the picker's (fluxrt_lora.pick_best_save): per set, every measure's
   YARD_REAL         --worn: the same garments as REALLY worn (eval.worn_reference: the real videos of the garment
                     photos' own clips, scored like a render) next to favourite #2 on the same garments, measure by
                     measure: the level a perfect try-on would reach. YARD_REAL_GARMENT: per garment type
+  YARD_GAPS         --worn: per model at the live seed, the three places where favourite #2 stands apart from the
+                    real videos (dress length, colour flicker on tops, light-dark spread per garment type): the
+                    model's figure next to favourite #2's and the real videos', and whether it is nearer to real
   YARD_RESOLUTION   how small a difference this yardstick shows
   YARD_NOTE         score files that are there but cannot be read (left out, never taken for scores)
 A range that does not include 0 is a real difference ("better" or "worse"); otherwise "no difference shown"; with
@@ -170,6 +173,56 @@ def real_against(real: dict, fav: dict, clips=None) -> tuple[str, dict, int]:
         res[k] = {"real": r, "fav2": f, "clips": len(rows)}
         parts.append(f"{label}: real {fmt.format(r)}, favourite #2 {fmt.format(f)}")
     return " | ".join(parts), res, len(both)
+
+
+# where favourite #2 stands apart from the real videos (yardstick run, 2026-11-22): key, words, garment types
+GAPS = (("length_ratio", "dress length", ("dresses",)), ("flicker_de", "colour flicker on tops", ("tops",)),
+        ("fabric_ratio", "light-dark spread", GARMENT_TYPES))
+
+
+def entries(yard: Path) -> list[tuple[Path, dict]]:
+    """Every entry of the yard that says what it is: (folder, meta)."""
+    out = []
+    for d in sorted(p for p in yard.iterdir() if p.is_dir() and (p / "meta.json").exists()):
+        meta = _load(d / "meta.json") or {}
+        if meta.get("name") and meta.get("seed") is not None and meta.get("model"):
+            out.append((d, meta))
+    return out
+
+
+def load_model_raw(yard: Path, sets: list[str], live: int = 52) -> dict:
+    """{model: {(set, clip): {key: number}}} of every model (not favourite #2, not the control) at the live seed."""
+    out: dict = {}
+    for d, meta in entries(yard):
+        if str(meta["model"]) in ("fav2", CONTROL) or int(meta["seed"]) != live:
+            continue
+        for st in sets:
+            if (d / st).is_dir():
+                for c, row in raw_values(d / st, meta["name"]).items():
+                    out.setdefault(str(meta["model"]), {})[(st, c)] = row
+    return out
+
+
+def gaps_against(real: dict, fav: dict, mine: dict, types: dict) -> tuple[str, dict]:
+    """One model next to favourite #2 and the real videos on the same garments, where favourite #2 stands apart
+    from real: (the words, {key:type: {model, fav2, real, clips, word}})."""
+    ratio = {k: r for k, _, _, r in SHOWN}
+    fmt = {k: f for k, _, f, _ in SHOWN}
+    parts, res = [], {}
+    for key, words, kinds in GAPS:
+        for kind in kinds:
+            cl = [c for c in real if c in fav and c in mine and types.get(c[0], {}).get(c[1]) == kind
+                  and all(x[c].get(key, 0) > 0 for x in (real, fav, mine))]
+            if len(cl) < 3:
+                continue
+            agg = geo if ratio[key] else (lambda xs: float(np.mean(list(xs))))
+            r, f, m = (agg([x[c][key] for c in cl]) for x in (real, fav, mine))
+            dm, df = abs(float(np.log(m / r))), abs(float(np.log(f / r)))
+            word_ = "nearer to real" if dm < df - 0.02 else "further from real" if dm > df + 0.02 else "as near to real"
+            name = words if len(kinds) == 1 else f"{words} on {kind}"
+            parts.append(f"{name} {fmt[key].format(m)} (favourite #2 {fmt[key].format(f)}, real {fmt[key].format(r)}): {word_}")
+            res[f"{key}:{kind}"] = {"model": m, "fav2": f, "real": r, "clips": len(cl), "word": word_}
+    return " | ".join(parts), res
 
 
 def load_fabric(yard: Path, baseline: str, sets: list[str], live: int = 52) -> dict:
@@ -539,6 +592,11 @@ def main(argv=None) -> dict:
             print(f"YARD_MODEL_GARMENT {model}: " + " | ".join(f"{t} {rng_txt(v)} {word(v)}, {v['clips']} clips" for t, v in g.items()))
         print(f"YARD_MODEL_AREAS {model}: " + ", ".join(f"{k} {rng_txt(v)}" for k, v in r["areas"].items()))
         out["models"].append({"model": model, "seeds": seeds, "all": r, "fresh": rfr, "garments": g})
+    # the models for the side-by-side video: the three best overall, by the name of their render at the live seed
+    names = {(str(meta["model"]), int(meta["seed"])): meta["name"] for _, meta in entries(yard)}
+    show = [names[(m["model"], live)] for m in sorted(out["models"], key=lambda m: -m["all"]["score"]) if (m["model"], live) in names]
+    if show:
+        out["model_show"] = show[:3]
     # ---- the same garments as really worn: the level a perfect try-on would reach
     real: dict = {}
     if a.worn and Path(a.worn).is_dir():
@@ -559,6 +617,12 @@ def main(argv=None) -> dict:
                 if txt:
                     out["real"]["garments"][t] = {"clips": n, **res}
                     print(f"YARD_REAL_GARMENT {t}, {n} real videos: {txt}")
+        # does a model come nearer to the real videos where favourite #2 stands apart from them?
+        for model, mine in sorted(load_model_raw(yard, sets, live).items()):
+            txt, res = gaps_against(real, fav_raw, mine, types)
+            if txt:
+                out.setdefault("gaps", {})[model] = res
+                print(f"YARD_GAPS {model}: {txt}")
     # ---- which way the fabric differs: flatter or more contrasty than the garment photo
     fab = load_fabric(yard, a.baseline, sets, live)
     fav = {sd: geo(v.values()) for (m, sd), v in sorted(fab.items()) if m == "fav2"}

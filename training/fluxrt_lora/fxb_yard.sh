@@ -31,6 +31,17 @@
 #      dresses first (yard_seeds_<type>.mp4: favourite #2 at the live seed next to the three best seeds;
 #      yard_models_<type>.mp4: next to the models; AZ_GARMENT_CLIPS clips each, default 8), eval/yard_review.tar.
 #      Then the Pod stops itself.
+# The live settings test (2026-11-22, after the yardstick showed no seed and no trained save beats favourite #2):
+#   AZ_YARD_SETTINGS="4:1.00 4:1.54 3:1.00 2:1.00:432x768" renders favourite #2 itself at other settings of the
+#   live model, steps:strength[:WxH] (strength x1.00 = as live, x1.54 = full training strength; WxH = the size the
+#   model works at, the result is shown at the live size). Black Forest Labs' reference for the distilled model is
+#   4 steps; live runs 2 at 288x512. Each setting is compared with favourite #2 as it runs live, on all clips, and
+#   YARD_GAPS says whether it comes nearer to the real videos where favourite #2 stands apart from them (dress
+#   length, flicker on tops, light and shade of the fabric). With AZ_YARD_NAME=settings the run keeps its own
+#   folder (eval/fxa/settings, eval/settings_review.tar), AZ_YARD_SEEDS=none AZ_YARD_MODELS="" AZ_YARD_CONTROL=0
+#   leave everything else out, and AZ_WORN=0 AZ_WORN_SCORES=<yard>/worn reads the real videos' scores of the
+#   yardstick run. Nothing is trained and nothing that is live is touched: whether the live worker changes is the
+#   owner's call.
 # Money: never past AZ_CAP (counting AZ_SPENT) nor past AZ_BALANCE minus AZ_BALANCE_KEEP (1.50); what is rendered
 # and scored when the money ends is kept, and the report is made from it. Both limits are fixed when the script
 # starts: a top-up during the run is not seen. Safe to start again, with AZ_SPENT = the total the log shows and
@@ -61,6 +72,9 @@ MODEL_SEEDS_N="${AZ_MODEL_SEEDS_N:-2}"
 MODELS="${AZ_YARD_MODELS-fxreal8:750}"
 ALL_SEEDS="${AZ_YARD_ALL_SEEDS:-1}"
 CONTROL="${AZ_YARD_CONTROL:-1}"
+SETTINGS="${AZ_YARD_SETTINGS:-}"             # favourite #2 at other live settings: steps:strength[:WxH] ...
+NAME="${AZ_YARD_NAME:-yard}"                 # this run's folder under eval/fxa, and the name of its review file
+case "$NAME" in *[!a-z0-9_]*|"") echo "YARD STOPPED: BAD_AZ_YARD_NAME: $NAME (small letters, digits and _ only)"; exit 1;; esac
 WEIGHTS="${AZ_SET_WEIGHTS:-fx6test=1,dress10=1,cases5=0.5,$FRESH=2}"
 FAV2_SHA="${AZ_FAV2_SHA:-8a2f5635}"
 LIVE_SEED=52
@@ -68,7 +82,7 @@ REF_SIZE=528x704
 TAG=r528
 FAV="fav2_$TAG"
 C="$AZ_ROOT/checkpoints"; S="$AZ_ROOT/data/staging"; E="$AZ_ROOT/eval/fxa"; R="$E/results"
-Y="$E/yard"; SWEEP="$E/fx6b"
+Y="$E/$NAME"; SWEEP="$E/fx6b"
 PY="$AZ_ROOT/venv-fluxlora/bin/python"; MP="$AZ_ROOT/venv-mp/bin/python"
 SEG="$AZ_ROOT/selfie_multiclass_256x256.tflite"
 INIT="$AZ_ROOT/outputs/fluxrt_lora/blend05s065"
@@ -219,19 +233,22 @@ for d in sorted(sweep.iterdir()) if sweep.is_dir() else []:
     break
 print(n)" "$SWEEP" "$Y" "$1" "$OLD" 2>/dev/null || echo 0
 }
-JOBS=()         # name<TAB>weights<TAB>seed
-job() {  # name, model, seed, weights, label
+JOBS=()         # name<TAB>weights<TAB>seed<TAB>more renderer arguments (- = none)
+job() {  # name, model, seed, weights, label[, more renderer arguments]
   mkdir -p "$Y/$1"
-  [ -f "$Y/$1/meta.json" ] || "$PY" -c "import json, sys; json.dump({'name': sys.argv[1], 'model': sys.argv[2], 'seed': int(sys.argv[3]), 'weights': sys.argv[4], 'label': sys.argv[5]}, open(sys.argv[6], 'w'))" \
-    "$1" "$2" "$3" "$4" "$5" "$Y/$1/meta.json"
-  JOBS+=("$1"$'\t'"$4"$'\t'"$3")
+  [ -f "$Y/$1/meta.json" ] || "$PY" -c "import json, sys; json.dump({'name': sys.argv[1], 'model': sys.argv[2], 'seed': int(sys.argv[3]), 'weights': sys.argv[4], 'label': sys.argv[5], 'args': sys.argv[7]}, open(sys.argv[6], 'w'))" \
+    "$1" "$2" "$3" "$4" "$5" "$Y/$1/meta.json" "${6:-}"
+  JOBS+=("$1"$'\t'"$4"$'\t'"$3"$'\t'"${6:--}")
   local got; got=$(reuse_scores "$1")
   [ "${got:-0}" -gt 0 ] && say "   $5: the scores of $got old set(s) reused"
   return 0
 }
 
 # ---- 2. the list: the control, the models at the live seed, every seed of the sweep, the models at the best seeds
-if [ -z "$SEEDS" ]; then
+if [ "$SEEDS" = "none" ]; then
+  SEEDS=""; TOP_SEEDS=""
+  say "2. no seeds in this run"
+elif [ -z "$SEEDS" ]; then
   SEEDS=$("$PY" -c "
 import json, re, sys
 d = json.load(open(sys.argv[1]))
@@ -285,6 +302,18 @@ model_jobs() {  # live = at the live seed only, rest = at the other seeds
 # the order is the order of worth if the money ends early: the control (is the yardstick itself sound?), the models
 # at the live seed (cheap: their videos on the old clips are there), every seed, and last the models at other seeds
 [ "$CONTROL" = "1" ] && job "fav2again_$TAG" "favourite #2 rendered again" "$LIVE_SEED" "$INIT_W" "favourite #2 rendered again at seed $LIVE_SEED (the control)"
+# favourite #2 itself at other settings of the live model, in the order given (the first is the one that matters most)
+for st in $SETTINGS; do
+  IFS=: read -r st_steps st_scale st_size <<< "$st"
+  case "$st_steps" in [1-8]) ;; *) fail "BAD_SETTING: $st (steps 1 to 8, as in 4:1.00)";; esac
+  case "$st_scale" in [0-2].[0-9][0-9]) ;; *) fail "BAD_SETTING: $st (strength with two decimals, as in 4:1.00 or 4:1.54)";; esac
+  case "${st_size:-}" in ""|[1-9][0-9][0-9]x[1-9][0-9][0-9]|[1-9][0-9][0-9]x[1-9][0-9][0-9][0-9]) ;; *) fail "BAD_SETTING: $st (size as in 2:1.00:432x768)";; esac
+  lab="favourite #2, $st_steps steps"
+  [ "$st_scale" = "1.00" ] || lab="$lab, strength x$st_scale"
+  [ -z "${st_size:-}" ] || lab="$lab, worked at $st_size"
+  job "fav2st${st_steps}s${st_scale/./}${st_size:+px${st_size%%x*}}_$TAG" "$lab" "$LIVE_SEED" "$INIT_W" "$lab" \
+    "--steps $st_steps --lora-scale $st_scale${st_size:+ --render-size $st_size}"
+done
 model_jobs live
 for sd in $SEEDS; do
   case "$sd" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) fail "BAD_SEED: $sd";; esac
@@ -292,7 +321,7 @@ for sd in $SEEDS; do
   job "fav2seed${sd}_$TAG" fav2 "$sd" "$INIT_W" "favourite #2 at seed $sd"
 done
 model_jobs rest
-say "3. ${#JOBS[@]} renders to check on: $SETS (models at seeds $MODEL_SEEDS)"
+say "3. ${#JOBS[@]} renders to check on: $SETS${MODELS:+ (models at seeds $MODEL_SEEDS)}"
 
 # ---- 3. render (GPU) and score (CPU, beside it, one at a time: the scorers share files per set)
 score_loop() {
@@ -354,10 +383,11 @@ if [ -n "$FRESH" ]; then
   render "$FRESH" "$FAV" "$INIT_W" "" || fail "NO_BASELINE: favourite #2 could not be rendered on $FRESH (see $Y/render_${FRESH}_$FAV.log)"
 fi
 for row in "${JOBS[@]}"; do
-  IFS=$'\t' read -r n w sd <<< "$row"
+  IFS=$'\t' read -r n w sd xa <<< "$row"
   [ -f "$Y/$n/.rendered" ] || [ -f "$Y/$n/.failed" ] && continue
   out_of_money && { say "money limit reached: the remaining renders are left out"; break; }
   x=""; [ "$sd" != "$LIVE_SEED" ] && x="--seed $sd"
+  [ "$xa" = "-" ] || x="$x $xa"              # later arguments win: --steps 4 here over the --steps 2 of every render
   ok=1; cut=0
   for s in $SETS; do
     out_of_money && { cut=1; break; }
@@ -390,7 +420,7 @@ fi
 
 # ---- 4. the report
 ( cd "$T" && "$PY" -m eval.yardstick "$Y" --baseline "$FAV" --old $OLD ${FRESH:+--fresh $FRESH} --weights "$WEIGHTS" \
-    --clips "$E" --worn "$Y/worn" --json "$Y/yardstick.json" ) > "$Y/yardstick.log" 2>&1 || say "NOTE: the report failed (see $Y/yardstick.log)"
+    --clips "$E" --worn "${AZ_WORN_SCORES:-$Y/worn}" --json "$Y/yardstick.json" ) > "$Y/yardstick.log" 2>&1 || say "NOTE: the report failed (see $Y/yardstick.log)"
 grep -E "^YARD_" "$Y/yardstick.log" | sed 's/^/YARD /'
 LEFT=$(for row in "${JOBS[@]}"; do n="${row%%$'\t'*}"; [ -f "$Y/$n/.scored" ] || echo "$n"; done | tr '\n' ' ')
 TOTAL=$(awk -v a="$SPENT0" -v b="$(spent_run)" 'BEGIN { printf "%.2f", a + b + 0.10 }')   # with the minutes until the Pod is off
@@ -410,11 +440,18 @@ if [ "$(left_min)" -gt 4 ]; then
   PS=("$FAV=favourite #2, seed $LIVE_SEED (live)")
   for sd in $SHOW; do [ -f "$Y/fav2seed${sd}_$TAG/.rendered" ] && PS+=("fav2seed${sd}_$TAG=favourite #2, seed $sd"); done
   PM=("$FAV=favourite #2 (today)")
-  for row in "${JOBS[@]}"; do
-    IFS=$'\t' read -r n w sd <<< "$row"
-    case "$n" in fav2seed*|fav2again*) continue;; esac
-    [ "$sd" = "$LIVE_SEED" ] && [ -f "$Y/$n/.rendered" ] && PM+=("$n=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['model'])" "$Y/$n/meta.json")")
-  done
+  model_of() { "$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['model'])" "$Y/$1/meta.json"; }
+  # the models beside it: the three the report puts first; without a report, all of this run at the live seed
+  MSHOW=$("$PY" -c "import json, sys; print(' '.join(json.load(open(sys.argv[1])).get('model_show') or []))" "$Y/yardstick.json" 2>/dev/null)
+  if [ -n "$MSHOW" ]; then
+    for n in $MSHOW; do [ -f "$Y/$n/.rendered" ] && PM+=("$n=$(model_of "$n")"); done
+  else
+    for row in "${JOBS[@]}"; do
+      IFS=$'\t' read -r n w sd xa <<< "$row"
+      case "$n" in fav2seed*|fav2again*) continue;; esac
+      [ "$sd" = "$LIVE_SEED" ] && [ -f "$Y/$n/.rendered" ] && PM+=("$n=$(model_of "$n")")
+    done
+  fi
   ( cd "$T" && "$PY" -m eval.garment_mix "$AZ_ROOT" --sets ${FRESH:-$OLD} --per-type "${AZ_GARMENT_CLIPS:-8}" --prefix y_ ) > "$Y/garment_mix.log" 2>&1 || true
   grep "^GARMENT_SETS" "$Y/garment_mix.log" | sed 's/^/YARD /'
   MADE=0
@@ -431,5 +468,5 @@ if [ "$(left_min)" -gt 4 ]; then
     video "$VSET" yard_models "${PM[@]}"
   fi
 fi
-( cd "$Y" && tar cf "$AZ_ROOT/eval/yard_review.tar" yardstick.json yardstick.log yard_*.mp4 2>/dev/null )
-say "YARD_DONE: $AZ_ROOT/eval/yard_review.tar"
+( cd "$Y" && tar cf "$AZ_ROOT/eval/${NAME}_review.tar" yardstick.json yardstick.log yard_*.mp4 2>/dev/null )
+say "YARD_DONE: $AZ_ROOT/eval/${NAME}_review.tar"

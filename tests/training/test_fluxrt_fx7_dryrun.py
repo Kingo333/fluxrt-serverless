@@ -141,7 +141,11 @@ elif mod == "eval.generate_fluxrt":
         if not (d / f"out_{name}.mp4").exists():
             (d / f"out_{name}.mp4").write_text("video"); new += 1
             print(json.dumps({"key": clip, "model": name, "clip": clip, **({"fps": 2.61} if os.environ.get("STUB_FPS") else {})}))
+    def last(flag):                                        # as the real renderer reads it: the last one given wins
+        at = [i for i, x in enumerate(args) if x == flag]
+        return args[at[-1] + 1] if at else None
     log("render.log", {"name": name, "set": out.name, "seed": opt("--seed"), "steady": opt("--steady-blend"), "new": new,
+                       "steps": last("--steps"), "scale": last("--lora-scale"), "render_size": last("--render-size"),
                        "t": time.time()})
     if os.environ.get("STUB_RENDER_MIN"):                  # the made-up clock (Volume.fake_clock): a render takes this long
         clock = LOG / "clock"
@@ -1019,6 +1023,58 @@ def test_the_yardstick_run_stops_at_its_money_limit_and_a_second_start_after_a_t
     p, out3, _ = _yard(vol, AZ_SPENT="92.00", AZ_BALANCE="30.00")
     assert p.returncode == 0 and "YARD_DONE" in out3 and "earlier starts" not in out3 and "already spent $92.00" in out3
     assert len(vol.lines("render.log")) == n_render
+
+
+def test_the_live_settings_test_renders_favourite_2_at_other_steps_strengths_and_sizes_in_its_own_folder(vol):
+    vol.run(**_fx8_env(vol), AZ_AA_SEEDS="53 54 55 56 57")
+    p, out, _ = _yard(vol)                                             # the yardstick run: its fresh clips and real videos
+    assert p.returncode == 0 and "YARD_DONE" in out, out[-2000:]
+    yard, sett = vol.root / "eval/fxa/yard", vol.root / "eval/fxa/settings"
+    before = (yard / "yardstick.json").read_text()
+    n_render, n_env = len(vol.lines("render.log")), len(vol.lines("train_env.log"))
+    env = {"AZ_YARD_NAME": "settings", "AZ_YARD_SEEDS": "none", "AZ_YARD_MODELS": "", "AZ_YARD_CONTROL": "0", "AZ_WORN": "0",
+           "AZ_WORN_SCORES": str(yard / "worn"), "AZ_YARD_SETTINGS": "4:1.00 4:1.54 3:1.00 2:1.00:432x768",
+           "AZ_SPENT": "99.68", "AZ_CAP": "110", "AZ_BALANCE": "20.00", "STUB_FPS": "1"}
+    p, out, _ = _yard(vol, **env)
+    assert p.returncode == 0 and "YARD_DONE" in out and "NOT CHECKED" not in out, out[-3000:]
+    assert "already spent $99.68" in out and "2. no seeds in this run" in out
+    assert "3. 4 renders to check on: fx6test dress10 cases5 fx12test\n" in out
+    # favourite #2's own file, the live seed, on every clip; the settings as the last arguments, in the order given
+    new = vol.lines("render.log")[n_render:]
+    names = [f"fav2st4s100_{TAG}", f"fav2st4s154_{TAG}", f"fav2st3s100_{TAG}", f"fav2st2s100px432_{TAG}"]
+    assert [r["name"] for r in new] == [n for n in names for _ in range(4)] and all(r["seed"] is None and r["new"] == 2 for r in new)
+    by = {r["name"]: r for r in new}
+    assert [(by[n]["steps"], by[n]["scale"], by[n]["render_size"]) for n in names] == [
+        ("4", "1.00", None), ("4", "1.54", None), ("3", "1.00", None), ("2", "1.00", "432x768")]
+    assert not [r for r in new if r["name"] == f"fav2_{TAG}"]                 # favourite #2 as live is there already
+    # nothing is trained; the real videos are not scored again (their scores are read from the yardstick run)
+    assert len(vol.lines("train_env.log")) == n_env and "WORN_SETS" not in out and "NOTE: the real videos" not in out
+    # each setting against favourite #2 as it runs live, and against the real videos of the yardstick run
+    for lab in ("favourite #2, 4 steps", "favourite #2, 4 steps, strength x1.54", "favourite #2, 3 steps",
+                "favourite #2, 2 steps, worked at 432x768"):
+        assert f"YARD YARD_MODEL {lab} against favourite #2 at the same seeds (52), 8 clips:" in out, lab
+    assert "YARD YARD_GAPS favourite #2, 4 steps: light-dark spread on dresses x1.00 (favourite #2 x0.90, real x1.80): nearer to real" in out
+    assert "YARD_SEED" not in out and "YARD_CONTROL" not in out
+    assert f"render fx12test/fav2st4s100_{TAG}: 2 new clips, 2 of 2 (2.61 frames a second)" in out
+    res = json.loads((sett / "yardstick.json").read_text())
+    assert len(res["models"]) == 4 and len(res["model_show"]) == 3 and res["seeds"] == []
+    # its own folder and review file; the yardstick run's are as they were
+    assert (vol.root / "eval/settings_review.tar").exists() and (yard / "yardstick.json").read_text() == before
+    assert json.loads((sett / f"fav2st4s154_{TAG}/meta.json").read_text())["args"] == "--steps 4 --lora-scale 1.54"
+    # the videos: favourite #2 as live next to the three settings the report puts first, per garment type
+    videos = vol.lines("video.log")[-2:]
+    assert [v["set"] for v in videos] == ["y_dresses", "y_tops"]
+    for v in videos:
+        assert v["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(v["panels"]) == 4
+        assert [x.split("=")[0] for x in v["panels"][1:]] == res["model_show"]
+    assert (sett / "yard_models_dresses.mp4").exists() and not (sett / "yard_seeds_dresses.mp4").exists()
+    # a setting that cannot be read stops the run before the GPU is used
+    for bad in ("4", "4:1.5", "9:1.00", "4:1.00:big"):
+        n = len(vol.lines("render.log"))
+        p, out, _ = _yard(vol, **{**env, "AZ_YARD_SETTINGS": bad})
+        assert p.returncode != 0 and "STOPPED: BAD_SETTING" in out and len(vol.lines("render.log")) == n, bad
+    p, out, _ = _yard(vol, **{**env, "AZ_YARD_NAME": "../x"})
+    assert p.returncode != 0 and "BAD_AZ_YARD_NAME" in out
 
 
 def test_the_yardstick_run_without_a_sweep_or_without_money_stops_before_the_gpu_is_used(vol):

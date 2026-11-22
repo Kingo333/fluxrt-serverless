@@ -578,7 +578,7 @@ def test_scripts_carry_the_earlier_frame_and_the_live_setting_stays_a_switch():
     assert "AZ_ANCHOR_COLUMN=${AZ_ANCHOR_COLUMN:-anchor}" in train and "^ANCHOR_BATCHES" in train
     assert '--anchor-after 8 --anchor-every 12' in train and "fxreal6 + earlier frame" in train
     gen = (ROOT / "training/eval/generate_fluxrt.py").read_text()
-    assert '"--anchor-after"' in gen and "images = [frame, garment] + ([anchor] if anchor is not None else [])" in gen
+    assert '"--anchor-after"' in gen and "images = [model_frames[i], garment] + ([anchor] if anchor is not None else [])" in gen
 
 
 # ---------------------------------------------------------------- overnight chain (owner, 2026-11-15)

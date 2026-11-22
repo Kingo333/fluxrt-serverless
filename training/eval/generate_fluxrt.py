@@ -172,6 +172,9 @@ def main(argv=None) -> None:
                          "the camera picture did not move (0 = off; --clip-list only). Not part of the model.")
     ap.add_argument("--steady-motion", type=float, default=0.04,
                     help="camera change (0..1 of full brightness) at which a place counts as moving (no blending)")
+    ap.add_argument("--render-size", help="clip-list only: the size the model works at (WxH, multiples of 16, e.g. "
+                    "432x768). The camera frames are cut for that size, the result is scaled back to --size, so the "
+                    "camera video and the scorers stay as they are (live settings test, 2026-11-22)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
                     "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
                     "--staging is then ignored")
@@ -284,10 +287,14 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
         if result.exists():
             continue
         dest.mkdir(parents=True, exist_ok=True)
-        frames = [_cover(f, w, h) for f in _read_frames(Path(it["video"]), a.frames)]
+        source = _read_frames(Path(it["video"]), a.frames)
+        frames = [_cover(f, w, h) for f in source]
         if not frames:
             print(json.dumps({"key": it["key"], "skipped": "no frames"}), flush=True)
             continue
+        # the size the model works at: --size unless --render-size asks for another (then from the original frames)
+        mw, mh = (int(v) for v in a.render_size.lower().split("x")) if getattr(a, "render_size", None) else (w, h)
+        model_frames = frames if (mw, mh) == (w, h) else [_cover(f, mw, mh) for f in source]
         ref_path = Path(it["ref"])
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
         plain = {"plain": True} if a.prompt_style == "live" and it.get("plain") else {}
@@ -302,17 +309,17 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
             if a.anchor_after > 0 and outs and (
                     (anchor is None and i >= a.anchor_after)
                     or (anchor is not None and a.anchor_every > 0 and i - anchor_at >= a.anchor_every)):
-                anchor, anchor_at = outs[-1].resize((w, h)), i   # its own picture, as the live worker takes it
+                anchor, anchor_at = outs[-1].resize((mw, mh)), i   # its own picture, as the live worker takes it
             gen = torch.Generator(device="cuda").manual_seed(a.seed)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            images = [frame, garment] + ([anchor] if anchor is not None else [])
-            img = pipe(prompt=prompt, image=images, height=h, width=w, guidance_scale=1.0,
+            images = [model_frames[i], garment] + ([anchor] if anchor is not None else [])
+            img = pipe(prompt=prompt, image=images, height=mh, width=mw, guidance_scale=1.0,
                        num_inference_steps=a.steps, generator=gen).images[0]
             torch.cuda.synchronize()
             if i >= 3:
                 latencies.append(time.perf_counter() - t0)
-            o = img.convert("RGB").resize((w, h))
+            o = img.convert("RGB").resize((w, h)) if (mw, mh) == (w, h) else img.convert("RGB").resize((w, h), Image.LANCZOS)
             if steady is not None:
                 o = Image.fromarray(steady(np.asarray(frame.convert("RGB")), np.asarray(o)))
             outs.append(o)

@@ -127,3 +127,26 @@ def test_a_few_steps_on_the_starting_noise_bring_the_render_closer_to_the_answer
         opt.step()
         losses.append(float(loss))
     assert losses[-1] < losses[0] * 0.9
+
+
+def test_the_pipeline_takes_more_steps_and_a_larger_working_size_as_the_live_settings_test_asks():
+    """The live settings test (2026-11-22) renders favourite #2 at 3 and 4 steps and at a larger working size
+    (eval.generate_fluxrt --steps N --render-size WxH): the pipeline call it makes must be a valid one."""
+    import numpy as np
+    pipe = tiny_pipe()
+    pipe.set_progress_bar_config(disable=True)
+    frame, garment = pictures()
+    emb = text()
+
+    def render(image, w, h, steps):
+        out = pipe(prompt=None, prompt_embeds=emb, image=image, height=h, width=w, guidance_scale=1.0,
+                   num_inference_steps=steps, generator=torch.Generator().manual_seed(52)).images[0]
+        assert out.size == (w, h)
+        return np.asarray(out.convert("RGB")).astype(float)
+
+    by_steps = {n: render([frame, garment], W, H, n) for n in (2, 3, 4)}
+    # the steps are really taken: each count gives another picture
+    assert np.abs(by_steps[2] - by_steps[3]).mean() > 0.01 and np.abs(by_steps[3] - by_steps[4]).mean() > 0.01
+    # a working size 1.5 times the live one (as 288x512 -> 432x768): the camera frame at that size, the garment as it is
+    big = render([frame.resize((96, 144)), garment], 96, 144, 2)
+    assert big.shape == (144, 96, 3)
