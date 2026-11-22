@@ -50,7 +50,7 @@ if [ "$1" = "-m" ]; then
   mod="$2"; shift 2
   case "$mod" in
     fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix|eval.yardstick) exec "$REAL" -m "$mod" "$@";;   # the real tools
-    fluxrt_lora.merge_lora|eval.generate_fluxrt|eval.garment_report|eval.step_a) exec "$REAL" "$STUB_DIR/tools.py" "$mod" "$@";;
+    fluxrt_lora.merge_lora|eval.generate_fluxrt|eval.garment_report|eval.step_a|eval.worn_reference) exec "$REAL" "$STUB_DIR/tools.py" "$mod" "$@";;
   esac
   echo "unexpected module $mod" >&2; exit 3
 fi
@@ -145,13 +145,17 @@ elif mod == "eval.generate_fluxrt":
     time.sleep(0.05)
 elif mod == "eval.garment_report":
     if args[0] == "score":
-        models = opt("--models", many=True); base = opt("--baseline"); name = [m for m in models if m != base][0]
+        models = opt("--models", many=True); base = opt("--baseline"); name = ([m for m in models if m != base] or [base])[0]
         if os.environ.get("STUB_FAIL_SCORE") and name.startswith(os.environ["STUB_FAIL_SCORE"]):
             sys.exit("made-up scoring failure")
         rows = [{"priority": "COLOUR", "metric": "colour_de", "model": name, "baseline": base, "mean": colour(name), "baseline_mean": 12.0}]
         # per clip: the first clip of every set a little better than the set's mean, the second a little worse
         items = {c: {name: {"colour_de": colour(name) + d, "fabric_ratio": round(colour(name) / 12.0, 3)},
                      base: {"colour_de": 12.0, "fabric_ratio": 0.9}} for c, d in (("c1", -0.4), ("c2", 0.4))}
+        if name == base:                                   # the real videos, scored alone: nearer the photo than any render
+            rows = []
+            items = {c: {name: {"colour_de": 9.0 + d, "fabric_ratio": 1.8}} for c, d in (("c1", -0.4), ("c2", 0.4))}
+            log("worn_score.log", {"set": Path(args[1]).name, "models": models})
         Path(opt("--json")).write_text(json.dumps({"scorecard": rows, "items": items}))
         Path(opt("--out")).write_text("| garment |\n")
 elif mod == "eval.face_skin_report":
@@ -170,6 +174,19 @@ elif mod == "eval.preserve_check":
     Path(opt("--out")).write_text("| gate |\n")
 elif mod == "eval.stability_report":
     out = Path(opt("--out")); out.write_text("| steady |\n"); out.with_suffix(".json").write_text("{}")
+elif mod == "eval.worn_reference":
+    if os.environ.get("STUB_FAIL_WORN"):
+        sys.exit("made-up failure: the real videos cannot be read")
+    out, made = Path(opt("--out")), []
+    for s in opt("--sets", many=True):
+        if s == "cases5":                                  # the owner's own photos: no video of the garment being worn
+            continue
+        for clip in ("c1", "c2"):
+            d = out / s / clip; d.mkdir(parents=True, exist_ok=True)
+            (d / "input.mp4").write_text("real video"); (d / "out_worn.mp4").write_text("real video")
+        made.append(s)
+    print("WORN_SETS " + " | ".join(f"{s}: 2 real videos of the test garments (2 new)" for s in made))
+    log("worn.log", {"sets": made})
 elif mod == "eval.step_a" and args[0] == "pick":
     root, s = Path(args[1]), opt("--set")
     items = [{"key": f"c{i + 1}", "category": ("tops", "dresses")[i], "case": s} for i in range(min(int(opt("--n")), 2))]
@@ -817,59 +834,106 @@ def _yard(vol, timeout=300, **extra):
     return p, p.stdout + p.stderr, time.time() - t0
 
 
-def test_the_yardstick_run_judges_the_best_seeds_on_fresh_clips_and_two_saves_at_the_same_seeds(vol):
+def test_the_yardstick_run_judges_every_seed_on_fresh_clips_with_a_control_and_a_save_at_the_same_seeds(vol):
     vol.run(**_fx8_env(vol), AZ_AA_SEEDS="53 54 55 56 57")           # fxreal8 to step 1000, and a sweep of five seeds
     n_env, n_render = len(vol.lines("train_env.log")), len(vol.lines("render.log"))
     p, out, secs = _yard(vol)
     assert p.returncode == 0 and "YARD_DONE" in out and secs < 200, out[-3000:]
     assert vol.lines("runpodctl.log") == ["stop pod testpod"] * 2 and len(vol.lines("train_env.log")) == n_env   # nothing trained
     order = ["0. favourite #2 confirmed", "1. fresh test set fx12test: 2 clips no run has used (1 dresses, 1 tops)",
-             "2. seeds from the sweep: best on the old clips 54 56 57; for comparison (middle, worst) 53 55",
-             "favourite #2 at seed 54: the scores of 3 old set(s) reused",
+             "2. seeds from the sweep, best on the old clips first: 54 56 57 53 55",
              "fxreal8 step 750 at seed 52: the scores of 3 old set(s) reused",
-             "3. 11 renders to check on: fx6test dress10 cases5 fx12test (models at seeds 52 54 56 )",
-             f"render fx12test/fav2_{TAG}: 2 new clips, 2 of 2", "4. renders done", "YARD YARD_SETS old clips: 6 in fx6test, dress10, cases5",
+             "favourite #2 at seed 54: the scores of 3 old set(s) reused",
+             "3. 9 renders to check on: fx6test dress10 cases5 fx12test (models at seeds 52 54 56 )",
+             f"render fx12test/fav2_{TAG}: 2 new clips, 2 of 2", "4. renders done",
+             "YARD WORN_SETS fx6test: 2 real videos of the test garments (2 new) | dress10: 2 real videos",
+             "YARD YARD_SETS old clips: 6 in fx6test, dress10, cases5",
              "YARD YARD_SETS fresh clips: 2 in fx12test", "YARD YARD_SEED favourite #2 at seed 54 against seed 52: old clips +",
-             "YARD YARD_MODEL fxreal8 step 1000 against favourite #2 at the same seeds (52, 54, 56), 8 clips:",
+             "YARD YARD_SEED_AVERAGE the 5 other seeds together against seed 52: old clips ",
+             "YARD YARD_SEED_AGREEMENT the order of the 5 seeds on the old clips against their order on the fresh clips: rank correlation +1.00",
+             "YARD YARD_SEED_PICK better than seed 52 on the fresh clips at the level that allows for 5 seeds being tried, and no area "
+             "clearly worse on both the old and the fresh clips: none",
+             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its videos of this run, fresh clips: +0.0%",
+             "YARD YARD_CONTROL favourite #2 rendered again at seed 52 against its stored videos, old clips: +0.0%",
+             "YARD YARD_CONTROL_SEEDS the 5 other seeds together against favourite #2 rendered again today at seed 52, old clips:",
              "YARD YARD_MODEL fxreal8 step 750 against favourite #2 at the same seeds (52, 54, 56), 8 clips:",
-             "YARD YARD_RESOLUTION", "video: ", "YARD_DONE"]
+             "YARD YARD_REAL the same garments as really worn (6 real videos) next to favourite #2 at seed 52 on the same garments: "
+             "colour distance from the photo: real 9.0, favourite #2 12.0 | light-dark spread (1 = the photo's): real x1.80, favourite #2 x0.90",
+             "YARD YARD_REAL_GARMENT dresses, 3 real videos: colour distance from the photo: real ",
+             "YARD YARD_RESOLUTION", "YARD GARMENT_SETS dresses: 1 clips from fx12test | tops: 1 clips from fx12test", "video: ", "YARD_DONE"]
     assert "YARD YARD_SEED_ORDER best first, on the old clips: 54 > 56 > 57 > 53 > 55; on the fresh clips: 54 > 56 > 57 > 53 > 55" in out
+    assert "the same: a render can be repeated" in out and "the same: the stored videos are what today's renderer makes" in out
+    assert "YARD_MODEL fxreal8 step 1000" not in out and "YARD_MODEL favourite #2 rendered again" not in out
+    assert "; the same garments as really worn: x1.80" in out                                 # beside favourite #2's own spread
     pos, at = 0, []
     for x in order:
         pos = out.find(x, pos)
-        assert pos >= 0, (x, out[-3500:])
+        assert pos >= 0, (x, out[-4500:])
         at.append(pos)
     renders = vol.lines("render.log")[n_render:]
     fresh = [r for r in renders if r["set"] == "fx12test"]
-    # favourite #2 at the live seed first on the fresh clips; then the five seeds there, each with its own seed
-    assert fresh[0]["name"] == f"fav2_{TAG}" and fresh[0]["seed"] is None
-    assert [(r["name"], r["seed"]) for r in fresh[1:6]] == [(f"fav2seed{s}_{TAG}", str(s)) for s in (54, 56, 57, 53, 55)]
+    # on the fresh clips: favourite #2 at the live seed first, then the control (the same seed again, under another
+    # name), the save at the live seed, the five seeds each with its own seed, and last the save at the two best seeds
+    assert [(r["name"], r["seed"]) for r in fresh[:2]] == [(f"fav2_{TAG}", None), (f"fav2again_{TAG}", None)]
+    assert fresh[2]["name"].startswith("fx8750x") and fresh[2]["seed"] is None
+    assert [(r["name"], r["seed"]) for r in fresh[3:8]] == [(f"fav2seed{s}_{TAG}", str(s)) for s in (54, 56, 57, 53, 55)]
+    assert [r["seed"] for r in fresh[8:]] == ["54", "56"] and all(r["name"].startswith("fx8750x") for r in fresh[8:])
+    # the control is rendered on the old clips too: there it meets favourite #2's STORED videos
+    again = [r for r in renders if r["name"] == f"fav2again_{TAG}"]
+    assert {r["set"] for r in again} == {*SETS, "fx12test"} and all(r["new"] == 2 and r["seed"] is None for r in again)
     # the seeds have their videos on the old clips already: nothing is rendered there again
     assert not [r for r in renders if r["name"].startswith("fav2seed") and r["set"] != "fx12test"]
-    # the two saves: the live seed only on the fresh clips (the old videos are there), the two best seeds on every set
+    # the save: the live seed only on the fresh clips (the old videos are there), the two best seeds on every set
     m750 = [r for r in renders if r["name"].startswith("fx8750x")]
     assert {(r["set"], r["seed"]) for r in m750} == {("fx12test", None)} | {(s, sd) for s in (*SETS, "fx12test") for sd in ("54", "56")}
     assert all(r["new"] == 2 for r in m750) and len(m750) == 9
-    assert len({r["name"] for r in renders if r["name"].startswith("fx81000x")}) == 3
-    res = json.loads((vol.root / "eval/fxa/yard/yardstick.json").read_text())
+    assert not [r for r in renders if r["name"].startswith("fx81000x")]
+    yard = vol.root / "eval/fxa/yard"
+    res = json.loads((yard / "yardstick.json").read_text())
     seeds = {s["seed"]: s for s in res["seeds"]}
     assert set(seeds) == {53, 54, 55, 56, 57} and seeds[54]["old"]["score"] > seeds[57]["old"]["score"] > seeds[55]["old"]["score"]
-    assert seeds[54]["fresh"] is not None and [m["model"] for m in res["models"]] == ["fxreal8 step 1000", "fxreal8 step 750"]
-    assert res["models"][1]["seeds"] == [52, 54, 56]
-    # the videos: the best seeds side by side, the models side by side, on the fresh clips, once each
-    videos = vol.lines("video.log")[-2:]
-    assert [v["set"] for v in videos] == ["fx12test", "fx12test"] and all(v["legend"] for v in videos)
-    assert videos[0]["panels"] == [f"fav2_{TAG}=favourite #2, seed 52 (live)"] + [f"fav2seed{s}_{TAG}=favourite #2, seed {s}" for s in (54, 56, 57)]
-    assert videos[1]["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(videos[1]["panels"]) == 3
-    assert videos[1]["panels"][1].endswith("=fxreal8 step 750") and videos[1]["panels"][2].endswith("=fxreal8 step 1000")
-    yard = vol.root / "eval/fxa/yard"
-    assert (yard / "yard_seeds.mp4").exists() and (yard / "yard_models.mp4").exists() and (vol.root / "eval/yard_review.tar").exists()
+    assert seeds[54]["fresh"] is not None and [m["model"] for m in res["models"]] == ["fxreal8 step 750"]
+    assert res["models"][0]["seeds"] == [52, 54, 56]
+    assert res["control"]["fresh"]["ok"] and res["control"]["old"]["ok"] and res["control"]["seeds_old"]["seeds"] == [53, 54, 55, 56, 57]
+    assert res["seed_average"]["fresh"]["seeds"] == [53, 54, 55, 56, 57] and res["seed_agreement"]["rank_correlation"] == pytest.approx(1.0)
+    assert res["seed_pick"] == [] and res["seed_show"] == [54, 56, 57]       # two clips cannot prove a seed; the best three are shown
+    assert res["real"]["clips"] == 6 and res["real"]["all"]["colour_de"] == {"real": 9.0, "fav2": 12.0, "clips": 6}
+    # the real videos: laid out once, scored alone on the sets that have them (the owner's own photos have none)
+    assert [x["sets"] for x in vol.lines("worn.log")] == [["fx6test", "dress10", "fx12test"]]
+    assert [(x["set"], x["models"]) for x in vol.lines("worn_score.log")] == [(s, ["worn"]) for s in ("fx6test", "dress10", "fx12test")]
+    # the videos: per garment type on the fresh clips, dresses first; the three best seeds side by side, then the save
+    videos = vol.lines("video.log")[-4:]
+    assert [v["set"] for v in videos] == ["y_dresses", "y_dresses", "y_tops", "y_tops"] and all(v["legend"] for v in videos)
+    for seeds_video, models_video in (videos[:2], videos[2:]):
+        assert seeds_video["panels"] == [f"fav2_{TAG}=favourite #2, seed 52 (live)"] + [f"fav2seed{s}_{TAG}=favourite #2, seed {s}" for s in (54, 56, 57)]
+        assert models_video["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(models_video["panels"]) == 2
+        assert models_video["panels"][1].endswith("=fxreal8 step 750") and models_video["panels"][1].startswith("fx8750x")
+    for f in ("yard_seeds_dresses", "yard_models_dresses", "yard_seeds_tops", "yard_models_tops"):
+        assert (yard / f"{f}.mp4").exists(), f
+    assert not (yard / "yard_seeds_bottoms.mp4").exists() and (vol.root / "eval/yard_review.tar").exists()
+    # the training runs' own review sets are not touched: the yardstick's are y_...
+    assert (vol.root / "eval/fxa/y_dresses.json").exists() and (vol.root / "eval/fxa/g_dresses.json").exists()
     _no_two_scorers_at_once(vol.lines("score.log"))
     # started again: nothing is rendered or scored twice, the report is made again
-    n_render, n_score = len(vol.lines("render.log")), len(vol.lines("score.log"))
+    n_render, n_score, n_worn = len(vol.lines("render.log")), len(vol.lines("score.log")), len(vol.lines("worn_score.log"))
     p, out2, _ = _yard(vol)
     assert p.returncode == 0 and "YARD_DONE" in out2 and "YARD YARD_SEED favourite #2 at seed 54" in out2
     assert len(vol.lines("render.log")) == n_render and len(vol.lines("score.log")) == n_score
+    assert len(vol.lines("worn_score.log")) == n_worn and "YARD YARD_REAL the same garments as really worn (6 real videos)" in out2
+
+
+def test_the_yardstick_run_carries_on_when_the_real_videos_cannot_be_scored_and_can_do_the_few_seeds_only(vol):
+    vol.run(**_fx8_env(vol), AZ_AA_SEEDS="53 54 55 56 57")
+    n_render = len(vol.lines("render.log"))
+    p, out, _ = _yard(vol, STUB_FAIL_WORN="1", AZ_YARD_ALL_SEEDS="0", AZ_YARD_CONTROL="0")
+    assert p.returncode == 0 and "YARD_DONE" in out, out[-3000:]
+    assert "NOTE: the real videos could not be scored" in out and "YARD_REAL" not in out and "YARD YARD_SEED favourite #2 at seed 54" in out
+    # the earlier choice of seeds is still there: the best three, one from the middle, the worst; and no control
+    assert "2. seeds from the sweep: best on the old clips 54 56 57; for comparison (middle, worst) 53 55" in out
+    assert "YARD_CONTROL" not in out and not [r for r in vol.lines("render.log")[n_render:] if r["name"].startswith("fav2again")]
+    # AZ_WORN=0 leaves the real videos out without a note
+    p, out, _ = _yard(vol, AZ_WORN="0", AZ_YARD_CONTROL="0")
+    assert p.returncode == 0 and "YARD_DONE" in out and "the real videos" not in out and "YARD_REAL" not in out
 
 
 def test_the_yardstick_run_without_a_sweep_or_without_money_stops_before_the_gpu_is_used(vol):

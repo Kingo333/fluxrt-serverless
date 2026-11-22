@@ -198,7 +198,42 @@ def test_where_links_are_not_possible_the_videos_are_copied(tmp_path, monkeypatc
     assert not d.is_symlink() and {p.name for p in d.iterdir()} == {"input.mp4", "ref.jpg", "out_fav2.mp4", "out_new.mp4"}
 
 
+def test_the_yardstick_run_names_its_review_sets_apart_so_the_training_runs_keep_theirs(tmp_path, capsys):
+    from eval import garment_mix
+    fxa = _results(tmp_path)
+    garment_mix.build(tmp_path, ["dress10", "fx6test", "cases5"], per_type=4)
+    before = (fxa / "g_dresses.json").read_text()
+    rep = garment_mix.main([str(tmp_path), "--sets", "fx6test", "--per-type", "2", "--prefix", "y_"])
+    assert {t: r["set"] for t, r in rep.items()} == {"dresses": "y_dresses", "tops": "y_tops", "bottoms": "y_bottoms"}
+    assert [it["key"] for it in json.loads((fxa / "y_tops.json").read_text())] == ["t1", "t2"]
+    assert (fxa / "results/y_tops/t1/out_new.mp4").read_text() == "fx6test/t1/out_new.mp4"
+    assert (fxa / "g_dresses.json").read_text() == before and (fxa / "results/g_dresses").is_dir()
+    with pytest.raises(SystemExit):
+        garment_mix.main([str(tmp_path), "--sets", "fx6test", "--prefix", "../x"])
+
+
 # ---------------------------------------------------------------- the wiring in the Pod script
+def test_the_yardstick_pod_script_has_the_control_every_seed_and_the_real_videos():
+    s = (ROOT / "training/fluxrt_lora/fxb_yard.sh").read_text()
+    assert "rm -rf" not in s and "rm -r " not in s                              # nothing on the volume is ever removed by folder
+    assert 'ALL_SEEDS="${AZ_YARD_ALL_SEEDS:-1}"' in s and 'CONTROL="${AZ_YARD_CONTROL:-1}"' in s
+    assert 'MODELS="${AZ_YARD_MODELS-fxreal8:750}"' in s
+    # the order of the list is the order of worth when the money ends early
+    order = ['job "fav2again_$TAG" "favourite #2 rendered again" "$LIVE_SEED"', "model_jobs live", 'job "fav2seed${sd}_$TAG" fav2 "$sd"',
+             "model_jobs rest"]
+    at = [s.index(x) for x in order]
+    assert at == sorted(at)
+    # the real videos: laid out, scored alone by the usual scorers, read by the report; a failure there is only a note
+    assert '-m eval.worn_reference "$AZ_ROOT" --sets $SETS --out "$E/worn"' in s
+    assert '-m eval.garment_report score "$d" --models worn --baseline worn' in s and '--worn "$Y/worn"' in s
+    assert 'if [ "${AZ_WORN:-1}" = "1" ]; then' in s and "NOTE: the real videos could not be scored" in s
+    # the videos: per garment type, dresses first, on sets of their own
+    assert "--prefix y_" in s and "for t in dresses tops bottoms; do" in s
+    assert 'video "y_$t" "yard_seeds_$t" "${PS[@]}"' in s and 'video "y_$t" "yard_models_$t" "${PM[@]}"' in s
+    # never an endpoint, never a training
+    assert "run_train" not in s and "endpoint" not in s.replace("never touches an endpoint", "")
+
+
 def test_the_pod_script_reports_and_films_each_garment_type():
     s = SCRIPT.read_text()
     assert 'AA_SEEDS="${AZ_AA_SEEDS:-53}"' in s and 'register "aa$sd"' in s and '"--seed $sd"' in s
