@@ -230,6 +230,8 @@ def test_the_yardstick_pod_script_has_the_control_every_seed_and_the_real_videos
     # the videos: per garment type, dresses first, on sets of their own
     assert "--prefix y_" in s and "for t in dresses tops bottoms; do" in s
     assert 'video "y_$t" "yard_seeds_$t" "${PS[@]}"' in s and 'video "y_$t" "yard_models_$t" "${PM[@]}"' in s
+    # a set may take two hours to render before it is cut off (a clip took a minute on 2026-11-22, not 20 seconds)
+    assert 'timeout -s INT "${AZ_RENDER_MIN:-120}m" $G' in s
     # never an endpoint, never a training
     assert "run_train" not in s and "endpoint" not in s.replace("never touches an endpoint", "")
 

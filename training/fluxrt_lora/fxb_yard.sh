@@ -23,9 +23,10 @@
 #      favourite #2 at EVERY seed of the sweep in eval/fxa/fx6b, best on the old clips first (AZ_YARD_ALL_SEEDS=0:
 #      only the best AZ_TOP_SEEDS_N (3), one from the middle and the worst; AZ_YARD_SEEDS="54 61" names them
 #      instead); last the models at the best AZ_MODEL_SEEDS_N (2) seeds
-#   3. renders (GPU, one after the other; clips that have a video are never rendered again) and scores (CPU, beside
-#      it; scores an earlier run made on the old clips are reused). The real videos are scored beside it
-#      (AZ_WORN=0 leaves them out).
+#   3. renders (GPU, one after the other; clips that have a video are never rendered again; one set may take up to
+#      AZ_RENDER_MIN minutes, default 120: on 2026-11-22 a clip took about a minute, three times the sweep's pace,
+#      and 50 minutes would have cut a 48-clip set off) and scores (CPU, beside it; scores an earlier run made on
+#      the old clips are reused). The real videos are scored beside it (AZ_WORN=0 leaves them out).
 #   4. the report: YARD lines (eval/fxa/yard/yardstick.json), labelled videos per garment type on the fresh clips,
 #      dresses first (yard_seeds_<type>.mp4: favourite #2 at the live seed next to the three best seeds;
 #      yard_models_<type>.mp4: next to the models; AZ_GARMENT_CLIPS clips each, default 8), eval/yard_review.tar.
@@ -164,13 +165,14 @@ SETS="$OLD${FRESH:+ $FRESH}"
 
 G="$PY -m eval.generate_fluxrt --model-dir $C/FLUX.2-klein-4B --size 288x512 --steps 2 --prompt-style live --ref-size $REF_SIZE"
 render() {  # set, name, weights, extra renderer arguments -> 0 when every clip of the set has that video
-  local s="$1" n="$2" w="$3" x="${4:-}" want have
+  local s="$1" n="$2" w="$3" x="${4:-}" want have fps
   want=$(n_items "$s"); have=$(n_videos "$s" "$n")
   [ "$want" -gt 0 ] && [ "$have" -ge "$want" ] && return 0
-  ( cd "$T" && timeout -s INT 50m $G --lora "$w" --name "$n" $x --clip-list "$E/$s.json" --staging "$S/vivid" --out "$R/$s" --max-items 200 ) \
+  ( cd "$T" && timeout -s INT "${AZ_RENDER_MIN:-120}m" $G --lora "$w" --name "$n" $x --clip-list "$E/$s.json" --staging "$S/vivid" --out "$R/$s" --max-items 200 ) \
     > "$Y/render_${s}_$n.log" 2>&1
   have=$(n_videos "$s" "$n")
-  say "render $s/$n: $(grep -c '"model"' "$Y/render_${s}_$n.log") new clips, $have of $want"
+  fps=$(grep '"model"' "$Y/render_${s}_$n.log" | tail -n 1 | sed -n 's/.*"fps": *\([0-9.]*\).*/\1/p')   # the renderer's own speed
+  say "render $s/$n: $(grep -c '"model"' "$Y/render_${s}_$n.log") new clips, $have of $want${fps:+ ($fps frames a second)}"
   [ "$have" -gt 0 ] && [ "$have" -ge $(( want * 9 / 10 )) ]
 }
 json_ok() {  # files: each is there AND can be read (a Pod that stops in the middle of a write leaves half a file)

@@ -139,7 +139,8 @@ elif mod == "eval.generate_fluxrt":
     for clip in ("c1", "c2"):
         d = out / clip; d.mkdir(parents=True, exist_ok=True)
         if not (d / f"out_{name}.mp4").exists():
-            (d / f"out_{name}.mp4").write_text("video"); new += 1; print(json.dumps({"model": name, "clip": clip}))
+            (d / f"out_{name}.mp4").write_text("video"); new += 1
+            print(json.dumps({"key": clip, "model": name, "clip": clip, **({"fps": 2.61} if os.environ.get("STUB_FPS") else {})}))
     log("render.log", {"name": name, "set": out.name, "seed": opt("--seed"), "steady": opt("--steady-blend"), "new": new,
                        "t": time.time()})
     if os.environ.get("STUB_RENDER_MIN"):                  # the made-up clock (Volume.fake_clock): a render takes this long
@@ -953,8 +954,9 @@ def test_the_yardstick_run_stops_at_its_money_limit_and_a_second_start_after_a_t
     n_render = len(vol.lines("render.log"))
     yard = vol.root / "eval/fxa/yard"
     # $8.40 on the account: (8.40 - 1.50) / 2.80 an hour = 147 minutes; every render here takes 40 of them
-    p, out, _ = _yard(vol, AZ_SPENT="83.30", AZ_BALANCE="8.40", STUB_RENDER_MIN="40")
+    p, out, _ = _yard(vol, AZ_SPENT="83.30", AZ_BALANCE="8.40", STUB_RENDER_MIN="40", STUB_FPS="1")
     assert p.returncode == 0 and "YARD_DONE" in out, out[-3000:]
+    assert f"render fx12test/fav2_{TAG}: 2 new clips, 2 of 2 (2.61 frames a second)" in out      # the renderer's own speed
     assert "RunPod balance $8.40 (keeping $1.50): 147 min allowed" in out
     # the limit falls in the middle of the control (three of its four sets rendered): unfinished, not a failed try
     assert f"money limit reached: fav2again_{TAG} is left unfinished, the remaining renders are left out" in out
