@@ -34,6 +34,9 @@
 # and scored when the money ends is kept, and the report is made from it. Both limits are fixed when the script
 # starts: a top-up during the run is not seen. Safe to start again, with AZ_SPENT = the total the log shows and
 # AZ_BALANCE = the balance RunPod shows then: nothing is rendered or scored twice, the report is made again.
+# AZ_BALANCE must be money that IS on the account: with promised money in it the script cannot stop itself before
+# RunPod stops the Pod at a balance of 0, in the middle of whatever it is writing (eval.half_files then cleans up
+# on the next start).
 #
 #   curl -fsSL https://raw.githubusercontent.com/Kingo333/fluxrt-serverless/<SHA>/training/fluxrt_lora/fxb_yard.sh -o /workspace/fxb_yard.sh
 #   AZ_REF=<SHA> AZ_SPENT=86.00 AZ_CAP=100 AZ_PRICE=2.80 AZ_BALANCE=40.00 nohup bash /workspace/fxb_yard.sh >> /workspace/yard.log 2>&1 &
@@ -125,6 +128,13 @@ FAV_SUM=$(sha256sum "$INIT_W" | cut -c1-64)
 case "$FAV_SUM" in "$FAV2_SHA"*) ;; *) fail "WRONG_FAVOURITE2: $INIT is ${FAV_SUM:0:8}..., expected $FAV2_SHA...";; esac
 say "0. favourite #2 confirmed (${FAV_SUM:0:8}...)"
 mkdir -p "$Y"
+# a Pod that was stopped while it wrote a video or a segmentation file (a restart by hand, RunPod stopping it when
+# the balance is used up) leaves half a file, which counts as made and then breaks the scoring. The files of the
+# last AZ_CHECK_HOURS (72) hours are opened once; one that cannot be read is moved aside (name.bad) and made again.
+HV=""; [ "${AZ_CHECK_VIDEOS:-1}" = "1" ] || HV="--no-videos"
+( cd "$T" && "$PY" -m eval.half_files "$R" "$E/worn" --yard "$Y" --hours "${AZ_CHECK_HOURS:-72}" $HV ) > "$Y/halves.log" 2>&1 \
+  || say "NOTE: the check for half-written files could not run (see $Y/halves.log)"
+grep "^HALVES" "$Y/halves.log" | sed 's/^/YARD /'
 
 # ---- 1. the test clips: the old sets as they are, and a fresh set no run has used
 SETS=""

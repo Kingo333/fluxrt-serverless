@@ -49,7 +49,7 @@ fi
 if [ "$1" = "-m" ]; then
   mod="$2"; shift 2
   case "$mod" in
-    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix|eval.yardstick) exec "$REAL" -m "$mod" "$@";;   # the real tools
+    fluxrt_lora.pick_best_save|fluxrt_lora.lora_geometry|eval.garment_mix|eval.yardstick|eval.half_files) exec "$REAL" -m "$mod" "$@";;   # the real tools
     fluxrt_lora.merge_lora|eval.generate_fluxrt|eval.garment_report|eval.step_a|eval.worn_reference) exec "$REAL" "$STUB_DIR/tools.py" "$mod" "$@";;
   esac
   echo "unexpected module $mod" >&2; exit 3
@@ -342,6 +342,7 @@ class Volume:
             "STUB_PY": sys.executable,
             "AZ_ROOT": str(r), "AZ_REF": "testref", "AZ_SPENT": "53.17", "AZ_CAP": "65", "AZ_PRICE": "2.80",
             "AZ_BALANCE": "13.00", "AZ_TEXT_CACHE_DIR": str(tmp / "textcache"), "RUNPOD_POD_ID": "testpod",
+            "AZ_CHECK_VIDEOS": "0",                        # the stand-in videos are not videos
             "AZ_FAV2_SHA": _sha8(lora / "blend05s065/pytorch_lora_weights.safetensors"),
             "AZ_START_SHA": _sha8(lora / "fxreal6/pytorch_lora_weights.safetensors"),
         }
@@ -973,12 +974,24 @@ def test_the_yardstick_run_stops_at_its_money_limit_and_a_second_start_after_a_t
     (cut / "garment.json").write_text('{"scorecard": [], "items": {"c1": {"fav2se')
     (cut / "face_skin.json").write_text("{}")
     (cut / "stability.json").write_text("{}")
+    # and a segmentation file of the same kind, of a model the first start had marked as failed for it
+    import numpy as np
+    seg = vol.root / "eval/fxa/results/fx12test/c1"
+    np.savez_compressed(seg / f"seg_fav2_{TAG}.npz", cat=np.zeros((2, 4, 4), np.uint8))          # a whole one stays
+    whole = (seg / f"seg_fav2_{TAG}.npz").read_bytes()
+    (seg / f"seg_fav2seed56_{TAG}.npz").write_bytes(whole[: len(whole) // 2])
+    (yard / f"fav2seed56_{TAG}/.failed").touch()
     # the owner tops up; the line is started again with the new balance but the OLD spent figure (the easy mistake):
     # what the first start spent is still counted, so the cap holds
     n_render = len(vol.lines("render.log"))
     p, out2, _ = _yard(vol, AZ_SPENT="83.30", AZ_BALANCE="38.40", STUB_RENDER_MIN="1")
     assert p.returncode == 0 and "YARD_DONE" in out2 and "NOT CHECKED" not in out2 and "money limit reached" not in out2, out2[-3000:]
     assert "earlier starts with this same AZ_SPENT spent $7." in out2 and "already spent $90." in out2
+    # the half segmentation file is moved aside, not deleted, and its model is no longer left out
+    assert "YARD HALVES 2 files written in the last 72 hours opened (videos NOT checked): 1 cannot be read and were moved aside" in out2
+    assert (seg / f"seg_fav2seed56_{TAG}.npz.bad").exists() and not (seg / f"seg_fav2seed56_{TAG}.npz").exists()
+    assert (seg / f"seg_fav2_{TAG}.npz").exists() and (yard / f"fav2seed56_{TAG}/.failed.old").exists()
+    assert (yard / f"fav2seed56_{TAG}/.scored").exists() and not (yard / f"fav2seed56_{TAG}/.failed").exists()
     assert "RunPod balance $38.40 (keeping $1.50)" in out2                   # the balance was read again: taken as given
     second = vol.lines("render.log")[n_render:]
     # nothing is rendered twice: the control only on the set it lacked, then the rest of the list
