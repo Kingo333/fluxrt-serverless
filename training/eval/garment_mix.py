@@ -10,6 +10,12 @@ folder (a link; a copy of the videos where links are not possible), so nothing i
 `eval.step_a video ROOT --set g_dresses ...` then makes the dresses-only video from the videos that are there.
 Prints one GARMENT_SETS line. --prefix names the lists (g_dresses, ...): the yardstick run uses y_ so that the
 training runs' review sets stay as they are.
+
+--outerwear (owner's review, 2026-11-23: a long coat came out as a cropped jacket): the test clips file coats and
+jackets as tops, and a top's wording tells the model that the trousers or skirt stay as they are. This writes
+<prefix>coats instead: the tops whose name or description says coat, jacket, blazer, trench, parka or puffer, with
+the category "outerwear" ("worn over the current outfit"), pointing at the same clip folders, so the same clips
+can be rendered once more with that wording and looked at side by side.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from pathlib import Path
 from fluxrt_lora.pick_best_save import GARMENT_TYPES, garment_type
 
 WORD = {"dresses": "dress", "tops": "top / shirt", "bottoms": "trousers / bottoms"}
+OUTER_WORDS = ("coat", "jacket", "blazer", "trench", "parka", "puffer")
 
 
 def in_turn(groups: list[list], n: int) -> list:
@@ -89,15 +96,53 @@ def build(root: Path, sets: list[str], per_type: int = 8, prefix: str = "g_") ->
     return report
 
 
+def build_outerwear(root: Path, sets: list[str], per: int = 8, prefix: str = "g_") -> dict:
+    """<prefix>coats: up to `per` tops that are really coats or jackets, as outerwear, on their own clip folders."""
+    fxa = root / "eval/fxa"
+    res = fxa / "results"
+    name = f"{prefix}coats"
+    rows = []
+    for s in sets:
+        try:
+            items = json.loads((fxa / f"{s}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict) or garment_type(it.get("category")) != "tops" or not it.get("key"):
+                continue
+            words = f"{it.get('name') or ''} {it.get('description') or ''}".lower()
+            if any(w in words for w in OUTER_WORDS) and (res / s / str(it["key"])).is_dir():
+                rows.append((s, it))
+    rows = rows[:per]
+    if not rows:
+        (fxa / f"{name}.json").unlink(missing_ok=True)
+        print("GARMENT_SETS coats: none of the tops is a coat or a jacket by its name or description")
+        return {}
+    (res / name).mkdir(parents=True, exist_ok=True)
+    items, used = [], set()
+    for i, (s, it) in enumerate(rows, 1):
+        key = str(it["key"]) if str(it["key"]) not in used else f"{s}_{it['key']}"
+        used.add(key)
+        _point_at(res / name / key, res / s / str(it["key"]))
+        items.append({**{k: v for k, v in it.items() if k != "prompt"}, "key": key, "category": "outerwear",
+                      "case": f"coat or jacket {i} of {len(rows)} (test set {s})", "from_set": s})
+    (fxa / f"{name}.json").write_text(json.dumps(items, indent=1))
+    print(f"GARMENT_SETS coats: {len(items)} tops that are coats or jackets, from {', '.join(sorted({s for s, _ in rows}))}")
+    return {"coats": {"set": name, "clips": len(items), "from": sorted({s for s, _ in rows})}}
+
+
 def main(argv=None) -> dict:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default="/workspace/azyah-vton")
     ap.add_argument("--sets", nargs="+", required=True)
     ap.add_argument("--per-type", type=int, default=8)
     ap.add_argument("--prefix", default="g_", help="the lists are <prefix>dresses, <prefix>tops, <prefix>bottoms")
+    ap.add_argument("--outerwear", action="store_true", help="only <prefix>coats: the tops that are coats, as outerwear")
     a = ap.parse_args(argv)
     if not a.prefix or not a.prefix.replace("_", "").isalnum():
         ap.error("--prefix: letters, digits and _ only")
+    if a.outerwear:
+        return build_outerwear(Path(a.root), a.sets, a.per_type, a.prefix)
     return build(Path(a.root), a.sets, a.per_type, a.prefix)
 
 

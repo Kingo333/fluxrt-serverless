@@ -41,7 +41,11 @@
 #   folder (eval/fxa/settings, eval/settings_review.tar), AZ_YARD_SEEDS=none AZ_YARD_MODELS="" AZ_YARD_CONTROL=0
 #   leave everything else out, and AZ_WORN=0 AZ_WORN_SCORES=<yard>/worn reads the real videos' scores of the
 #   yardstick run. Nothing is trained and nothing that is live is touched: whether the live worker changes is the
-#   owner's call.
+#   owner's call. The owner's own review of the videos (2026-11-23) found the main fault to be a garment's SHAPE
+#   (dresses too short or too straight, a long coat cut to a jacket, special details made plain), which these
+#   measures do not see: the videos show up to four settings beside favourite #2 for the eye, and AZ_YARD_COATS=1
+#   renders the tops that are coats once more as outerwear ("worn over the current outfit": a top's wording tells
+#   the model that the trousers or skirt stay) into one more video, yard_coats.mp4.
 # Money: never past AZ_CAP (counting AZ_SPENT) nor past AZ_BALANCE minus AZ_BALANCE_KEEP (1.50); what is rendered
 # and scored when the money ends is kept, and the report is made from it. Both limits are fixed when the script
 # starts: a top-up during the run is not seen. Safe to start again, with AZ_SPENT = the total the log shows and
@@ -73,6 +77,7 @@ MODELS="${AZ_YARD_MODELS-fxreal8:750}"
 ALL_SEEDS="${AZ_YARD_ALL_SEEDS:-1}"
 CONTROL="${AZ_YARD_CONTROL:-1}"
 SETTINGS="${AZ_YARD_SETTINGS:-}"             # favourite #2 at other live settings: steps:strength[:WxH] ...
+COATS="${AZ_YARD_COATS:-0}"                  # 1: the tops that are coats, once more with the wording of outerwear
 NAME="${AZ_YARD_NAME:-yard}"                 # this run's folder under eval/fxa, and the name of its review file
 case "$NAME" in *[!a-z0-9_]*|"") echo "YARD STOPPED: BAD_AZ_YARD_NAME: $NAME (small letters, digits and _ only)"; exit 1;; esac
 WEIGHTS="${AZ_SET_WEIGHTS:-fx6test=1,dress10=1,cases5=0.5,$FRESH=2}"
@@ -400,6 +405,18 @@ for row in "${JOBS[@]}"; do
     [ "$(wc -l < "$Y/$n/.render_tries")" -ge 3 ] && { say "NO_RENDERS for $n after 3 tries: left out (see $Y/render_*_$n.log)"; touch "$Y/$n/.failed"; }
   fi
 done
+# Coats and jackets are filed as tops in the test clips, and a top's wording tells the model that the trousers or
+# skirt stay as they are: a long coat then comes out as a cropped jacket (owner's review, 2026-11-23). The same
+# clips once more as favourite #2 runs live, but told that the garment is worn over the outfit. For the eye only.
+COAT_SET=""
+if [ "$COATS" = "1" ] && ! out_of_money; then
+  ( cd "$T" && "$PY" -m eval.garment_mix "$AZ_ROOT" --sets $SETS --per-type "${AZ_GARMENT_CLIPS:-8}" --prefix y_ --outerwear ) > "$Y/coats.log" 2>&1 || true
+  grep "^GARMENT_SETS" "$Y/coats.log" | sed 's/^/YARD /'
+  if [ -f "$E/y_coats.json" ]; then
+    if render y_coats "fav2coat_$TAG" "$INIT_W" ""; then COAT_SET=y_coats
+    else say "NOTE: the coats could not be rendered as outerwear (see $Y/render_y_coats_fav2coat_$TAG.log)"; fi
+  fi
+fi
 touch "$Y/.renders_done"
 say "4. renders done; finishing the scores (the money limit leaves $(( $(left_min) - END_MIN )) min)"
 while kill -0 "$SCORE_PID" 2>/dev/null; do
@@ -462,6 +479,8 @@ if [ "$(left_min)" -gt 4 ]; then
     video "y_$t" "yard_models_$t" "${PM[@]}"
     MADE=1
   done
+  [ -n "$COAT_SET" ] && [ "$(left_min)" -gt 2 ] && video "$COAT_SET" yard_coats \
+    "$FAV=favourite #2, told it is a top" "fav2coat_$TAG=favourite #2, told it is worn over the outfit"
   if [ "$MADE" = 0 ]; then   # no clip list says what its clips are: one video of the whole set each
     VSET="${FRESH:-$(echo $OLD | cut -d' ' -f1)}"
     video "$VSET" yard_seeds "${PS[@]}"

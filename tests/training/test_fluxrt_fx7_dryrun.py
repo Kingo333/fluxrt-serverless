@@ -199,7 +199,9 @@ elif mod == "eval.worn_reference":
     log("worn.log", {"sets": made})
 elif mod == "eval.step_a" and args[0] == "pick":
     root, s = Path(args[1]), opt("--set")
-    items = [{"key": f"c{i + 1}", "category": ("tops", "dresses")[i], "case": s} for i in range(min(int(opt("--n")), 2))]
+    items = [{"key": f"c{i + 1}", "category": ("tops", "dresses")[i], "case": s,
+              "description": ("a long caramel leather coat with buttons", "a black ruffled dress")[i],
+              "prompt": "the wording of a top"} for i in range(min(int(opt("--n")), 2))]
     (root / "eval/fxa" / f"{s}.json").write_text(json.dumps(items))
     log("pick.log", {"set": s, "n": opt("--n"), "auto": "--auto-describe" in args})
 elif mod == "eval.step_a":
@@ -1034,7 +1036,7 @@ def test_the_live_settings_test_renders_favourite_2_at_other_steps_strengths_and
     n_render, n_env = len(vol.lines("render.log")), len(vol.lines("train_env.log"))
     env = {"AZ_YARD_NAME": "settings", "AZ_YARD_SEEDS": "none", "AZ_YARD_MODELS": "", "AZ_YARD_CONTROL": "0", "AZ_WORN": "0",
            "AZ_WORN_SCORES": str(yard / "worn"), "AZ_YARD_SETTINGS": "4:1.00 4:1.54 3:1.00 2:1.00:432x768",
-           "AZ_SPENT": "99.68", "AZ_CAP": "110", "AZ_BALANCE": "20.00", "STUB_FPS": "1"}
+           "AZ_YARD_COATS": "1", "AZ_SPENT": "99.68", "AZ_CAP": "110", "AZ_BALANCE": "20.00", "STUB_FPS": "1"}
     p, out, _ = _yard(vol, **env)
     assert p.returncode == 0 and "YARD_DONE" in out and "NOT CHECKED" not in out, out[-3000:]
     assert "already spent $99.68" in out and "2. no seeds in this run" in out
@@ -1042,6 +1044,8 @@ def test_the_live_settings_test_renders_favourite_2_at_other_steps_strengths_and
     # favourite #2's own file, the live seed, on every clip; the settings as the last arguments, in the order given
     new = vol.lines("render.log")[n_render:]
     names = [f"fav2st4s100_{TAG}", f"fav2st4s154_{TAG}", f"fav2st3s100_{TAG}", f"fav2st2s100px432_{TAG}"]
+    coat = [r for r in new if r["name"] == f"fav2coat_{TAG}"]
+    new = [r for r in new if r["name"] != f"fav2coat_{TAG}"]
     assert [r["name"] for r in new] == [n for n in names for _ in range(4)] and all(r["seed"] is None and r["new"] == 2 for r in new)
     by = {r["name"]: r for r in new}
     assert [(by[n]["steps"], by[n]["scale"], by[n]["render_size"]) for n in names] == [
@@ -1057,17 +1061,26 @@ def test_the_live_settings_test_renders_favourite_2_at_other_steps_strengths_and
     assert "YARD_SEED" not in out and "YARD_CONTROL" not in out
     assert f"render fx12test/fav2st4s100_{TAG}: 2 new clips, 2 of 2 (2.61 frames a second)" in out
     res = json.loads((sett / "yardstick.json").read_text())
-    assert len(res["models"]) == 4 and len(res["model_show"]) == 3 and res["seeds"] == []
+    assert len(res["models"]) == 4 and len(res["model_show"]) == 4 and res["seeds"] == []
+    # the top that is a coat: once more as favourite #2 runs live (2 steps, its own strength), but as outerwear
+    assert "YARD GARMENT_SETS coats: 1 tops that are coats or jackets, from fx12test" in out
+    assert [(r["set"], r["steps"], r["scale"], r["seed"]) for r in coat] == [("y_coats", "2", None, None)]
+    coats = json.loads((vol.root / "eval/fxa/y_coats.json").read_text())
+    assert [(c["key"], c["category"], c["from_set"]) for c in coats] == [("c1", "outerwear", "fx12test")] and "prompt" not in coats[0]
+    assert json.loads((vol.root / "eval/fxa/fx12test.json").read_text())[0]["category"] == "tops"       # the test set is as it was
     # its own folder and review file; the yardstick run's are as they were
     assert (vol.root / "eval/settings_review.tar").exists() and (yard / "yardstick.json").read_text() == before
     assert json.loads((sett / f"fav2st4s154_{TAG}/meta.json").read_text())["args"] == "--steps 4 --lora-scale 1.54"
     # the videos: favourite #2 as live next to the three settings the report puts first, per garment type
-    videos = vol.lines("video.log")[-2:]
-    assert [v["set"] for v in videos] == ["y_dresses", "y_tops"]
-    for v in videos:
-        assert v["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(v["panels"]) == 4
+    videos = vol.lines("video.log")[-3:]
+    assert [v["set"] for v in videos] == ["y_dresses", "y_tops", "y_coats"]
+    for v in videos[:2]:                                     # all four settings beside favourite #2: shape is for the eye
+        assert v["panels"][0] == f"fav2_{TAG}=favourite #2 (today)" and len(v["panels"]) == 5
         assert [x.split("=")[0] for x in v["panels"][1:]] == res["model_show"]
+    assert videos[2]["panels"] == [f"fav2_{TAG}=favourite #2, told it is a top",
+                                   f"fav2coat_{TAG}=favourite #2, told it is worn over the outfit"]
     assert (sett / "yard_models_dresses.mp4").exists() and not (sett / "yard_seeds_dresses.mp4").exists()
+    assert (sett / "yard_coats.mp4").exists()
     # a setting that cannot be read stops the run before the GPU is used
     for bad in ("4", "4:1.5", "9:1.00", "4:1.00:big"):
         n = len(vol.lines("render.log"))

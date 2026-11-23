@@ -355,7 +355,7 @@ def test_the_real_videos_of_the_same_garments_are_shown_next_to_favourite_2_meas
     res, out = _run(yard, capsys, worn=yard / "worn")
     assert ("YARD_REAL the same garments as really worn (82 real videos) next to favourite #2 at seed 52 on the same garments: "
             "colour distance from the photo: real 9.0, favourite #2 12.0 | light-dark spread (1 = the photo's): real x2.00, "
-            "favourite #2 x2.20 | dress length (1 = the photo's): real x0.98, favourite #2 x0.90 | shape jitter: real 0.010, "
+            "favourite #2 x2.20 | dress length over waist width (1 = the photo's): real x0.98, favourite #2 x0.90 | shape jitter: real 0.010, "
             "favourite #2 0.020 | wobble: real 0.01, favourite #2 0.02 | colour wander: real 0.50, favourite #2 1.00 | "
             "sharpness: real 2.0, favourite #2 1.0") in out
     assert res["real"]["clips"] == 82 and res["real"]["all"]["length_ratio"]["clips"] == 34   # the dresses only
@@ -431,21 +431,24 @@ def test_a_model_is_read_against_the_real_videos_where_favourite_2_stands_apart_
             v["worn"]["length_ratio"] = 0.98
         g.write_text(json.dumps(d))
     res, out = _run(yard, capsys, worn=yard / "worn")
-    assert ("YARD_GAPS favourite #2, 4 steps: dress length x1.04 (favourite #2 x1.15, real x0.98): nearer to real | "
+    assert ("YARD_GAPS favourite #2, 4 steps: "
             "colour flicker on tops 1.90 (favourite #2 2.50, real 1.80): nearer to real | "
             "light-dark spread on dresses x1.90 (favourite #2 x1.60, real x2.00): nearer to real | "
             "light-dark spread on tops x1.90 (favourite #2 x1.60, real x2.00): nearer to real | "
             "light-dark spread on bottoms x1.90 (favourite #2 x1.60, real x2.00): nearer to real") in out
-    assert "YARD_GAPS favourite #2, 3 steps: dress length x1.15 (favourite #2 x1.15, real x0.98): as near to real" in out
-    assert "YARD_GAPS favourite #2, 4 steps, strength x1.54: dress length x1.30 (favourite #2 x1.15, real x0.98): further from real" in out
+    assert "YARD_GAPS favourite #2, 3 steps: colour flicker on tops 2.50 (favourite #2 2.50, real 1.80): as near to real" in out
+    assert "YARD_GAPS favourite #2, 4 steps, strength x1.54: colour flicker on tops 3.40 (favourite #2 2.50, real 1.80): further from real" in out
+    # the dress length is not judged here: the figure is length over waist width, and the owner's review (2026-11-23)
+    # showed dresses coming out too short where it said longer. Length and shape are for the eye, in the videos.
+    assert "dress length" not in "".join(l for l in out.splitlines() if l.startswith("YARD_GAPS"))
     assert res["gaps"]["favourite #2, 4 steps"]["flicker_de:tops"] == {"model": pytest.approx(1.9), "fav2": pytest.approx(2.5),
                                                                        "real": pytest.approx(1.8), "clips": 24, "word": "nearer to real"}
-    assert res["gaps"]["favourite #2, 4 steps"]["length_ratio:dresses"]["clips"] == 34
-    # the three best overall are the ones shown beside favourite #2 in the video, best first, by their render names
-    # (full strength is last: its better colour does not make up for its flicker, which counts in the score)
-    assert res["model_show"] == ["fav2st4s100_r528", "fav2st3s100_r528", "fav2st2s100px432_r528"]
+    assert "length_ratio:dresses" not in res["gaps"]["favourite #2, 4 steps"]
+    # all four are shown beside favourite #2 in the video (the score does not see shape, the eye does), the best
+    # overall first (full strength is last: its better colour does not make up for its flicker)
+    assert res["model_show"] == ["fav2st4s100_r528", "fav2st3s100_r528", "fav2st2s100px432_r528", "fav2st4s154_r528"]
     # 4 steps: colour +20% and flicker +24%, 2 of the 11 measures these records hold
     assert "YARD_MODEL favourite #2, 4 steps against favourite #2 at the same seeds (52), 87 clips: +4.0%" in out
     # without the real videos there are no such lines, and nothing breaks
     res, out = _run(yard, capsys)
-    assert "YARD_GAPS" not in out and "gaps" not in res and len(res["model_show"]) == 3
+    assert "YARD_GAPS" not in out and "gaps" not in res and len(res["model_show"]) == 4

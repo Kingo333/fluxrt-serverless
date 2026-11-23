@@ -212,6 +212,44 @@ def test_the_yardstick_run_names_its_review_sets_apart_so_the_training_runs_keep
         garment_mix.main([str(tmp_path), "--sets", "fx6test", "--prefix", "../x"])
 
 
+def test_tops_that_are_coats_get_a_list_of_their_own_as_outerwear(tmp_path, capsys):
+    """Owner's review, 2026-11-23: a long coat came out as a cropped jacket. The test clips file it as a top, and a
+    top's wording says the trousers stay; as outerwear it is 'worn over the current outfit'."""
+    from data_tools.fluxrt_prompt import fx6_prompt
+    from eval import garment_mix
+    fxa = tmp_path / "eval/fxa"
+    items = {"fx12test": [{"key": "a", "category": "tops", "description": "Long caramel leather COAT", "prompt": "old wording"},
+                          {"key": "b", "category": "tops", "description": "white puff blouse"},
+                          {"key": "c", "category": "dresses", "description": "a coat dress"},          # a dress stays a dress
+                          {"key": "d", "category": "tops", "name": "Cropped denim jacket", "description": None},
+                          {"key": "e", "category": "tops", "description": "a blazer"}],                  # no clip folder
+             "fx6test": [{"key": "a", "category": "upper", "description": "trench in beige"}]}
+    for s, its in items.items():
+        (fxa / "results" / s).mkdir(parents=True)
+        (fxa / f"{s}.json").write_text(json.dumps(its))
+        for it in its:
+            if it["key"] != "e":
+                d = fxa / "results" / s / it["key"]
+                d.mkdir()
+                (d / "input.mp4").write_text(f"{s}/{it['key']}")
+    rep = garment_mix.main([str(tmp_path), "--sets", "fx12test", "fx6test", "--prefix", "y_", "--outerwear"])
+    assert rep == {"coats": {"set": "y_coats", "clips": 3, "from": ["fx12test", "fx6test"]}}
+    coats = json.loads((fxa / "y_coats.json").read_text())
+    assert [(c["key"], c["from_set"], c["category"]) for c in coats] == [("a", "fx12test", "outerwear"), ("d", "fx12test", "outerwear"),
+                                                                        ("fx6test_a", "fx6test", "outerwear")]
+    assert "prompt" not in coats[0] and coats[0]["case"] == "coat or jacket 1 of 3 (test set fx12test)"
+    assert (fxa / "results/y_coats/fx6test_a/input.mp4").read_text() == "fx6test/a"
+    assert "GARMENT_SETS coats: 3 tops that are coats or jackets, from fx12test, fx6test" in capsys.readouterr().out
+    # what the renderer then tells the model: over the outfit, not "the pants or skirt stay as they are"
+    top = fx6_prompt("tops", None, "Long caramel leather coat")
+    over = fx6_prompt(coats[0]["category"], coats[0].get("name"), coats[0]["description"])
+    assert "the pants or skirt stay as they are" in top and "the pants or skirt stay as they are" not in over
+    assert "It is worn over the current outfit" in over
+    # the usual lists are not touched, and no coats means no list
+    assert not (fxa / "y_tops.json").exists()
+    assert garment_mix.build_outerwear(tmp_path, ["nosuchset"], prefix="y_") == {} and not (fxa / "y_coats.json").exists()
+
+
 # ---------------------------------------------------------------- the wiring in the Pod script
 def test_the_yardstick_pod_script_has_the_control_every_seed_and_the_real_videos():
     s = (ROOT / "training/fluxrt_lora/fxb_yard.sh").read_text()
@@ -237,6 +275,9 @@ def test_the_yardstick_pod_script_has_the_control_every_seed_and_the_real_videos
     assert '"--steps $st_steps --lora-scale $st_scale${st_size:+ --render-size $st_size}"' in s
     r = (ROOT / "training/eval/generate_fluxrt.py").read_text()
     assert '"--render-size"' in r and "height=mh, width=mw" in r and "model_frames[i]" in r
+    # the coats: the same clips once more with the wording of outerwear, into a video of their own
+    assert 'COATS="${AZ_YARD_COATS:-0}"' in s and "--prefix y_ --outerwear" in s
+    assert 'render y_coats "fav2coat_$TAG" "$INIT_W" ""' in s and 'video "$COAT_SET" yard_coats' in s
     # never an endpoint, never a training
     assert "run_train" not in s and "endpoint" not in s.replace("never touches an endpoint", "")
 

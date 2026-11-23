@@ -40,9 +40,10 @@ The score is the picker's (fluxrt_lora.pick_best_save): per set, every measure's
   YARD_REAL         --worn: the same garments as REALLY worn (eval.worn_reference: the real videos of the garment
                     photos' own clips, scored like a render) next to favourite #2 on the same garments, measure by
                     measure: the level a perfect try-on would reach. YARD_REAL_GARMENT: per garment type
-  YARD_GAPS         --worn: per model at the live seed, the three places where favourite #2 stands apart from the
-                    real videos (dress length, colour flicker on tops, light-dark spread per garment type): the
-                    model's figure next to favourite #2's and the real videos', and whether it is nearer to real
+  YARD_GAPS         --worn: per model at the live seed, where favourite #2 stands apart from the real videos in a
+                    way these measures can see (colour flicker on tops, light-dark spread per garment type): the
+                    model's figure next to favourite #2's and the real videos', and whether it is nearer to real.
+                    A garment's length and shape are not here: they are judged by eye in the videos
   YARD_RESOLUTION   how small a difference this yardstick shows
   YARD_NOTE         score files that are there but cannot be read (left out, never taken for scores)
 A range that does not include 0 is a real difference ("better" or "worse"); otherwise "no difference shown"; with
@@ -64,7 +65,7 @@ WORN = "worn"                                # the render name of the real video
 # what the real videos are shown with: (key, words, format, a ratio: averaged as a ratio)
 SHOWN = (("colour_de", "colour distance from the photo", "{:.1f}", False), ("likeness", "likeness to the photo", "{:.2f}", False),
          ("fabric_ratio", "light-dark spread (1 = the photo's)", "x{:.2f}", True),
-         ("length_ratio", "dress length (1 = the photo's)", "x{:.2f}", True),
+         ("length_ratio", "dress length over waist width (1 = the photo's)", "x{:.2f}", True),
          ("flicker_de", "colour flicker", "{:.2f}", False), ("jitter", "shape jitter", "{:.3f}", False),
          ("follow_px", "garment off the body's movement", "{:.2f} px", False), ("wobble_garment", "wobble", "{:.2f}", False),
          ("colour_wander", "colour wander", "{:.2f}", False), ("sharpness", "sharpness", "{:.1f}", False))
@@ -175,9 +176,12 @@ def real_against(real: dict, fav: dict, clips=None) -> tuple[str, dict, int]:
     return " | ".join(parts), res, len(both)
 
 
-# where favourite #2 stands apart from the real videos (yardstick run, 2026-11-22): key, words, garment types
-GAPS = (("length_ratio", "dress length", ("dresses",)), ("flicker_de", "colour flicker on tops", ("tops",)),
-        ("fabric_ratio", "light-dark spread", GARMENT_TYPES))
+# where favourite #2 stands apart from the real videos (yardstick run, 2026-11-22): key, words, garment types.
+# The dress length is NOT among them: length_ratio is the dress's length over its narrowest waist row, so a dress
+# that comes out straighter, or with a hand or a bag in front of the waist, reads as "longer". The owner's review
+# of the videos (2026-11-23) showed dresses coming out too SHORT where this figure said 15% longer. Length and
+# shape are judged by eye, in the side-by-side videos.
+GAPS = (("flicker_de", "colour flicker on tops", ("tops",)), ("fabric_ratio", "light-dark spread", GARMENT_TYPES))
 
 
 def entries(yard: Path) -> list[tuple[Path, dict]]:
@@ -592,11 +596,12 @@ def main(argv=None) -> dict:
             print(f"YARD_MODEL_GARMENT {model}: " + " | ".join(f"{t} {rng_txt(v)} {word(v)}, {v['clips']} clips" for t, v in g.items()))
         print(f"YARD_MODEL_AREAS {model}: " + ", ".join(f"{k} {rng_txt(v)}" for k, v in r["areas"].items()))
         out["models"].append({"model": model, "seeds": seeds, "all": r, "fresh": rfr, "garments": g})
-    # the models for the side-by-side video: the three best overall, by the name of their render at the live seed
+    # the models for the side-by-side video: up to four, the best overall first, by the name of their render at the
+    # live seed. Four, not fewer: the score does not see a garment's shape, the owner's eye does.
     names = {(str(meta["model"]), int(meta["seed"])): meta["name"] for _, meta in entries(yard)}
     show = [names[(m["model"], live)] for m in sorted(out["models"], key=lambda m: -m["all"]["score"]) if (m["model"], live) in names]
     if show:
-        out["model_show"] = show[:3]
+        out["model_show"] = show[:4]
     # ---- the same garments as really worn: the level a perfect try-on would reach
     real: dict = {}
     if a.worn and Path(a.worn).is_dir():
