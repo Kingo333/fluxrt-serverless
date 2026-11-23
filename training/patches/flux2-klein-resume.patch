@@ -1,0 +1,39 @@
+diff --git a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+index 4e0982b..ef39a9a 100644
+--- a/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
++++ b/examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py
+@@ -498,6 +498,15 @@ def parse_args(input_args=None):
+             "finite, frame pairs are present) and stop with FX8_SAFETY_FAILED otherwise. 0 = no check."
+         ),
+     )
++    parser.add_argument(
++        "--resume_skip_seen",
++        action="store_true",
++        help=(
++            "Azyah (2026-11-21): after a restart from a save, carry on in the data where that save left off, "
++            "instead of going through the first batches of the pass again (the batch order is fixed, so without "
++            "this a restarted run trains on the very examples it has already seen before any new one). Off: as before."
++        ),
++    )
+     parser.add_argument(
+         "--pair_floor",
+         type=float,
+@@ -2408,10 +2417,18 @@ def main(args):
+             sigma = sigma.unsqueeze(-1)
+         return sigma
+ 
++    # Azyah: the batches of the first pass that the save had already used are not used again after a restart
++    _az_resume_skip = 0
++    if args.resume_skip_seen and initial_global_step > 0:
++        _az_resume_skip = (initial_global_step % num_update_steps_per_epoch) * args.gradient_accumulation_steps
++        print(f"RESUME_SKIP carrying on after the {_az_resume_skip} batches this pass over the data had used before "
++              f"the restart ({num_update_steps_per_epoch} batches in a pass)", flush=True)
+     for epoch in range(first_epoch, args.num_train_epochs):
+         transformer.train()
+ 
+         for step, batch in enumerate(train_dataloader):
++            if epoch == first_epoch and step < _az_resume_skip:
++                continue
+             models_to_accumulate = [transformer]
+             prompts = batch["prompts"]
+ 

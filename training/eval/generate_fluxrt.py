@@ -161,8 +161,20 @@ def main(argv=None) -> None:
     ap.add_argument("--lora2", help="second LoRA file: the two are blended in weight space (Step A, 2026-11-09)")
     ap.add_argument("--blend", type=float, default=0.5,
                     help="with --lora2: share of the FIRST LoRA (0.3 = 30%% first, 70%% second); --lora-scale scales both")
-    ap.add_argument("--prompt-style", choices=("full", "compact"), default="full",
+    ap.add_argument("--prompt-style", choices=("full", "compact", "live"), default="full",
                     help="compact = the app's default FluxRT prompt since azyah-shopping #21 (buildCompactTryOnPrompt)")
+    ap.add_argument("--anchor-after", type=int, default=0,
+                    help="fxreal6: like the live FLUXRT_ANCHOR, after this many output frames of a clip the model also "
+                         "gets its own last picture as a third image (0 = off; --clip-list only)")
+    ap.add_argument("--anchor-every", type=int, default=0, help="and that picture is renewed every this many frames (0 = once)")
+    ap.add_argument("--steady-blend", type=float, default=0.0,
+                    help="fxreal8 run-time steadiness (eval.steady_filter): keep this share of the previous output where "
+                         "the camera picture did not move (0 = off; --clip-list only). Not part of the model.")
+    ap.add_argument("--steady-motion", type=float, default=0.04,
+                    help="camera change (0..1 of full brightness) at which a place counts as moving (no blending)")
+    ap.add_argument("--render-size", help="clip-list only: the size the model works at (WxH, multiples of 16, e.g. "
+                    "432x768). The camera frames are cut for that size, the result is scaled back to --size, so the "
+                    "camera video and the scorers stay as they are (live settings test, 2026-11-22)")
     ap.add_argument("--clip-list", help="JSON list of {key, video, ref, category, name?, description?, case?}: each "
                     "real clip is run with the given garment photo (test cases picked by eval.select_test_clips); "
                     "--staging is then ignored")
@@ -172,8 +184,10 @@ def main(argv=None) -> None:
     import torch
     from diffusers import Flux2KleinPipeline
     from PIL import Image
-    from data_tools.fluxrt_prompt import compact_prompt, fluxrt_prompt
-    make_prompt = compact_prompt if a.prompt_style == "compact" else fluxrt_prompt
+    from data_tools.fluxrt_prompt import compact_prompt, fluxrt_prompt, fx6_prompt
+    # "live" = the app's prompt as it is today (fxreal6): "head covering" for a dress, never "hijab",
+    # and the plain wording for a clip-list item marked "plain": true.
+    make_prompt = {"compact": compact_prompt, "live": fx6_prompt}.get(a.prompt_style, fluxrt_prompt)
 
     w, h = (int(v) for v in a.size.lower().split("x"))
     rw, rh = (int(v) for v in a.ref_size.lower().split("x"))
@@ -263,6 +277,7 @@ def main(argv=None) -> None:
 def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies: list) -> None:
     """--clip-list: real clips with chosen garment photos (the owner's five test cases)."""
     import shutil
+    import numpy as np
     import torch
     from PIL import Image
     items = json.loads(Path(a.clip_list).read_text())[: a.max_items]
@@ -272,24 +287,42 @@ def run_clip_list(a, pipe, make_prompt, w, h, rw, rh, out_root: Path, latencies:
         if result.exists():
             continue
         dest.mkdir(parents=True, exist_ok=True)
-        frames = [_cover(f, w, h) for f in _read_frames(Path(it["video"]), a.frames)]
+        source = _read_frames(Path(it["video"]), a.frames)
+        frames = [_cover(f, w, h) for f in source]
         if not frames:
             print(json.dumps({"key": it["key"], "skipped": "no frames"}), flush=True)
             continue
+        # the size the model works at: --size unless --render-size asks for another (then from the original frames)
+        mw, mh = (int(v) for v in a.render_size.lower().split("x")) if getattr(a, "render_size", None) else (w, h)
+        model_frames = frames if (mw, mh) == (w, h) else [_cover(f, mw, mh) for f in source]
         ref_path = Path(it["ref"])
         garment = _pad(Image.open(ref_path).convert("RGB"), rw, rh)
-        prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"))
+        plain = {"plain": True} if a.prompt_style == "live" and it.get("plain") else {}
+        prompt = make_prompt(it.get("category"), it.get("name"), it.get("description"), **plain)
         outs = []
+        anchor, anchor_at = None, None
+        steady = None
+        if a.steady_blend > 0:
+            from eval.steady_filter import SteadyFilter
+            steady = SteadyFilter(a.steady_blend, a.steady_motion)
         for i, frame in enumerate(frames):
+            if a.anchor_after > 0 and outs and (
+                    (anchor is None and i >= a.anchor_after)
+                    or (anchor is not None and a.anchor_every > 0 and i - anchor_at >= a.anchor_every)):
+                anchor, anchor_at = outs[-1].resize((mw, mh)), i   # its own picture, as the live worker takes it
             gen = torch.Generator(device="cuda").manual_seed(a.seed)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            img = pipe(prompt=prompt, image=[frame, garment], height=h, width=w, guidance_scale=1.0,
+            images = [model_frames[i], garment] + ([anchor] if anchor is not None else [])
+            img = pipe(prompt=prompt, image=images, height=mh, width=mw, guidance_scale=1.0,
                        num_inference_steps=a.steps, generator=gen).images[0]
             torch.cuda.synchronize()
             if i >= 3:
                 latencies.append(time.perf_counter() - t0)
-            outs.append(img.convert("RGB").resize((w, h)))
+            o = img.convert("RGB").resize((w, h)) if (mw, mh) == (w, h) else img.convert("RGB").resize((w, h), Image.LANCZOS)
+            if steady is not None:
+                o = Image.fromarray(steady(np.asarray(frame.convert("RGB")), np.asarray(o)))
+            outs.append(o)
         _write_mp4(result, outs)
         if not (dest / "input.mp4").exists():
             _write_mp4(dest / "input.mp4", frames)

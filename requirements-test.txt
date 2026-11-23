@@ -6,3 +6,4 @@ numpy==2.2.1
 pillow==11.1.0
 websockets==16.0
 pyarrow==18.1.0
+safetensors==0.8.0
